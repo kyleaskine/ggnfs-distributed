@@ -21,5 +21,6 @@ int sieve_run_local(const char *siever_path,
         extra_args ? extra_args : "",
         side, job_infile);
 
+    fprintf(stderr, "siever: %s\n", syscmd);
     return system(syscmd);
 }

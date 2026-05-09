@@ -85,6 +85,9 @@ All JSON encode/decode lives here so `server.c` and `client.c` don't both link c
 ### Dashboard
 `dashboard.html` is embedded at build time via `xxd -i -n dashboard_html` → `dashboard_html.h`. Editing the HTML is enough; Make picks up the dependency. The HTML reads its bearer token from `?token=…` in the URL.
 
+### Siever flags
+`--siever-args="..."` on `init` is stored in `meta.siever_args`, sent to every client in the `/lease` response, and appended verbatim to the siever command in `sieve_run_local`. Used for tunables every worker should share — e.g. `-J 16` for a larger I-sieve area. To change it on an existing jobdir without reinitializing, edit meta directly: `sqlite3 jobdir/job.db "UPDATE meta SET value='-J 16' WHERE key='siever_args'"` and restart `serve`.
+
 ## Things that have bitten people (load-bearing detail)
 
 - `mfbr`/`mfba` and `lpbr`/`lpba` in `input.job` must match what you use for filtering later — `finalize-nfs.sh` aborts if `<yafu-dir>/nfs.job` SHA differs from the `.job` the server distributed, because mismatched factor base settings silently corrupt filtering.
