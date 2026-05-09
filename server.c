@@ -1,10 +1,10 @@
-/* yafu-sieve-server — Phase 1 walking skeleton.
+/* ggnfs-sieve-server — Phase 1 walking skeleton.
  *
- *   yafu-sieve-server init   --job=foo.job --siever=gnfs-lasieve4I14e \
+ *   ggnfs-sieve-server init   --job=foo.job --siever=gnfs-lasieve4I14e \
  *                            --qmin=80000000 --qmax=100000000 --qrange=10000 \
  *                            [--side=a] [--jobdir=.]
  *
- *   yafu-sieve-server serve  [--port=8080] [--jobdir=.] [--lease-seconds=3600]
+ *   ggnfs-sieve-server serve  [--port=8080] [--jobdir=.] [--lease-seconds=3600]
  *                            [--sweep-seconds=60] [--max-attempts=5]
  *
  * The server reuses the bearer token from <jobdir>/token (written at init).
@@ -190,7 +190,7 @@ static const char *flag(int argc, char **argv, const char *key)
 static void usage_init(void)
 {
     fprintf(stderr,
-        "usage: yafu-sieve-server init \\\n"
+        "usage: ggnfs-sieve-server init \\\n"
         "    --job=<file>            (required) ggnfs .job file describing the polynomial\n"
         "    --siever=<name>         (required) gnfs-lasieve4* binary clients should run\n"
         "    --qmin=<int>            (required) start of special-q range\n"
@@ -273,7 +273,7 @@ static int cmd_init(int argc, char **argv)
     /* Open db, seed workunits. */
     char *db_path = path_join(jobdir, "job.db");
     if (!db_path) return 1;
-    yafu_db_t *db = db_open(db_path);
+    ggnfs_db_t *db = db_open(db_path);
     if (!db) {
         free(files_dir); free(rels_dir); free(dst_path); free(db_path); return 1;
     }
@@ -336,14 +336,14 @@ static int cmd_init(int argc, char **argv)
 
     db_close(db);
 
-    printf("yafu-sieve-server: initialized job %s\n", job_id);
+    printf("ggnfs-sieve-server: initialized job %s\n", job_id);
     printf("  jobdir   : %s\n", jobdir);
     printf("  job.db   : %s\n", db_path);
     printf("  job file : %s  (sha=%s, %lld bytes)\n", dst_path, job_sha, (long long)dst_bytes);
     printf("  workunits: %lld   (q_range=%lld, side=%c, siever=%s)\n",
            (long long)seq, (long long)qrange, side, siever);
     printf("  token    : written to %s (chmod 600)\n", token_path);
-    printf("\nNext: yafu-sieve-server serve --jobdir=%s\n", jobdir);
+    printf("\nNext: ggnfs-sieve-server serve --jobdir=%s\n", jobdir);
 
     free(files_dir); free(rels_dir); free(dst_path); free(db_path); free(token_path);
     return 0;
@@ -354,7 +354,7 @@ static int cmd_init(int argc, char **argv)
 static void usage_extend(void)
 {
     fprintf(stderr,
-        "usage: yafu-sieve-server extend \\\n"
+        "usage: ggnfs-sieve-server extend \\\n"
         "    --jobdir=<dir>          (required) existing initialized jobdir\n"
         "    --qmin=<int>            (required) start of new range — must be >= existing q_end\n"
         "    --qmax=<int>            (required) end (exclusive)\n"
@@ -390,7 +390,7 @@ static int cmd_extend(int argc, char **argv)
 
     char *db_path = path_join(jobdir, "job.db");
     if (!db_path) return 1;
-    yafu_db_t *db = db_open(db_path);
+    ggnfs_db_t *db = db_open(db_path);
     if (!db) {
         fprintf(stderr, "extend: cannot open %s — did you run init?\n", db_path);
         free(db_path);
@@ -454,7 +454,7 @@ static int cmd_extend(int argc, char **argv)
 
     db_close(db);
 
-    printf("yafu-sieve-server: extended job %s\n", job_id);
+    printf("ggnfs-sieve-server: extended job %s\n", job_id);
     printf("  new workunits : %lld   (q_range=%lld, side=%c)\n",
            (long long)added, (long long)qrange, side);
     printf("  q range added : [%lld, %lld)\n",
@@ -467,7 +467,7 @@ static int cmd_extend(int argc, char **argv)
 /* ===================== serve subcommand ================================= */
 
 typedef struct {
-    yafu_db_t  *db;
+    ggnfs_db_t  *db;
     char        token[65];          /* expected bearer token */
     char        job_id[16];
     char        siever[64];         /* required siever binary name */
@@ -983,7 +983,7 @@ static int cmd_serve(int argc, char **argv)
                  MG_TIMER_REPEAT, on_sweep_timer, &ctx);
 
     fprintf(stderr,
-        "yafu-sieve-server: serving job %s on %s\n"
+        "ggnfs-sieve-server: serving job %s on %s\n"
         "  jobdir       : %s\n"
         "  siever       : %s   side=%c   lease=%llds\n"
         "  sweep        : every %llds   max_attempts=%lld\n"
@@ -1010,11 +1010,11 @@ static int cmd_serve(int argc, char **argv)
 static void usage_top(void)
 {
     fprintf(stderr,
-        "yafu-sieve-server — Phase 1 walking skeleton\n"
+        "ggnfs-sieve-server — Phase 1 walking skeleton\n"
         "usage:\n"
-        "  yafu-sieve-server init   [args...]   create a new job\n"
-        "  yafu-sieve-server extend [args...]   add workunits to an existing job\n"
-        "  yafu-sieve-server serve  [args...]   run the HTTP server\n"
+        "  ggnfs-sieve-server init   [args...]   create a new job\n"
+        "  ggnfs-sieve-server extend [args...]   add workunits to an existing job\n"
+        "  ggnfs-sieve-server serve  [args...]   run the HTTP server\n"
         "Run a subcommand without args to see its flags.\n");
 }
 

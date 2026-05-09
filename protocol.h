@@ -3,8 +3,8 @@
  * All encode_* functions return a malloc'd, null-terminated JSON string the
  * caller must free(). NULL on allocation failure.
  */
-#ifndef YAFU_SIEVE_SERVER_PROTOCOL_H
-#define YAFU_SIEVE_SERVER_PROTOCOL_H
+#ifndef GGNFS_SIEVE_PROTOCOL_H
+#define GGNFS_SIEVE_PROTOCOL_H
 
 #include <stddef.h>
 #include <stdint.h>
@@ -70,4 +70,4 @@ char *proto_encode_submit_response(int accepted,
 char *proto_encode_health_response(int ok, const char *job_id,
                                    int64_t uptime_seconds);
 
-#endif /* YAFU_SIEVE_SERVER_PROTOCOL_H */
+#endif /* GGNFS_SIEVE_PROTOCOL_H */

@@ -1,7 +1,7 @@
 # Build artifacts
 *.o
-yafu-sieve-server
-yafu-sieve-client
+ggnfs-sieve-server
+ggnfs-sieve-client
 dashboard_html.h
 
 # Operator state from running `init` / `serve` / a client out of this directory.

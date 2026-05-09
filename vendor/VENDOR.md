@@ -2,8 +2,8 @@
 
 These files are pulled verbatim from upstream and committed into the repo so
 the server builds offline. Do not edit them. To bump versions, see
-`make update-mongoose`, `make update-cjson`, and `make update-sqlite` in
-`factor/nfs/distributed/Makefile`.
+`make update-mongoose`, `make update-cjson`, and `make update-sqlite` in the
+top-level Makefile.
 
 | File(s)                                | Library       | Version    | Source |
 |----------------------------------------|---------------|------------|--------|

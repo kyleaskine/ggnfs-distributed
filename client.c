@@ -1,17 +1,17 @@
-/* yafu-sieve-client — Phase 2 walking skeleton.
+/* ggnfs-sieve-client — Phase 2 walking skeleton.
  *
- * Polls a yafu-sieve-server in a loop:
+ * Polls a ggnfs-sieve-server in a loop:
  *   POST /lease   -> get a workunit
  *   GET  /file/X  -> fetch any input files (sha-cached)
- *   run gnfs-lasieve4* through the same executor seam YAFU itself uses
+ *   run gnfs-lasieve4* via system()
  *   POST /submit  -> hand the relation file back
  *
- *   yafu-sieve-client \
+ *   ggnfs-sieve-client \
  *     --server-url=http://host:8080 \
  *     --token=<bearer token> \
  *     --siever=/usr/local/bin/gnfs-lasieve4I14e \
  *     [--client-id=<defaults to hostname>] \
- *     [--workdir=/tmp/yafu-client] \
+ *     [--workdir=/tmp/ggnfs-client] \
  *     [--idle-backoff=30] \
  *     [--workers=1] \
  *     [--cpu-pin=0,1,2,...] \
@@ -295,12 +295,12 @@ typedef struct {
 static void usage(void)
 {
     fprintf(stderr,
-        "usage: yafu-sieve-client \\\n"
+        "usage: ggnfs-sieve-client \\\n"
         "    --server-url=http://host:port  (required)\n"
         "    --token=<bearer token>         (required)\n"
         "    --siever=<path>                (required) gnfs-lasieve4* binary\n"
         "    [--client-id=<hostname>]\n"
-        "    [--workdir=/tmp/yafu-client]\n"
+        "    [--workdir=/tmp/ggnfs-client]\n"
         "    [--idle-backoff=30]\n"
         "    [--workers=1]                  pthread workers (each runs an independent siever)\n"
         "    [--cpu-pin=0,2,4,6]            (Linux) pin worker K to the K'th CPU in the list;\n"
@@ -313,7 +313,7 @@ static int parse_config(int argc, char **argv, client_cfg_t *cfg)
     memset(cfg, 0, sizeof(*cfg));
     cfg->idle_backoff_seconds = 30;
     cfg->workers = 1;
-    snprintf(cfg->workdir, sizeof(cfg->workdir), "%s", "/tmp/yafu-client");
+    snprintf(cfg->workdir, sizeof(cfg->workdir), "%s", "/tmp/ggnfs-client");
 
     const char *url     = flag(argc, argv, "--server-url");
     const char *token   = flag(argc, argv, "--token");
@@ -661,21 +661,12 @@ static int run_one_iteration(struct mg_mgr *mgr, const client_cfg_t *cfg)
                 lease.siever, siever_basename);
     }
 
-    sieve_request_t req = {
-        .sievername        = cfg->siever_path,
-        .job_infile_name   = job_local,
-        .outfilename       = outfile,
-        .startq            = (uint32_t)lease.q_start,
-        .qrange            = (uint32_t)lease.q_range,
-        .side_is_algebraic = (lease.side == 'a'),
-        .batch_3lp         = 0,
-        .tindex            = 0,
-        .verbose           = 0,
-    };
-
     struct timeval t0, t1;
     gettimeofday(&t0, NULL);
-    int sieve_rc = sieve_executor_run(&req);
+    int sieve_rc = sieve_run_local(cfg->siever_path, job_local, outfile,
+                                   (uint32_t)lease.q_start,
+                                   (uint32_t)lease.q_range,
+                                   lease.side);
     gettimeofday(&t1, NULL);
     double sieve_seconds = elapsed_seconds(t0, t1);
 
@@ -788,7 +779,7 @@ int main(int argc, char **argv)
     mg_log_set(MG_LL_ERROR);  /* quiet by default; raise to debug */
 
     fprintf(stderr,
-        "yafu-sieve-client: %s\n"
+        "ggnfs-sieve-client: %s\n"
         "  server   : %s\n"
         "  client_id: %s\n"
         "  siever   : %s\n"

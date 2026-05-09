@@ -1,11 +1,11 @@
-# yafu-sieve-server
+# ggnfs-sieve-server / ggnfs-sieve-client
 #
-# Standalone build. No dependency on the main yafu binary or its Makefiles —
-# this server only needs vendored mongoose/cJSON/sqlite (all under vendor/).
+# Standalone build. Depends only on vendored mongoose/cJSON/sqlite under
+# vendor/ — no link against ggnfs or yafu.
 #
 # Usage:
-#   make            -> build yafu-sieve-server
-#   make clean      -> remove objects + binary
+#   make            -> build both binaries
+#   make clean      -> remove objects + binaries
 #   make update-mongoose / update-cjson / update-sqlite
 #                   -> re-fetch a vendored library (manually invoked; not part
 #                      of the default build, so a clean clone builds offline)
@@ -43,8 +43,8 @@ CLIENT_VENDOR_OBJS := vendor/mongoose.o vendor/cJSON.o
 ALL_OWN_OBJS    := server.o db.o protocol.o client.o sieve_executor.o
 ALL_VENDOR_OBJS := vendor/mongoose.o vendor/cJSON.o vendor/sqlite3.o
 
-SERVER_BIN := yafu-sieve-server
-CLIENT_BIN := yafu-sieve-client
+SERVER_BIN := ggnfs-sieve-server
+CLIENT_BIN := ggnfs-sieve-client
 
 .PHONY: all server client clean update-mongoose update-cjson update-sqlite
 

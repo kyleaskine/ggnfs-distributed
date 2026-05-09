@@ -1,38 +1,38 @@
-/* db.h — SQLite layer for yafu-sieve-server.
+/* db.h — SQLite layer for ggnfs-sieve-server.
  *
  * Single-connection model: open once at server start, all operations run on
  * the main mongoose event-loop thread. No locking is needed in Phase 1; when
  * the verifier thread lands in Phase 3 we'll either add a mutex or give it
  * its own connection.
  */
-#ifndef YAFU_SIEVE_SERVER_DB_H
-#define YAFU_SIEVE_SERVER_DB_H
+#ifndef GGNFS_SIEVE_DB_H
+#define GGNFS_SIEVE_DB_H
 
 #include <stdint.h>
 
-typedef struct yafu_db_s yafu_db_t;
+typedef struct ggnfs_db_s ggnfs_db_t;
 
 /* Open or create `path`. Runs schema migrations on a fresh DB.
  * Returns NULL on failure (logs the cause to stderr). */
-yafu_db_t *db_open(const char *path);
-void       db_close(yafu_db_t *db);
+ggnfs_db_t *db_open(const char *path);
+void       db_close(ggnfs_db_t *db);
 
 /* ---- meta: simple string key/value store. ---- */
 
-int   db_meta_set(yafu_db_t *db, const char *key, const char *value);
+int   db_meta_set(ggnfs_db_t *db, const char *key, const char *value);
 /* Returns malloc'd string the caller must free(); NULL if key absent. */
-char *db_meta_get(yafu_db_t *db, const char *key);
+char *db_meta_get(ggnfs_db_t *db, const char *key);
 
 /* ---- files: content-addressed input files for /file/<sha>. ---- */
 
-int   db_files_insert(yafu_db_t *db, const char *sha256_hex,
+int   db_files_insert(ggnfs_db_t *db, const char *sha256_hex,
                       const char *path, int64_t bytes, const char *purpose);
 /* Returns malloc'd on-disk path the caller must free(); NULL if not found. */
-char *db_files_path_for(yafu_db_t *db, const char *sha256_hex);
+char *db_files_path_for(ggnfs_db_t *db, const char *sha256_hex);
 
 /* ---- workunits ---- */
 
-int db_workunit_insert(yafu_db_t *db, const char *id,
+int db_workunit_insert(ggnfs_db_t *db, const char *id,
                        int64_t q_start, int64_t q_range, char side,
                        int64_t now_unix);
 
@@ -40,14 +40,14 @@ int db_workunit_insert(yafu_db_t *db, const char *id,
  * total row count (used as the next sequence number for ID generation, since
  * IDs are assigned 0..N-1 by init/extend). `*out_q_end` receives the largest
  * q_start+q_range, i.e. one past the highest-Q workunit (0 if empty). */
-int db_workunit_extent(yafu_db_t *db, int64_t *out_count, int64_t *out_q_end);
+int db_workunit_extent(ggnfs_db_t *db, int64_t *out_count, int64_t *out_q_end);
 
 /* Re-queue any leased workunits whose lease has expired. If a workunit's
  * attempt_count would reach `max_attempts`, mark it 'poisoned' instead of
  * available so we stop re-issuing a workunit that keeps timing out.
  * Returns 0 on success; *out_requeued and *out_poisoned receive counts.
  * Either out pointer may be NULL. */
-int db_lease_expire_sweep(yafu_db_t *db,
+int db_lease_expire_sweep(ggnfs_db_t *db,
                           int64_t now_unix, int64_t max_attempts,
                           int64_t *out_requeued, int64_t *out_poisoned);
 
@@ -61,7 +61,7 @@ typedef struct {
     char     side;
 } db_lease_result_t;
 
-int db_lease(yafu_db_t *db, const char *client_id,
+int db_lease(ggnfs_db_t *db, const char *client_id,
              int64_t lease_seconds, int64_t now_unix,
              db_lease_result_t *out);
 
@@ -69,14 +69,14 @@ int db_lease(yafu_db_t *db, const char *client_id,
  * `verify_status` is hardcoded to 'skipped' in Phase 1 (no verifier yet).
  * Returns 0 on success, 1 if the workunit is not currently leased
  * (caller should respond 409), -1 on internal error. */
-int db_submit(yafu_db_t *db,
+int db_submit(ggnfs_db_t *db,
               const char *workunit_id, const char *client_id,
               const char *rel_file_path, const char *body_sha256_hex,
               int64_t num_relations, double sieve_seconds,
               int64_t now_unix);
 
 /* Upsert a client's last_seen timestamp. */
-int db_clients_seen(yafu_db_t *db, const char *client_id, int64_t now_unix);
+int db_clients_seen(ggnfs_db_t *db, const char *client_id, int64_t now_unix);
 
 /* ---- health/status ---- */
 
@@ -90,7 +90,7 @@ typedef struct {
     int64_t poisoned;
 } db_workunit_counts_t;
 
-int db_workunit_counts(yafu_db_t *db, db_workunit_counts_t *out);
+int db_workunit_counts(ggnfs_db_t *db, db_workunit_counts_t *out);
 
 /* ---- stats snapshot for /stats and the dashboard --------------------- */
 
@@ -127,7 +127,7 @@ typedef struct {
 
 /* Fill a stats snapshot. Returns 0 on success, -1 on internal error.
  * Caller is responsible for free()ing out->clients via db_stats_free. */
-int  db_stats_snapshot(yafu_db_t *db, int64_t now_unix, db_stats_t *out);
+int  db_stats_snapshot(ggnfs_db_t *db, int64_t now_unix, db_stats_t *out);
 void db_stats_free(db_stats_t *out);
 
-#endif /* YAFU_SIEVE_SERVER_DB_H */
+#endif /* GGNFS_SIEVE_DB_H */

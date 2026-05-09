@@ -6,8 +6,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 A distributed coordinator for GGNFS lattice sieving (the special-q sieving phase of the General Number Field Sieve). Two binaries built from one Makefile:
 
-- `yafu-sieve-server` — HTTP coordinator: chops a Q-range into workunits, hands them out under lease, receives relation files back, persists state in SQLite, serves a dashboard.
-- `yafu-sieve-client` — polls the server, leases a workunit, fetches the `.job`, shells out to `gnfs-lasieve4*` via `system()`, posts the relations back.
+- `ggnfs-sieve-server` — HTTP coordinator: chops a Q-range into workunits, hands them out under lease, receives relation files back, persists state in SQLite, serves a dashboard.
+- `ggnfs-sieve-client` — polls the server, leases a workunit, fetches the `.job`, shells out to `gnfs-lasieve4*` via `system()`, posts the relations back.
 
 Output is consumed by `finalize-nfs.sh`, which assembles `nfs.dat` and feeds YAFU's filter / LA / sqrt pipeline.
 
@@ -17,8 +17,8 @@ The source comments still reference "Phase 1 walking skeleton" / "Phase 2" / "Ph
 
 ```
 make           # both binaries
-make server    # just yafu-sieve-server
-make client    # just yafu-sieve-client
+make server    # just ggnfs-sieve-server
+make client    # just ggnfs-sieve-client
 make clean
 ```
 
@@ -32,25 +32,25 @@ Vendored sources are compiled with `-w` and a pile of `-DSQLITE_*` / `-DMG_*` fl
 
 ```
 # 1. Initialize a job (creates job.db, files/, rels/, token in --jobdir)
-./yafu-sieve-server init \
+./ggnfs-sieve-server init \
     --job=input.job --siever=gnfs-lasieve4I14e \
     --qmin=80000000 --qmax=100000000 --qrange=10000 \
-    --jobdir=/tmp/yafu-job
+    --jobdir=/tmp/ggnfs-job
 
 # 2. Serve
-./yafu-sieve-server serve --jobdir=/tmp/yafu-job --port=8080
+./ggnfs-sieve-server serve --jobdir=/tmp/ggnfs-job --port=8080
 
 # 3. Add more workunits later without restarting state (qmin must be >= existing q_end)
-./yafu-sieve-server extend --jobdir=/tmp/yafu-job --qmin=100000000 --qmax=120000000 --qrange=10000
+./ggnfs-sieve-server extend --jobdir=/tmp/ggnfs-job --qmin=100000000 --qmax=120000000 --qrange=10000
 
 # 4. On worker machines
-./yafu-sieve-client \
+./ggnfs-sieve-client \
     --server-url=http://host:8080 --token=<from jobdir/token> \
     --siever=/path/to/gnfs-lasieve4I14e \
     --workers=4 --cpu-pin=0,2,4,6
 
 # 5. Assemble + factor
-./finalize-nfs.sh --jobdir=/tmp/yafu-job --yafu-dir=/path/to/yafu --threads=8 --run
+./finalize-nfs.sh --jobdir=/tmp/ggnfs-job --yafu-dir=/path/to/yafu --threads=8 --run
 ```
 
 The dashboard is at `http://host:8080/?token=<token>` — the HTML itself is unauthenticated, but its JS uses the token to poll `/stats`.
@@ -75,8 +75,8 @@ Input files (currently just the single `.job`) are stored under `<jobdir>/files/
 ### Client worker model
 Each `--workers=N` spawns a pthread with its own `mg_mgr`, its own `<workdir>/wN`, its own `client_id` (`<base>-wN`). Workers share only `g_stop` (a `sig_atomic_t` that only goes 0→1). On Linux, `--cpu-pin=a,b,c,…` pins each worker (and the siever it `system()`s, which inherits affinity).
 
-### Sieve executor seam (`sieve_executor.h`)
-`sieve_executor_t` is a function-pointer interface so the client can swap how `gnfs-lasieve4*` gets invoked. Today there's only `s_local_executor` (a static singleton that calls `system()`). The header anticipates a "distributed" executor — that hasn't been built. Don't add abstraction layers here that aren't needed yet.
+### Sieve executor (`sieve_executor.[ch]`)
+One function: `sieve_run_local()` formats the `gnfs-lasieve4*` command line and invokes it via `system()`. It also `remove()`s any prior file at the output path because the siever opens its `-o` argument in append mode.
 
 ### Protocol layer (`protocol.[ch]`)
 All JSON encode/decode lives here so `server.c` and `client.c` don't both link cJSON usage directly. Encoders return `malloc`'d strings the caller must `free()`. `proto_decode_lease_response` enforces required-field presence and returns -1 if any are missing — the client treats that as "malformed response, back off".

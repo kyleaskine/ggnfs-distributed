@@ -7,7 +7,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-struct yafu_db_s {
+struct ggnfs_db_s {
     sqlite3 *conn;
 };
 
@@ -81,7 +81,7 @@ static int exec_or_log(sqlite3 *conn, const char *sql, const char *what)
     return 0;
 }
 
-yafu_db_t *db_open(const char *path)
+ggnfs_db_t *db_open(const char *path)
 {
     sqlite3 *conn = NULL;
     if (sqlite3_open(path, &conn) != SQLITE_OK) {
@@ -96,13 +96,13 @@ yafu_db_t *db_open(const char *path)
     /* Best-effort; don't fail open if FK enforcement can't be turned on. */
     (void)exec_or_log(conn, "PRAGMA foreign_keys = ON;", "enable foreign_keys");
 
-    yafu_db_t *db = calloc(1, sizeof(*db));
+    ggnfs_db_t *db = calloc(1, sizeof(*db));
     if (!db) { sqlite3_close(conn); return NULL; }
     db->conn = conn;
     return db;
 }
 
-void db_close(yafu_db_t *db)
+void db_close(ggnfs_db_t *db)
 {
     if (!db) return;
     if (db->conn) sqlite3_close(db->conn);
@@ -111,7 +111,7 @@ void db_close(yafu_db_t *db)
 
 /* ---- meta ------------------------------------------------------------- */
 
-int db_meta_set(yafu_db_t *db, const char *key, const char *value)
+int db_meta_set(ggnfs_db_t *db, const char *key, const char *value)
 {
     sqlite3_stmt *st = NULL;
     if (sqlite3_prepare_v2(db->conn,
@@ -128,7 +128,7 @@ int db_meta_set(yafu_db_t *db, const char *key, const char *value)
     return (rc == SQLITE_DONE) ? 0 : -1;
 }
 
-char *db_meta_get(yafu_db_t *db, const char *key)
+char *db_meta_get(ggnfs_db_t *db, const char *key)
 {
     sqlite3_stmt *st = NULL;
     if (sqlite3_prepare_v2(db->conn,
@@ -148,7 +148,7 @@ char *db_meta_get(yafu_db_t *db, const char *key)
 
 /* ---- files ------------------------------------------------------------ */
 
-int db_files_insert(yafu_db_t *db, const char *sha256_hex,
+int db_files_insert(ggnfs_db_t *db, const char *sha256_hex,
                     const char *path, int64_t bytes, const char *purpose)
 {
     sqlite3_stmt *st = NULL;
@@ -171,7 +171,7 @@ int db_files_insert(yafu_db_t *db, const char *sha256_hex,
     return (rc == SQLITE_DONE) ? 0 : -1;
 }
 
-char *db_files_path_for(yafu_db_t *db, const char *sha256_hex)
+char *db_files_path_for(ggnfs_db_t *db, const char *sha256_hex)
 {
     sqlite3_stmt *st = NULL;
     if (sqlite3_prepare_v2(db->conn,
@@ -191,7 +191,7 @@ char *db_files_path_for(yafu_db_t *db, const char *sha256_hex)
 
 /* ---- workunits -------------------------------------------------------- */
 
-int db_workunit_insert(yafu_db_t *db, const char *id,
+int db_workunit_insert(ggnfs_db_t *db, const char *id,
                        int64_t q_start, int64_t q_range, char side,
                        int64_t now_unix)
 {
@@ -214,7 +214,7 @@ int db_workunit_insert(yafu_db_t *db, const char *id,
     return (rc == SQLITE_DONE) ? 0 : -1;
 }
 
-int db_workunit_extent(yafu_db_t *db, int64_t *out_count, int64_t *out_q_end)
+int db_workunit_extent(ggnfs_db_t *db, int64_t *out_count, int64_t *out_q_end)
 {
     sqlite3_stmt *st = NULL;
     if (sqlite3_prepare_v2(db->conn,
@@ -235,7 +235,7 @@ int db_workunit_extent(yafu_db_t *db, int64_t *out_count, int64_t *out_q_end)
     return -1;
 }
 
-int db_lease_expire_sweep(yafu_db_t *db,
+int db_lease_expire_sweep(ggnfs_db_t *db,
                           int64_t now_unix, int64_t max_attempts,
                           int64_t *out_requeued, int64_t *out_poisoned)
 {
@@ -278,7 +278,7 @@ int db_lease_expire_sweep(yafu_db_t *db,
     return 0;
 }
 
-int db_lease(yafu_db_t *db, const char *client_id,
+int db_lease(ggnfs_db_t *db, const char *client_id,
              int64_t lease_seconds, int64_t now_unix,
              db_lease_result_t *out)
 {
@@ -325,7 +325,7 @@ int db_lease(yafu_db_t *db, const char *client_id,
     return result;
 }
 
-int db_submit(yafu_db_t *db,
+int db_submit(ggnfs_db_t *db,
               const char *workunit_id, const char *client_id,
               const char *rel_file_path, const char *body_sha256_hex,
               int64_t num_relations, double sieve_seconds,
@@ -382,7 +382,7 @@ done:
     return result;
 }
 
-int db_clients_seen(yafu_db_t *db, const char *client_id, int64_t now_unix)
+int db_clients_seen(ggnfs_db_t *db, const char *client_id, int64_t now_unix)
 {
     sqlite3_stmt *st = NULL;
     if (sqlite3_prepare_v2(db->conn,
@@ -399,7 +399,7 @@ int db_clients_seen(yafu_db_t *db, const char *client_id, int64_t now_unix)
 
 /* ---- stats snapshot --------------------------------------------------- */
 
-int db_stats_snapshot(yafu_db_t *db, int64_t now_unix, db_stats_t *out)
+int db_stats_snapshot(ggnfs_db_t *db, int64_t now_unix, db_stats_t *out)
 {
     if (!out) return -1;
     memset(out, 0, sizeof(*out));
@@ -509,7 +509,7 @@ void db_stats_free(db_stats_t *out)
     out->client_count = 0;
 }
 
-int db_workunit_counts(yafu_db_t *db, db_workunit_counts_t *out)
+int db_workunit_counts(ggnfs_db_t *db, db_workunit_counts_t *out)
 {
     memset(out, 0, sizeof(*out));
     sqlite3_stmt *st = NULL;
