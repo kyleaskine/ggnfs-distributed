@@ -1,0 +1,214 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>yafu-sieve dashboard</title>
+<style>
+  body  { font-family: -apple-system, system-ui, sans-serif; margin: 2em; max-width: 1200px; color: #222; }
+  h1, h2 { font-weight: 500; }
+  h1 { margin-bottom: 0.2em; }
+  .sub { color: #888; margin-bottom: 1.5em; font-size: 0.9em; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 0.8em; margin: 1em 0; }
+  .stat { border: 1px solid #ddd; padding: 0.8em; border-radius: 4px; background: #fafafa; }
+  .stat .num { font-size: 1.5em; font-family: ui-monospace, Consolas, monospace; }
+  .stat .lbl { color: #666; font-size: 0.85em; margin-top: 0.2em; }
+  table { border-collapse: collapse; width: 100%; margin-top: 0.5em; font-size: 0.95em; }
+  th, td { text-align: left; padding: 0.45em 0.6em; border-bottom: 1px solid #eee; }
+  th { background: #f4f4f4; font-weight: 500; }
+  td.num, th.num { text-align: right; font-family: ui-monospace, Consolas, monospace; }
+  tr.active { background: #eff7ee; }
+  tr.stale  { color: #aaa; }
+  .progress { height: 22px; background: #eee; border-radius: 11px; overflow: hidden; margin: 0.6em 0; display: flex; }
+  .progress > div { height: 100%; }
+  .b-verified  { background: #2e7d32; }
+  .b-submitted { background: #66bb6a; }
+  .b-leased    { background: #fb8c00; }
+  .b-failed    { background: #d32f2f; }
+  .b-poisoned  { background: #6a1b9a; }
+  .legend { font-size: 0.85em; color: #555; }
+  .legend span { display: inline-block; margin-right: 1em; }
+  .legend .swatch { display: inline-block; width: 0.7em; height: 0.7em; vertical-align: middle; margin-right: 0.3em; border-radius: 2px; }
+  .err  { color: #c00; }
+  .warn { color: #888; }
+  .age  { color: #666; font-size: 0.9em; margin-top: 1em; }
+  code  { background: #f4f4f4; padding: 1px 4px; border-radius: 3px; }
+</style>
+</head>
+<body>
+<h1>yafu-sieve <span id="job-id"></span></h1>
+<div class="sub" id="server-line"></div>
+
+<div id="auth-warn" class="err" style="display:none">
+  No token. Append <code>?token=&lt;your-token&gt;</code> to the URL.
+</div>
+
+<div id="content" style="display:none">
+  <div class="grid">
+    <div class="stat"><div class="num" id="wu-pct">&mdash;</div><div class="lbl">complete</div></div>
+    <div class="stat"><div class="num" id="wu-active">&mdash;</div><div class="lbl">in flight</div></div>
+    <div class="stat"><div class="num" id="rels-total">&mdash;</div><div class="lbl">relations submitted</div></div>
+    <div class="stat"><div class="num" id="rate-1h">&mdash;</div><div class="lbl">workunits / hr (last 1h)</div></div>
+    <div class="stat"><div class="num" id="avg-sec">&mdash;</div><div class="lbl">avg sec / workunit</div></div>
+    <div class="stat"><div class="num" id="uptime">&mdash;</div><div class="lbl">server uptime</div></div>
+  </div>
+
+  <div class="progress" id="bar"></div>
+  <div class="legend" id="bar-legend"></div>
+
+  <h2>Clients</h2>
+  <table>
+    <thead><tr>
+      <th>id</th>
+      <th>last seen</th>
+      <th class="num">workunits</th>
+      <th class="num">relations</th>
+      <th class="num">avg sec</th>
+      <th class="num">fail</th>
+      <th>current</th>
+    </tr></thead>
+    <tbody id="clients"></tbody>
+  </table>
+
+  <p class="age">last update: <span id="updated">never</span> &middot; auto-refresh 5s</p>
+</div>
+
+<script>
+(function () {
+  var params = new URLSearchParams(location.search);
+  var token  = params.get('token');
+  if (!token) {
+    document.getElementById('auth-warn').style.display = 'block';
+    return;
+  }
+  document.getElementById('content').style.display = 'block';
+
+  function fmt(n) { return (n || 0).toLocaleString(); }
+  function fmtSec(s) {
+    if (s == null) return '0s';
+    if (s < 60)    return Math.round(s) + 's';
+    if (s < 3600)  return (s/60).toFixed(1) + 'm';
+    if (s < 86400) return (s/3600).toFixed(1) + 'h';
+    return (s/86400).toFixed(1) + 'd';
+  }
+  function ageText(unix) {
+    if (!unix) return 'never';
+    var dt = Math.floor(Date.now()/1000) - unix;
+    if (dt < 0)    dt = 0;
+    if (dt < 60)   return dt + 's ago';
+    if (dt < 3600) return Math.floor(dt/60)   + 'm ago';
+    if (dt < 86400)return Math.floor(dt/3600) + 'h ago';
+    return Math.floor(dt/86400) + 'd ago';
+  }
+  function escapeHtml(s) {
+    return String(s).replace(/[&<>"']/g, function (c) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+    });
+  }
+
+  function render(s) {
+    document.getElementById('job-id').textContent     = '— job ' + s.job_id;
+    document.getElementById('server-line').textContent =
+      'siever ' + s.siever + ' / side ' + s.side +
+      ' / lease ' + s.lease_seconds + 's' +
+      ' / sweep ' + s.sweep_seconds + 's';
+
+    var w    = s.workunits;
+    var done = (w.submitted || 0) + (w.verified || 0);
+    var pct  = w.total ? (100 * done / w.total) : 0;
+    document.getElementById('wu-pct').textContent     = pct.toFixed(1) + '%';
+    document.getElementById('wu-active').textContent  = fmt(w.leased);
+    document.getElementById('rels-total').textContent = fmt(s.submissions.total_relations);
+    document.getElementById('rate-1h').textContent    = fmt(s.submissions.last_1h);
+    document.getElementById('avg-sec').textContent    = (s.submissions.avg_sieve_seconds || 0).toFixed(1);
+    document.getElementById('uptime').textContent     = fmtSec(s.uptime_seconds);
+
+    var bar  = document.getElementById('bar');
+    bar.innerHTML = '';
+    var segs = [
+      ['verified',  w.verified  || 0, 'b-verified'],
+      ['submitted', w.submitted || 0, 'b-submitted'],
+      ['leased',    w.leased    || 0, 'b-leased'],
+      ['failed',    w.failed    || 0, 'b-failed'],
+      ['poisoned',  w.poisoned  || 0, 'b-poisoned']
+    ];
+    if (w.total > 0) {
+      for (var i = 0; i < segs.length; i++) {
+        var name = segs[i][0], n = segs[i][1], cls = segs[i][2];
+        if (!n) continue;
+        var d = document.createElement('div');
+        d.className = cls;
+        d.style.flex = String(n);
+        d.title = name + ': ' + n;
+        bar.appendChild(d);
+      }
+      var avail = w.available || 0;
+      if (avail > 0) {
+        var d2 = document.createElement('div');
+        d2.style.flex = String(avail);
+        d2.style.background = '#eee';
+        d2.title = 'available: ' + avail;
+        bar.appendChild(d2);
+      }
+    }
+    document.getElementById('bar-legend').innerHTML =
+      done + ' / ' + w.total + ' workunits done &middot; ' +
+      (w.leased   || 0) + ' in flight &middot; ' +
+      (w.available|| 0) + ' pending &middot; ' +
+      'q range ' + fmt(w.q_min) + '&ndash;' + fmt(w.q_max) +
+      '<br>' +
+      '<span><span class="swatch b-verified"></span>verified</span>' +
+      '<span><span class="swatch b-submitted"></span>submitted</span>' +
+      '<span><span class="swatch b-leased"></span>leased</span>' +
+      '<span><span class="swatch b-failed"></span>failed</span>' +
+      '<span><span class="swatch b-poisoned"></span>poisoned</span>';
+
+    var tbody = document.getElementById('clients');
+    tbody.innerHTML = '';
+    var clients = s.clients || [];
+    if (clients.length === 0) {
+      var tr = document.createElement('tr');
+      tr.innerHTML = '<td colspan="7" class="warn">no clients have connected yet</td>';
+      tbody.appendChild(tr);
+    } else {
+      for (var j = 0; j < clients.length; j++) {
+        var c  = clients[j];
+        var dt = Math.floor(Date.now()/1000) - c.last_seen;
+        var tr = document.createElement('tr');
+        if (c.current_workunit) tr.className = 'active';
+        else if (dt > 300)      tr.className = 'stale';
+        tr.innerHTML =
+          '<td>' + escapeHtml(c.id) + '</td>' +
+          '<td>' + ageText(c.last_seen) + '</td>' +
+          '<td class="num">' + fmt(c.submissions) + '</td>' +
+          '<td class="num">' + fmt(c.relations) + '</td>' +
+          '<td class="num">' + (c.avg_sieve_seconds || 0).toFixed(1) + '</td>' +
+          '<td class="num">' + (c.total_failures ? c.total_failures : '') + '</td>' +
+          '<td>' + escapeHtml(c.current_workunit || '') + '</td>';
+        tbody.appendChild(tr);
+      }
+    }
+
+    document.getElementById('updated').textContent = new Date().toLocaleTimeString();
+  }
+
+  function poll() {
+    fetch('/stats', { headers: { 'Authorization': 'Bearer ' + token } })
+      .then(function (r) {
+        if (r.status === 401) {
+          document.getElementById('auth-warn').textContent = '401 — token rejected.';
+          document.getElementById('auth-warn').style.display = 'block';
+          document.getElementById('content').style.display   = 'none';
+          throw new Error('unauthorized');
+        }
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        return r.json();
+      })
+      .then(render)
+      .catch(function (e) { console.error(e); });
+  }
+  poll();
+  setInterval(poll, 5000);
+})();
+</script>
+</body>
+</html>

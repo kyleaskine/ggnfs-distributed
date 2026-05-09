@@ -1,0 +1,15 @@
+# Build artifacts
+*.o
+yafu-sieve-server
+yafu-sieve-client
+dashboard_html.h
+
+# Operator state from running `init` / `serve` / a client out of this directory.
+# (Real deployments use a separate jobdir; these patterns just cover ad-hoc
+#  testing inside the source tree.)
+job.db
+job.db-wal
+job.db-shm
+token
+files/
+rels/
