@@ -19,6 +19,7 @@ typedef struct {
     int64_t     lease_seconds;
     const char *siever;           /* required gnfs-lasieve4* binary name */
     const char *command_template; /* "{siever} -f {q_start} -c ..." */
+    const char *siever_args;      /* extra flags appended to the siever command (may be "") */
     /* Single-file MVP: one .job file shipped per workunit. */
     const char *file_name;
     const char *file_sha256_hex;
@@ -46,6 +47,7 @@ typedef struct {
     int64_t lease_seconds;
     char    siever[64];
     char    command_template[256];
+    char    siever_args[128];
     char    file_name[64];
     char    file_sha256_hex[65];
     char    file_url[160];

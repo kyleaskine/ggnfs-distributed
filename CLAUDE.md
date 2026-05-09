@@ -35,6 +35,7 @@ Vendored sources are compiled with `-w` and a pile of `-DSQLITE_*` / `-DMG_*` fl
 ./ggnfs-sieve-server init \
     --job=input.job --siever=gnfs-lasieve4I14e \
     --qmin=80000000 --qmax=100000000 --qrange=10000 \
+    --siever-args="-J 16" \
     --jobdir=/tmp/ggnfs-job
 
 # 2. Serve

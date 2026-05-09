@@ -197,18 +197,20 @@ static void usage_init(void)
         "    --qmax=<int>            (required) end (exclusive)\n"
         "    --qrange=<int>          (required) per-workunit range size\n"
         "    [--side=a|r]            default a\n"
+        "    [--siever-args=<flags>] extra args appended to the siever command, e.g. \"-J 16\"\n"
         "    [--jobdir=<dir>]        default current dir\n");
 }
 
 static int cmd_init(int argc, char **argv)
 {
-    const char *job_path = flag(argc, argv, "--job");
-    const char *siever   = flag(argc, argv, "--siever");
-    const char *qmin_s   = flag(argc, argv, "--qmin");
-    const char *qmax_s   = flag(argc, argv, "--qmax");
-    const char *qrange_s = flag(argc, argv, "--qrange");
-    const char *side_s   = flag(argc, argv, "--side");
-    const char *jobdir   = flag(argc, argv, "--jobdir");
+    const char *job_path    = flag(argc, argv, "--job");
+    const char *siever      = flag(argc, argv, "--siever");
+    const char *qmin_s      = flag(argc, argv, "--qmin");
+    const char *qmax_s      = flag(argc, argv, "--qmax");
+    const char *qrange_s    = flag(argc, argv, "--qrange");
+    const char *side_s      = flag(argc, argv, "--side");
+    const char *siever_args = flag(argc, argv, "--siever-args");
+    const char *jobdir      = flag(argc, argv, "--jobdir");
 
     if (!job_path || !siever || !qmin_s || !qmax_s || !qrange_s) {
         usage_init();
@@ -332,7 +334,8 @@ static int cmd_init(int argc, char **argv)
         char buf[2] = { side, 0 };
         db_meta_set(db, "side",  buf);
     }
-    db_meta_set(db, "job_sha256", job_sha);
+    db_meta_set(db, "job_sha256",  job_sha);
+    db_meta_set(db, "siever_args", siever_args ? siever_args : "");
 
     db_close(db);
 
@@ -471,6 +474,7 @@ typedef struct {
     char        token[65];          /* expected bearer token */
     char        job_id[16];
     char        siever[64];         /* required siever binary name */
+    char        siever_args[128];   /* extra flags shipped to clients (may be "") */
     char        side;
     char        job_sha256[65];
     char       *jobdir;
@@ -566,6 +570,7 @@ static void handle_lease(struct mg_connection *c, struct mg_http_message *hm,
         .lease_seconds    = ctx->lease_seconds,
         .siever           = ctx->siever,
         .command_template = COMMAND_TEMPLATE_DEFAULT,
+        .siever_args      = ctx->siever_args,
         .file_name        = "job.txt",
         .file_sha256_hex  = ctx->job_sha256,
         .file_url         = file_url,
@@ -953,6 +958,15 @@ static int cmd_serve(int argc, char **argv)
     ctx.side = m_side[0];
     free(m_token); free(m_jobid); free(m_siever); free(m_side); free(m_jobsha);
 
+    /* siever_args is optional — jobs initialized before this flag existed
+     * won't have the key, in which case clients get an empty string. */
+    {
+        char *m_args = db_meta_get(ctx.db, "siever_args");
+        snprintf(ctx.siever_args, sizeof(ctx.siever_args), "%s",
+                 m_args ? m_args : "");
+        free(m_args);
+    }
+
     ctx.jobdir        = strdup(jobdir);
     ctx.rels_dir      = path_join(jobdir, "rels");
     ctx.lease_seconds = lease_seconds;
@@ -986,12 +1000,14 @@ static int cmd_serve(int argc, char **argv)
         "ggnfs-sieve-server: serving job %s on %s\n"
         "  jobdir       : %s\n"
         "  siever       : %s   side=%c   lease=%llds\n"
+        "  siever_args  : %s\n"
         "  sweep        : every %llds   max_attempts=%lld\n"
         "  job .job sha : %s\n"
         "  token        : %.8s... (read from <jobdir>/token)\n"
         "  dashboard    : %s/?token=%s\n",
         ctx.job_id, listen_url, ctx.jobdir, ctx.siever, ctx.side,
         (long long)ctx.lease_seconds,
+        ctx.siever_args[0] ? ctx.siever_args : "(none)",
         (long long)sweep_seconds, (long long)ctx.max_attempts,
         ctx.job_sha256, ctx.token,
         listen_url, ctx.token);

@@ -666,7 +666,8 @@ static int run_one_iteration(struct mg_mgr *mgr, const client_cfg_t *cfg)
     int sieve_rc = sieve_run_local(cfg->siever_path, job_local, outfile,
                                    (uint32_t)lease.q_start,
                                    (uint32_t)lease.q_range,
-                                   lease.side);
+                                   lease.side,
+                                   lease.siever_args);
     gettimeofday(&t1, NULL);
     double sieve_seconds = elapsed_seconds(t0, t1);
 

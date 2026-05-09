@@ -30,6 +30,7 @@ char *proto_encode_lease_response(const proto_lease_response_args *a)
     cJSON_AddNumberToObject(root, "lease_seconds",    (double)a->lease_seconds);
     cJSON_AddStringToObject(root, "siever",           a->siever);
     cJSON_AddStringToObject(root, "command_template", a->command_template);
+    cJSON_AddStringToObject(root, "siever_args",      a->siever_args ? a->siever_args : "");
 
     cJSON_AddStringToObject(file0, "name",   a->file_name);
     cJSON_AddStringToObject(file0, "sha256", a->file_sha256_hex);
@@ -117,6 +118,7 @@ int proto_decode_lease_response(const char *body, size_t body_len,
     copy_str_field_into(root, "workunit_id",      out->workunit_id,      sizeof(out->workunit_id));
     copy_str_field_into(root, "siever",           out->siever,           sizeof(out->siever));
     copy_str_field_into(root, "command_template", out->command_template, sizeof(out->command_template));
+    copy_str_field_into(root, "siever_args",      out->siever_args,      sizeof(out->siever_args));
 
     out->q_start       = copy_int_field(root, "q_start",       0);
     out->q_range       = copy_int_field(root, "q_range",       0);
