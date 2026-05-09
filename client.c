@@ -299,7 +299,7 @@ static void usage(void)
         "    --server-url=http://host:port  (required)\n"
         "    --token=<bearer token>         (required)\n"
         "    --siever=<path>                (required) gnfs-lasieve4* binary\n"
-        "    [--client-id=<hostname>]\n"
+        "    [--client-id=<name>]           label this worker on the dashboard; defaults to hostname\n"
         "    [--workdir=/tmp/ggnfs-client]\n"
         "    [--idle-backoff=30]\n"
         "    [--workers=1]                  pthread workers (each runs an independent siever)\n"
