@@ -828,14 +828,16 @@ static int method_is(struct mg_http_message *hm, const char *m)
 static void ev_handler(struct mg_connection *c, int ev, void *ev_data)
 {
     /* Protocol-mismatch shield: plain HTTP/1.1 only. MG_MAX_RECV_SIZE is
-     * deliberately huge (512 MiB, to fit /submit bodies), so a misdirected
-     * client speaking TLS (ClientHello starts with 0x16 0x03 …) or HTTP/2
-     * prior-knowledge ("PRI " preface) would otherwise sit on hundreds of
-     * megs of recv buffer waiting for an HTTP terminator that will never
-     * arrive. Close such connections before they accumulate. */
-    if (ev == MG_EV_READ && c->recv.len >= 4) {
-        const unsigned char *p = c->recv.buf;
-        if (p[0] == 0x16 || memcmp(p, "PRI ", 4) == 0) {
+     * deliberately huge (512 MiB, to fit /submit bodies), so misdirected
+     * clients — TLS handshakes (0x16 …), HTTP/2 prior-knowledge ("PRI …"),
+     * SOCKS probes (0x04/0x05 …), random scanner bytes — would otherwise
+     * sit on the connection waiting for an HTTP terminator that will never
+     * arrive. Since every valid HTTP request line starts with an ASCII
+     * uppercase method letter (GET, POST, …), reject anything else on the
+     * very first byte. */
+    if (ev == MG_EV_READ && c->recv.len >= 1) {
+        unsigned char b = c->recv.buf[0];
+        if (b < 'A' || b > 'Z') {
             c->is_closing = 1;
             return;
         }
