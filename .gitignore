@@ -13,3 +13,5 @@ job.db-shm
 token
 files/
 rels/
+/.codex
+/.agents

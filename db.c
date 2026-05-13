@@ -11,8 +11,7 @@ struct ggnfs_db_s {
     sqlite3 *conn;
 };
 
-/* Schema mirrors DISTRIBUTED_SIEVING_DESIGN.md "Storage" section verbatim,
- * with IF NOT EXISTS so opening an existing DB is a no-op. */
+/* Schema with IF NOT EXISTS so opening an existing DB is a no-op. */
 static const char SCHEMA_SQL[] =
     "PRAGMA journal_mode = WAL;"
     "PRAGMA synchronous  = NORMAL;"
@@ -95,6 +94,13 @@ ggnfs_db_t *db_open(const char *path)
     }
     /* Best-effort; don't fail open if FK enforcement can't be turned on. */
     (void)exec_or_log(conn, "PRAGMA foreign_keys = ON;", "enable foreign_keys");
+
+    /* Two connections (main event loop + verifier thread) will share this file
+     * once the verifier lands. WAL mode allows readers + one writer; busy_timeout
+     * resolves the brief contention window when both try to commit at once.
+     * 5s is long enough to ride out the other side's BEGIN IMMEDIATE / UPDATE /
+     * COMMIT but short enough that a real deadlock is still loud. */
+    sqlite3_busy_timeout(conn, 5000);
 
     ggnfs_db_t *db = calloc(1, sizeof(*db));
     if (!db) { sqlite3_close(conn); return NULL; }
@@ -355,7 +361,7 @@ int db_submit(ggnfs_db_t *db,
             "INSERT INTO submissions("
             "  workunit_id, client_id, received_at, file_path, sha256,"
             "  num_relations, verify_status, sieve_seconds"
-            ") VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'skipped', ?7);",
+            ") VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', ?7);",
             -1, &ins, NULL) != SQLITE_OK)
         goto done;
     sqlite3_bind_text  (ins, 1, workunit_id,     -1, SQLITE_STATIC);
@@ -382,6 +388,33 @@ done:
     return result;
 }
 
+int db_release_lease(ggnfs_db_t *db, const char *workunit_id,
+                     const char *client_id)
+{
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db->conn,
+            "UPDATE workunits "
+            "  SET state = 'available',"
+            "      leased_at = NULL,"
+            "      leased_to = NULL,"
+            "      lease_expires = NULL "
+            "  WHERE id = ?1 AND state = 'leased' AND leased_to = ?2;",
+            -1, &st, NULL) != SQLITE_OK) {
+        fprintf(stderr, "db_release_lease: %s\n", sqlite3_errmsg(db->conn));
+        return -1;
+    }
+    sqlite3_bind_text(st, 1, workunit_id, -1, SQLITE_STATIC);
+    sqlite3_bind_text(st, 2, client_id,   -1, SQLITE_STATIC);
+    int rc = sqlite3_step(st);
+    int changed = sqlite3_changes(db->conn);
+    sqlite3_finalize(st);
+    if (rc != SQLITE_DONE) {
+        fprintf(stderr, "db_release_lease: step: %s\n", sqlite3_errmsg(db->conn));
+        return -1;
+    }
+    return changed > 0 ? 0 : 1;
+}
+
 int db_clients_seen(ggnfs_db_t *db, const char *client_id, int64_t now_unix)
 {
     sqlite3_stmt *st = NULL;
@@ -395,6 +428,212 @@ int db_clients_seen(ggnfs_db_t *db, const char *client_id, int64_t now_unix)
     int rc = sqlite3_step(st);
     sqlite3_finalize(st);
     return (rc == SQLITE_DONE) ? 0 : -1;
+}
+
+/* ---- verifier --------------------------------------------------------- */
+
+void db_pending_free(db_pending_t *p)
+{
+    if (!p) return;
+    free(p->file_path);
+    p->file_path = NULL;
+}
+
+int db_verify_next_pending(ggnfs_db_t *db, db_pending_t *out)
+{
+    if (!out) return -1;
+    memset(out, 0, sizeof(*out));
+
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db->conn,
+            "SELECT s.id, s.workunit_id, s.file_path,"
+            "       w.q_start, w.q_range, w.side, w.attempt_count "
+            "FROM submissions s JOIN workunits w ON w.id = s.workunit_id "
+            "WHERE s.verify_status = 'pending' "
+            "ORDER BY s.id LIMIT 1;",
+            -1, &st, NULL) != SQLITE_OK) {
+        fprintf(stderr, "db_verify_next_pending: %s\n", sqlite3_errmsg(db->conn));
+        return -1;
+    }
+
+    int result = 1; /* nothing pending */
+    int rc = sqlite3_step(st);
+    if (rc == SQLITE_ROW) {
+        out->submission_id = sqlite3_column_int64(st, 0);
+        const unsigned char *wuid = sqlite3_column_text(st, 1);
+        snprintf(out->workunit_id, sizeof(out->workunit_id), "%s",
+                 wuid ? (const char *)wuid : "");
+        const unsigned char *fp = sqlite3_column_text(st, 2);
+        out->file_path = fp ? strdup((const char *)fp) : NULL;
+        out->q_start = sqlite3_column_int64(st, 3);
+        out->q_range = sqlite3_column_int64(st, 4);
+        const unsigned char *side = sqlite3_column_text(st, 5);
+        out->side = side ? (char)side[0] : '?';
+        out->attempt_count = sqlite3_column_int64(st, 6);
+        result = 0;
+    } else if (rc != SQLITE_DONE) {
+        fprintf(stderr, "db_verify_next_pending: step: %s\n", sqlite3_errmsg(db->conn));
+        result = -1;
+    }
+    sqlite3_finalize(st);
+    return result;
+}
+
+int db_verify_pass(ggnfs_db_t *db, int64_t submission_id,
+                   int64_t num_relations_actual, int64_t now_unix)
+{
+    (void)now_unix;  /* completed_at on workunit was set at submit time */
+
+    if (sqlite3_exec(db->conn, "BEGIN IMMEDIATE;", NULL, NULL, NULL) != SQLITE_OK) {
+        fprintf(stderr, "db_verify_pass: begin: %s\n", sqlite3_errmsg(db->conn));
+        return -1;
+    }
+
+    int result = -1;
+    sqlite3_stmt *st = NULL;
+
+    /* Update the submission row. RETURNING gives us workunit_id and client_id
+     * so we can roll the rest of the transition off the same statement.
+     * Guard with the current state so a duplicate verifier run is a no-op. */
+    if (sqlite3_prepare_v2(db->conn,
+            "UPDATE submissions "
+            "  SET verify_status = 'passed',"
+            "      verify_reason = NULL,"
+            "      num_relations = ?1 "
+            "  WHERE id = ?2 AND verify_status = 'pending' "
+            "RETURNING workunit_id, client_id;",
+            -1, &st, NULL) != SQLITE_OK) goto done;
+    sqlite3_bind_int64(st, 1, num_relations_actual);
+    sqlite3_bind_int64(st, 2, submission_id);
+
+    int rc = sqlite3_step(st);
+    if (rc != SQLITE_ROW) {
+        /* No row matched — already resolved or bad id. Treat as success so the
+         * caller stops retrying; nothing further to do. */
+        result = (rc == SQLITE_DONE) ? 0 : -1;
+        goto done;
+    }
+    const unsigned char *wuid = sqlite3_column_text(st, 0);
+    const unsigned char *cid  = sqlite3_column_text(st, 1);
+    char wu_buf[64]; char client_buf[128];
+    snprintf(wu_buf,     sizeof(wu_buf),     "%s", wuid ? (const char *)wuid : "");
+    snprintf(client_buf, sizeof(client_buf), "%s", cid  ? (const char *)cid  : "");
+    sqlite3_finalize(st); st = NULL;
+
+    /* Workunit → verified. */
+    if (sqlite3_prepare_v2(db->conn,
+            "UPDATE workunits SET state = 'verified' WHERE id = ?1;",
+            -1, &st, NULL) != SQLITE_OK) goto done;
+    sqlite3_bind_text(st, 1, wu_buf, -1, SQLITE_STATIC);
+    if (sqlite3_step(st) != SQLITE_DONE) goto done;
+    sqlite3_finalize(st); st = NULL;
+
+    /* clients.total_relations += N; total_workunits += 1. The submitting
+     * client is whoever the submission row recorded; we trust that here. */
+    if (sqlite3_prepare_v2(db->conn,
+            "UPDATE clients "
+            "  SET total_relations = total_relations + ?1,"
+            "      total_workunits = total_workunits + 1 "
+            "  WHERE id = ?2;",
+            -1, &st, NULL) != SQLITE_OK) goto done;
+    sqlite3_bind_int64(st, 1, num_relations_actual);
+    sqlite3_bind_text (st, 2, client_buf, -1, SQLITE_STATIC);
+    if (sqlite3_step(st) != SQLITE_DONE) goto done;
+
+    result = 0;
+
+done:
+    if (st) sqlite3_finalize(st);
+    if (result == 0) {
+        sqlite3_exec(db->conn, "COMMIT;",   NULL, NULL, NULL);
+    } else {
+        fprintf(stderr, "db_verify_pass: %s\n", sqlite3_errmsg(db->conn));
+        sqlite3_exec(db->conn, "ROLLBACK;", NULL, NULL, NULL);
+    }
+    return result;
+}
+
+int db_verify_fail(ggnfs_db_t *db, int64_t submission_id,
+                   const char *reason, int64_t max_attempts,
+                   int64_t now_unix, int *out_poisoned)
+{
+    (void)now_unix;
+    if (out_poisoned) *out_poisoned = 0;
+
+    if (sqlite3_exec(db->conn, "BEGIN IMMEDIATE;", NULL, NULL, NULL) != SQLITE_OK) {
+        fprintf(stderr, "db_verify_fail: begin: %s\n", sqlite3_errmsg(db->conn));
+        return -1;
+    }
+
+    int result = -1;
+    sqlite3_stmt *st = NULL;
+
+    /* Flip submission to failed, capture workunit + client for the rest. */
+    if (sqlite3_prepare_v2(db->conn,
+            "UPDATE submissions "
+            "  SET verify_status = 'failed',"
+            "      verify_reason = ?1 "
+            "  WHERE id = ?2 AND verify_status = 'pending' "
+            "RETURNING workunit_id, client_id;",
+            -1, &st, NULL) != SQLITE_OK) goto done;
+    sqlite3_bind_text (st, 1, reason ? reason : "unspecified", -1, SQLITE_STATIC);
+    sqlite3_bind_int64(st, 2, submission_id);
+
+    int rc = sqlite3_step(st);
+    if (rc != SQLITE_ROW) {
+        result = (rc == SQLITE_DONE) ? 0 : -1;
+        goto done;
+    }
+    const unsigned char *wuid = sqlite3_column_text(st, 0);
+    const unsigned char *cid  = sqlite3_column_text(st, 1);
+    char wu_buf[64]; char client_buf[128];
+    snprintf(wu_buf,     sizeof(wu_buf),     "%s", wuid ? (const char *)wuid : "");
+    snprintf(client_buf, sizeof(client_buf), "%s", cid  ? (const char *)cid  : "");
+    sqlite3_finalize(st); st = NULL;
+
+    /* Workunit: attempt_count++ then either available (retry) or poisoned.
+     * Mirrors the CASE pattern in db_lease_expire_sweep so the two paths
+     * to retire a workunit stay consistent. */
+    if (sqlite3_prepare_v2(db->conn,
+            "UPDATE workunits "
+            "  SET attempt_count = attempt_count + 1,"
+            "      state = CASE WHEN attempt_count + 1 >= ?1"
+            "                   THEN 'poisoned' ELSE 'available' END,"
+            "      leased_at = NULL,"
+            "      leased_to = NULL,"
+            "      lease_expires = NULL "
+            "  WHERE id = ?2 "
+            "RETURNING state;",
+            -1, &st, NULL) != SQLITE_OK) goto done;
+    sqlite3_bind_int64(st, 1, max_attempts);
+    sqlite3_bind_text (st, 2, wu_buf, -1, SQLITE_STATIC);
+    rc = sqlite3_step(st);
+    if (rc != SQLITE_ROW) goto done;
+    {
+        const unsigned char *new_state = sqlite3_column_text(st, 0);
+        if (out_poisoned && new_state && strcmp((const char *)new_state, "poisoned") == 0)
+            *out_poisoned = 1;
+    }
+    sqlite3_finalize(st); st = NULL;
+
+    /* clients.total_failures++ */
+    if (sqlite3_prepare_v2(db->conn,
+            "UPDATE clients SET total_failures = total_failures + 1 WHERE id = ?1;",
+            -1, &st, NULL) != SQLITE_OK) goto done;
+    sqlite3_bind_text(st, 1, client_buf, -1, SQLITE_STATIC);
+    if (sqlite3_step(st) != SQLITE_DONE) goto done;
+
+    result = 0;
+
+done:
+    if (st) sqlite3_finalize(st);
+    if (result == 0) {
+        sqlite3_exec(db->conn, "COMMIT;",   NULL, NULL, NULL);
+    } else {
+        fprintf(stderr, "db_verify_fail: %s\n", sqlite3_errmsg(db->conn));
+        sqlite3_exec(db->conn, "ROLLBACK;", NULL, NULL, NULL);
+    }
+    return result;
 }
 
 /* ---- stats snapshot --------------------------------------------------- */

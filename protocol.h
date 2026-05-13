@@ -67,6 +67,13 @@ char *proto_encode_submit_response(int accepted,
                                    const char *verified_status,
                                    int64_t num_relations);
 
+/* ---- /release ---- */
+
+char *proto_encode_release_request(const char *workunit_id, const char *client_id);
+int proto_decode_release_request(const char *body, size_t body_len,
+                                 char *workunit_id_buf, size_t workunit_id_buf_n,
+                                 char *client_id_buf,   size_t client_id_buf_n);
+
 /* ---- /health ---- */
 
 char *proto_encode_health_response(int ok, const char *job_id,

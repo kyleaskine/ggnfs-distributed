@@ -18,6 +18,11 @@
   td.num, th.num { text-align: right; font-family: ui-monospace, Consolas, monospace; }
   tr.active { background: #eff7ee; }
   tr.stale  { color: #aaa; }
+  tr.worker { background: #fcfcfc; font-size: 0.92em; }
+  tr.worker.active { background: #f3faf2; }
+  tr.worker td:first-child { padding-left: 2.2em; color: #555; }
+  .client-toggle { border: 0; background: transparent; color: inherit; cursor: pointer; font: inherit; padding: 0; }
+  .client-toggle .twisty { display: inline-block; width: 1.2em; color: #666; font-family: ui-monospace, Consolas, monospace; }
   .progress { height: 22px; background: #eee; border-radius: 11px; overflow: hidden; margin: 0.6em 0; display: flex; }
   .progress > div { height: 100%; }
   .b-verified  { background: #2e7d32; }
@@ -59,6 +64,7 @@
   <table>
     <thead><tr>
       <th>id</th>
+      <th class="num">workers</th>
       <th>last seen</th>
       <th class="num">workunits</th>
       <th class="num">relations</th>
@@ -104,8 +110,76 @@
       return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
     });
   }
+  var expandedClients = {};
+
+  document.getElementById('clients').addEventListener('click', function (ev) {
+    var btn = ev.target.closest && ev.target.closest('.client-toggle');
+    if (!btn) return;
+    var id = btn.getAttribute('data-client');
+    expandedClients[id] = !expandedClients[id];
+    var last = window.__lastStats;
+    if (last) render(last);
+  });
+
+  function clientGroupId(id) {
+    return String(id || '').replace(/-w[0-9]+$/, '');
+  }
+
+  function weightedAvg(totalSeconds, count) {
+    return count > 0 ? totalSeconds / count : 0;
+  }
+
+  function groupClients(clients) {
+    var groupsById = {};
+    var groups = [];
+    for (var i = 0; i < clients.length; i++) {
+      var c = clients[i];
+      var id = clientGroupId(c.id);
+      var g = groupsById[id];
+      if (!g) {
+        g = {
+          id: id,
+          first_seen: c.first_seen || 0,
+          last_seen: c.last_seen || 0,
+          submissions: 0,
+          relations: 0,
+          total_failures: 0,
+          avg_total_seconds: 0,
+          current_count: 0,
+          workers: []
+        };
+        groupsById[id] = g;
+        groups.push(g);
+      }
+      var submissions = c.submissions || 0;
+      g.workers.push(c);
+      if (!g.first_seen || (c.first_seen && c.first_seen < g.first_seen)) g.first_seen = c.first_seen;
+      if ((c.last_seen || 0) > g.last_seen) g.last_seen = c.last_seen || 0;
+      g.submissions += submissions;
+      g.relations += c.relations || 0;
+      g.total_failures += c.total_failures || 0;
+      g.avg_total_seconds += (c.avg_sieve_seconds || 0) * submissions;
+      if (c.current_workunit) g.current_count++;
+    }
+    for (var j = 0; j < groups.length; j++) {
+      groups[j].avg_sieve_seconds = weightedAvg(groups[j].avg_total_seconds, groups[j].submissions);
+      groups[j].workers.sort(function (a, b) {
+        return String(a.id).localeCompare(String(b.id), undefined, { numeric: true });
+      });
+    }
+    groups.sort(function (a, b) { return (b.last_seen || 0) - (a.last_seen || 0); });
+    return groups;
+  }
+
+  function rowState(lastSeen, activeCount) {
+    var dt = Math.floor(Date.now()/1000) - (lastSeen || 0);
+    if (activeCount) return 'active';
+    if (dt > 300) return 'stale';
+    return '';
+  }
 
   function render(s) {
+    window.__lastStats = s;
     document.getElementById('job-id').textContent     = '— job ' + s.job_id;
     document.getElementById('server-line').textContent =
       'siever ' + s.siever + ' / side ' + s.side +
@@ -167,32 +241,73 @@
     var clients = s.clients || [];
     if (clients.length === 0) {
       var tr = document.createElement('tr');
-      tr.innerHTML = '<td colspan="7" class="warn">no clients have connected yet</td>';
+      tr.innerHTML = '<td colspan="8" class="warn">no clients have connected yet</td>';
       tbody.appendChild(tr);
     } else {
-      for (var j = 0; j < clients.length; j++) {
-        var c  = clients[j];
-        var dt = Math.floor(Date.now()/1000) - c.last_seen;
+      var groups = groupClients(clients);
+      for (var j = 0; j < groups.length; j++) {
+        var c  = groups[j];
+        var isOpen = !!expandedClients[c.id];
         var tr = document.createElement('tr');
-        if (c.current_workunit) tr.className = 'active';
-        else if (dt > 300)      tr.className = 'stale';
+        tr.className = rowState(c.last_seen, c.current_count);
+        var current = c.current_count ? fmt(c.current_count) + ' active' : '';
         tr.innerHTML =
-          '<td>' + escapeHtml(c.id) + '</td>' +
+          '<td><button type="button" class="client-toggle" data-client="' + escapeHtml(c.id) + '">' +
+          '<span class="twisty">' + (isOpen ? '-' : '+') + '</span>' +
+          escapeHtml(c.id) + '</button></td>' +
+          '<td class="num">' + fmt(c.workers.length) + '</td>' +
           '<td>' + ageText(c.last_seen) + '</td>' +
           '<td class="num">' + fmt(c.submissions) + '</td>' +
           '<td class="num">' + fmt(c.relations) + '</td>' +
           '<td class="num">' + (c.avg_sieve_seconds || 0).toFixed(1) + '</td>' +
           '<td class="num">' + (c.total_failures ? c.total_failures : '') + '</td>' +
-          '<td>' + escapeHtml(c.current_workunit || '') + '</td>';
+          '<td>' + escapeHtml(current) + '</td>';
         tbody.appendChild(tr);
+        if (isOpen) {
+          for (var k = 0; k < c.workers.length; k++) {
+            var wkr = c.workers[k];
+            var wr = document.createElement('tr');
+            wr.className = 'worker ' + rowState(wkr.last_seen, wkr.current_workunit ? 1 : 0);
+            wr.innerHTML =
+              '<td>' + escapeHtml(wkr.id) + '</td>' +
+              '<td class="num">1</td>' +
+              '<td>' + ageText(wkr.last_seen) + '</td>' +
+              '<td class="num">' + fmt(wkr.submissions) + '</td>' +
+              '<td class="num">' + fmt(wkr.relations) + '</td>' +
+              '<td class="num">' + (wkr.avg_sieve_seconds || 0).toFixed(1) + '</td>' +
+              '<td class="num">' + (wkr.total_failures ? wkr.total_failures : '') + '</td>' +
+              '<td>' + escapeHtml(wkr.current_workunit || '') + '</td>';
+            tbody.appendChild(wr);
+          }
+        }
       }
     }
 
     document.getElementById('updated').textContent = new Date().toLocaleTimeString();
   }
 
+  var statsFetch = null;
+  var statsTimeout = null;
+
+  function finishPoll() {
+    if (statsTimeout) clearTimeout(statsTimeout);
+    statsTimeout = null;
+    statsFetch = null;
+  }
+
   function poll() {
-    fetch('/stats', { headers: { 'Authorization': 'Bearer ' + token } })
+    if (statsFetch) return;
+
+    statsFetch = new AbortController();
+    statsTimeout = setTimeout(function () {
+      if (statsFetch) statsFetch.abort();
+    }, 10000);
+
+    fetch('/stats', {
+      headers: { 'Authorization': 'Bearer ' + token },
+      cache: 'no-store',
+      signal: statsFetch.signal
+    })
       .then(function (r) {
         if (r.status === 401) {
           document.getElementById('auth-warn').textContent = '401 — token rejected.';
@@ -204,10 +319,17 @@
         return r.json();
       })
       .then(render)
-      .catch(function (e) { console.error(e); });
+      .catch(function (e) {
+        if (e && e.name === 'AbortError') return;
+        console.error(e);
+      })
+      .finally(finishPoll);
   }
+  window.addEventListener('beforeunload', function () {
+    if (statsFetch) statsFetch.abort();
+  });
   poll();
-  setInterval(poll, 30000);
+  setInterval(poll, 5000);
 })();
 </script>
 </body>

@@ -1,9 +1,10 @@
 /* db.h — SQLite layer for ggnfs-sieve-server.
  *
- * Single-connection model: open once at server start, all operations run on
- * the main mongoose event-loop thread. No locking is needed in Phase 1; when
- * the verifier thread lands in Phase 3 we'll either add a mutex or give it
- * its own connection.
+ * Connection model: each thread that touches SQLite opens its own
+ * ggnfs_db_t. The main event loop owns one; the verifier thread owns
+ * another. WAL mode + sqlite3_busy_timeout() (set in db_open) keep
+ * cross-thread contention to brief stalls rather than failures. There
+ * is no shared mutex; correctness comes from sqlite's own locking.
  */
 #ifndef GGNFS_SIEVE_DB_H
 #define GGNFS_SIEVE_DB_H
@@ -66,8 +67,8 @@ int db_lease(ggnfs_db_t *db, const char *client_id,
              db_lease_result_t *out);
 
 /* Record a relation file submission and mark the workunit submitted.
- * `verify_status` is hardcoded to 'skipped' in Phase 1 (no verifier yet).
- * Returns 0 on success, 1 if the workunit is not currently leased
+ * New submissions land with verify_status='pending' for the verifier to pick
+ * up. Returns 0 on success, 1 if the workunit is not currently leased
  * (caller should respond 409), -1 on internal error. */
 int db_submit(ggnfs_db_t *db,
               const char *workunit_id, const char *client_id,
@@ -75,8 +76,51 @@ int db_submit(ggnfs_db_t *db,
               int64_t num_relations, double sieve_seconds,
               int64_t now_unix);
 
+/* Voluntarily release a current lease back to available. Only succeeds if
+ * `workunit_id` is currently leased to `client_id`. Does not increment
+ * attempt_count, because this is operator-requested shutdown rather than a
+ * workunit failure. Returns 0 on release, 1 if no matching active lease exists,
+ * -1 on internal error. */
+int db_release_lease(ggnfs_db_t *db, const char *workunit_id,
+                     const char *client_id);
+
 /* Upsert a client's last_seen timestamp. */
 int db_clients_seen(ggnfs_db_t *db, const char *client_id, int64_t now_unix);
+
+/* ---- verifier API (called from the verifier thread) ----------------- */
+
+typedef struct {
+    int64_t  submission_id;
+    char     workunit_id[64];
+    int64_t  q_start;
+    int64_t  q_range;
+    char     side;
+    int64_t  attempt_count;     /* pre-this-attempt; informational */
+    char    *file_path;         /* malloc'd; caller frees via db_pending_free */
+} db_pending_t;
+
+void db_pending_free(db_pending_t *p);
+
+/* Fetch the oldest pending submission joined with its workunit. Returns 0 on
+ * success (out filled), 1 if nothing pending, -1 on internal error.
+ * Read-only; doesn't transition state — the verifier resolves with pass/fail
+ * after processing the file. */
+int db_verify_next_pending(ggnfs_db_t *db, db_pending_t *out);
+
+/* Parse pass: submission → 'passed' (with corrected num_relations), workunit
+ * → 'verified', clients.total_relations += num_relations and total_workunits++.
+ * One BEGIN IMMEDIATE transaction. Returns 0 on success, -1 on error. */
+int db_verify_pass(ggnfs_db_t *db, int64_t submission_id,
+                   int64_t num_relations_actual, int64_t now_unix);
+
+/* Parse fail: submission → 'failed' with `reason`; workunit either back to
+ * 'available' with attempt_count++ or 'poisoned' if the post-increment count
+ * reaches max_attempts. Bumps clients.total_failures.
+ * *out_poisoned (may be NULL) set to 1 if the workunit was poisoned.
+ * Returns 0 on success, -1 on error. */
+int db_verify_fail(ggnfs_db_t *db, int64_t submission_id,
+                   const char *reason, int64_t max_attempts,
+                   int64_t now_unix, int *out_poisoned);
 
 /* ---- health/status ---- */
 

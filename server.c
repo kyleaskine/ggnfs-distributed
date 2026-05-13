@@ -4,8 +4,10 @@
  *                            --qmin=80000000 --qmax=100000000 --qrange=10000 \
  *                            [--side=a] [--jobdir=.]
  *
- *   ggnfs-sieve-server serve  [--port=8080] [--jobdir=.] [--lease-seconds=3600]
+ *   ggnfs-sieve-server serve  [--bind=127.0.0.1] [--port=8080] [--jobdir=.]
+ *                            [--lease-seconds=3600]
  *                            [--sweep-seconds=60] [--max-attempts=5]
+ *                            [--spotcheck-k=50]   (0 disables norm spot-check)
  *
  * The server reuses the bearer token from <jobdir>/token (written at init).
  * One job per server. No verification, no .ranges write-back, no /stats.
@@ -14,6 +16,7 @@
 
 #include "db.h"
 #include "protocol.h"
+#include "verify.h"
 #include "vendor/cJSON.h"
 #include "vendor/mongoose.h"
 
@@ -286,6 +289,24 @@ static int cmd_init(int argc, char **argv)
         return 1;
     }
 
+    /* Parse the .job for polynomial coefficients and stash them in meta so
+     * the verifier (Phase 3) doesn't have to re-parse the file at startup. */
+    {
+        verify_poly_t poly;
+        if (verify_parse_job_file(dst_path, &poly) != 0) {
+            fprintf(stderr, "init: failed to parse polynomial from %s\n", dst_path);
+            db_close(db);
+            return 1;
+        }
+        if (verify_poly_save_to_meta(db, &poly) != 0) {
+            fprintf(stderr, "init: failed to store polynomial in meta\n");
+            verify_poly_free(&poly);
+            db_close(db);
+            return 1;
+        }
+        verify_poly_free(&poly);
+    }
+
     /* job_id = first 8 hex of the .job sha (per the design's wu-<jobhash>-<seq>). */
     char job_id[9];
     memcpy(job_id, job_sha, 8); job_id[8] = '\0';
@@ -483,12 +504,14 @@ typedef struct {
     int64_t     sweep_seconds;
     int64_t     started_at;
     int64_t     max_attempts;       /* mark workunit poisoned after this many lease expiries */
+    verify_thread_t *verifier;      /* background parse-pass verifier; may be NULL */
 } server_ctx_t;
 
 #define COMMAND_TEMPLATE_DEFAULT \
     "{siever} -f {q_start} -c {q_range} -a {job_file} -o {output_file} -n 0"
 #define OUTPUT_NAME_DEFAULT  "rels.out"
 #define OUTPUT_MAX_BYTES     (524288000LL)  /* 500 MiB per design */
+#define SERVER_POLL_MS       50
 
 static void send_text(struct mg_connection *c, int code, const char *body)
 {
@@ -505,6 +528,23 @@ static void send_json_take(struct mg_connection *c, int code, char *json_owned)
     } else {
         mg_http_reply(c, code, "Content-Type: application/json\r\n", "{}");
     }
+}
+
+static void send_json_take_close(struct mg_connection *c, int code, char *json_owned)
+{
+    /* /stats is browser-polled and often interrupted by reloads. Do not leave
+     * those fetch connections in the browser's keep-alive pool. */
+    const char *headers =
+        "Content-Type: application/json\r\n"
+        "Cache-Control: no-store\r\n"
+        "Connection: close\r\n";
+    if (json_owned) {
+        mg_http_reply(c, code, headers, "%s", json_owned);
+        free(json_owned);
+    } else {
+        mg_http_reply(c, code, headers, "{}");
+    }
+    c->is_draining = 1;
 }
 
 /* Returns 1 if the request carries a valid Bearer token; 0 otherwise.
@@ -621,6 +661,23 @@ static int header_get_str(struct mg_http_message *hm, const char *name,
     return 0;
 }
 
+static int workunit_id_is_safe_for_job(const char *id, const char *job_id)
+{
+    size_t job_len = strlen(job_id);
+    size_t prefix_len = 3 + job_len + 1;  /* "wu-" + job_id + "-" */
+
+    if (job_len == 0) return 0;
+    if (strncmp(id, "wu-", 3) != 0) return 0;
+    if (strncmp(id + 3, job_id, job_len) != 0) return 0;
+    if (id[3 + job_len] != '-') return 0;
+    if (id[prefix_len] == '\0') return 0;
+
+    for (const char *p = id + prefix_len; *p; p++) {
+        if (!isdigit((unsigned char)*p)) return 0;
+    }
+    return 1;
+}
+
 static void handle_submit(struct mg_connection *c, struct mg_http_message *hm,
                           server_ctx_t *ctx)
 {
@@ -630,6 +687,10 @@ static void handle_submit(struct mg_connection *c, struct mg_http_message *hm,
     if (header_get_str(hm, "X-Workunit-Id", workunit_id, sizeof(workunit_id)) != 0 ||
         header_get_str(hm, "X-Client-Id",   client_id,   sizeof(client_id))   != 0) {
         send_text(c, 400, "missing X-Workunit-Id / X-Client-Id\n");
+        return;
+    }
+    if (!workunit_id_is_safe_for_job(workunit_id, ctx->job_id)) {
+        send_text(c, 400, "invalid X-Workunit-Id\n");
         return;
     }
     /* X-Sha256 and X-Sieve-Seconds are advisory in Phase 1. */
@@ -698,7 +759,42 @@ static void handle_submit(struct mg_connection *c, struct mg_http_message *hm,
     }
     free(rel_path);
 
-    send_json_take(c, 200, proto_encode_submit_response(1, "skipped", num_relations));
+    /* Nudge the verifier so it processes this submission promptly instead of
+     * waiting for its 5-second timed-wait safety net. */
+    verify_thread_wake(ctx->verifier);
+
+    send_json_take(c, 200, proto_encode_submit_response(1, "pending", num_relations));
+}
+
+/* ---- /release ---- */
+
+static void handle_release(struct mg_connection *c, struct mg_http_message *hm,
+                           server_ctx_t *ctx)
+{
+    if (!check_auth(c, hm, ctx->token)) return;
+
+    char workunit_id[64], client_id[64];
+    if (proto_decode_release_request(hm->body.buf, hm->body.len,
+                                     workunit_id, sizeof(workunit_id),
+                                     client_id,   sizeof(client_id)) != 0 ||
+        workunit_id[0] == '\0' || client_id[0] == '\0') {
+        send_text(c, 400, "missing workunit_id / client_id\n");
+        return;
+    }
+    if (!workunit_id_is_safe_for_job(workunit_id, ctx->job_id)) {
+        send_text(c, 400, "invalid workunit_id\n");
+        return;
+    }
+
+    db_clients_seen(ctx->db, client_id, now_unix());
+    int rc = db_release_lease(ctx->db, workunit_id, client_id);
+    if (rc == 0) {
+        send_json_take(c, 200, proto_encode_submit_response(1, "released", 0));
+    } else if (rc == 1) {
+        send_text(c, 409, "workunit not leased to client\n");
+    } else {
+        send_text(c, 500, "internal error\n");
+    }
 }
 
 /* ---- /stats ---- */
@@ -774,7 +870,7 @@ static void handle_stats(struct mg_connection *c, struct mg_http_message *hm,
     char *json = format_stats_json(ctx, &s, now_unix());
     db_stats_free(&s);
     if (!json) { send_text(c, 500, "oom\n"); return; }
-    send_json_take(c, 200, json);
+    send_json_take_close(c, 200, json);
 }
 
 /* ---- / dashboard (HTML, no auth — JS fetches /stats with bearer token) ---- */
@@ -853,9 +949,12 @@ static void ev_handler(struct mg_connection *c, int ev, void *ev_data)
         handle_file(c, hm, ctx);
     } else if (uri_eq(hm, "/submit") && method_is(hm, "POST")) {
         handle_submit(c, hm, ctx);
+    } else if (uri_eq(hm, "/release") && method_is(hm, "POST")) {
+        handle_release(c, hm, ctx);
     } else if (uri_eq(hm, "/health") && method_is(hm, "GET")) {
         handle_health(c, hm, ctx);
-    } else if (uri_eq(hm, "/stats") && method_is(hm, "GET")) {
+    } else if ((uri_eq(hm, "/stats") || uri_eq(hm, "/stats/")) &&
+               method_is(hm, "GET")) {
         handle_stats(c, hm, ctx);
     } else if ((uri_eq(hm, "/") || uri_eq(hm, "/dashboard"))
                && method_is(hm, "GET")) {
@@ -901,17 +1000,24 @@ static void on_sweep_timer(void *arg)
 
 static int cmd_serve(int argc, char **argv)
 {
+    const char *bind      = flag(argc, argv, "--bind");
     const char *port_s    = flag(argc, argv, "--port");
     const char *jobdir    = flag(argc, argv, "--jobdir");
     const char *lease_s   = flag(argc, argv, "--lease-seconds");
     const char *sweep_s   = flag(argc, argv, "--sweep-seconds");
     const char *attempt_s = flag(argc, argv, "--max-attempts");
+    const char *spot_s    = flag(argc, argv, "--spotcheck-k");
 
     int64_t port = 8080;
     if (port_s && *port_s && parse_int64_arg(port_s, &port) != 0) {
         fprintf(stderr, "serve: bad --port\n");
         return 2;
     }
+    if (port < 1 || port > 65535) {
+        fprintf(stderr, "serve: --port must be in 1..65535\n");
+        return 2;
+    }
+    if (!bind || !*bind) bind = "127.0.0.1";
     if (!jobdir || !*jobdir) jobdir = ".";
 
     int64_t lease_seconds = 3600;
@@ -934,13 +1040,19 @@ static int cmd_serve(int argc, char **argv)
     }
     if (max_attempts < 1) max_attempts = 1;
 
+    int64_t spotcheck_k = 50;
+    if (spot_s && *spot_s && parse_int64_arg(spot_s, &spotcheck_k) != 0) {
+        fprintf(stderr, "serve: bad --spotcheck-k\n");
+        return 2;
+    }
+    if (spotcheck_k < 0) spotcheck_k = 0;
+
     char *db_path = path_join(jobdir, "job.db");
     if (!db_path) return 1;
 
     server_ctx_t ctx = {0};
     ctx.db = db_open(db_path);
-    free(db_path);
-    if (!ctx.db) return 1;
+    if (!ctx.db) { free(db_path); return 1; }
 
     /* Pull job metadata. token is also re-loaded from disk for the operator's
      * convenience (rotating the token = edit <jobdir>/token + restart). */
@@ -992,8 +1104,15 @@ static int cmd_serve(int argc, char **argv)
     if (!ctx.jobdir || !ctx.rels_dir) { db_close(ctx.db); return 1; }
 
     char listen_url[64];
-    snprintf(listen_url, sizeof(listen_url), "http://0.0.0.0:%lld",
-             (long long)port);
+    if (snprintf(listen_url, sizeof(listen_url), "http://%s:%lld",
+                 bind, (long long)port) >= (int)sizeof(listen_url)) {
+        fprintf(stderr, "serve: bind address too long\n");
+        free(ctx.jobdir);
+        free(ctx.rels_dir);
+        free(db_path);
+        db_close(ctx.db);
+        return 2;
+    }
 
     struct mg_mgr mgr;
     mg_mgr_init(&mgr);
@@ -1012,6 +1131,15 @@ static int cmd_serve(int argc, char **argv)
     mg_timer_add(&mgr, (uint64_t)sweep_seconds * 1000,
                  MG_TIMER_REPEAT, on_sweep_timer, &ctx);
 
+    /* Start the verifier. It opens its own SQLite connection against the same
+     * file; correctness comes from WAL mode + busy_timeout (see db_open). On
+     * startup it will drain any pending submissions left over from a prior
+     * run before going to sleep on its condvar. */
+    ctx.verifier = verify_thread_start(db_path, ctx.max_attempts, (int)spotcheck_k);
+    if (!ctx.verifier) {
+        fprintf(stderr, "serve: verifier failed to start — submissions will queue as 'pending'\n");
+    }
+
     fprintf(stderr,
         "ggnfs-sieve-server: serving job %s on %s\n"
         "  jobdir       : %s\n"
@@ -1028,13 +1156,33 @@ static int cmd_serve(int argc, char **argv)
         ctx.job_sha256, ctx.token,
         listen_url, ctx.token);
 
-    for (;;) mg_mgr_poll(&mgr, 1000);
+    for (;;) mg_mgr_poll(&mgr, SERVER_POLL_MS);
 
     /* Unreachable today (no graceful shutdown), but tidy: */
+    verify_thread_stop(ctx.verifier);
     mg_mgr_free(&mgr);
     free(ctx.jobdir); free(ctx.rels_dir);
+    free(db_path);
     db_close(ctx.db);
     return 0;
+}
+
+/* ===================== verify-parse subcommand ========================= */
+
+/* Diagnostic: stream a relation file through the parser and report counts.
+ * Useful for smoke-testing the parser against real siever output without
+ * standing up a full job. */
+static int cmd_verify_parse(int argc, char **argv)
+{
+    if (argc < 2) {
+        fprintf(stderr, "usage: ggnfs-sieve-server verify-parse <relation-file>\n");
+        return 2;
+    }
+    int64_t parsed = 0, failed = 0;
+    if (verify_parse_file(argv[1], &parsed, &failed) != 0) return 1;
+    printf("parsed=%lld failed=%lld\n",
+           (long long)parsed, (long long)failed);
+    return failed > 0 ? 1 : 0;
 }
 
 /* ===================== main ============================================= */
@@ -1044,18 +1192,20 @@ static void usage_top(void)
     fprintf(stderr,
         "ggnfs-sieve-server — Phase 1 walking skeleton\n"
         "usage:\n"
-        "  ggnfs-sieve-server init   [args...]   create a new job\n"
-        "  ggnfs-sieve-server extend [args...]   add workunits to an existing job\n"
-        "  ggnfs-sieve-server serve  [args...]   run the HTTP server\n"
+        "  ggnfs-sieve-server init         [args...]   create a new job\n"
+        "  ggnfs-sieve-server extend       [args...]   add workunits to an existing job\n"
+        "  ggnfs-sieve-server serve        [--bind=127.0.0.1] [--port=8080] [args...]\n"
+        "  ggnfs-sieve-server verify-parse <file>      diagnostic: parse a relation file\n"
         "Run a subcommand without args to see its flags.\n");
 }
 
 int main(int argc, char **argv)
 {
     if (argc < 2) { usage_top(); return 2; }
-    if (strcmp(argv[1], "init")   == 0) return cmd_init  (argc - 1, argv + 1);
-    if (strcmp(argv[1], "extend") == 0) return cmd_extend(argc - 1, argv + 1);
-    if (strcmp(argv[1], "serve")  == 0) return cmd_serve (argc - 1, argv + 1);
+    if (strcmp(argv[1], "init")         == 0) return cmd_init        (argc - 1, argv + 1);
+    if (strcmp(argv[1], "extend")       == 0) return cmd_extend      (argc - 1, argv + 1);
+    if (strcmp(argv[1], "serve")        == 0) return cmd_serve       (argc - 1, argv + 1);
+    if (strcmp(argv[1], "verify-parse") == 0) return cmd_verify_parse(argc - 1, argv + 1);
     if (strcmp(argv[1], "-h") == 0 || strcmp(argv[1], "--help") == 0) {
         usage_top(); return 0;
     }

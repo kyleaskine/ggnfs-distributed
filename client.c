@@ -20,7 +20,7 @@
  * With --workers=N, N pthreads each drive an independent lease/sieve/submit
  * loop. Each worker gets its own workdir (<workdir>/wN), its own client-id
  * (<base>-wN), and its own mg_mgr — so no shared mutable state between
- * threads beyond the global g_stop flag.
+ * threads beyond shutdown state and active-lease bookkeeping.
  *
  * --cpu-pin (Linux only) gives each worker an explicit CPU. Worker K pins
  * itself to the K'th CPU in the list, and the siever (spawned via system())
@@ -59,9 +59,48 @@
 
 #define CLIENT_VERSION "0.1.0"
 
-static volatile sig_atomic_t g_stop = 0;
+enum {
+    SHUTDOWN_RUNNING = 0,
+    SHUTDOWN_DRAINING = 1,
+    SHUTDOWN_CANCELLING = 2
+};
 
-static void on_signal(int sig) { (void)sig; g_stop = 1; }
+static volatile sig_atomic_t g_shutdown = SHUTDOWN_RUNNING;
+
+typedef struct {
+    int  has_lease;
+    char workunit_id[64];
+    char client_id[64];
+} active_lease_t;
+
+static pthread_mutex_t g_active_mu = PTHREAD_MUTEX_INITIALIZER;
+static active_lease_t *g_active = NULL;
+static int g_active_count = 0;
+
+static int shutdown_phase(void)
+{
+    return (int)g_shutdown;
+}
+
+static void on_signal(int sig)
+{
+    (void)sig;
+    if (g_shutdown == SHUTDOWN_RUNNING) {
+        static const char msg[] =
+            "\nclient: draining; finishing active work only. Press Ctrl-C again to release leases and exit.\n";
+        ssize_t ignored;
+        g_shutdown = SHUTDOWN_DRAINING;
+        ignored = write(STDERR_FILENO, msg, sizeof(msg) - 1);
+        (void)ignored;
+    } else if (g_shutdown == SHUTDOWN_DRAINING) {
+        static const char msg[] =
+            "\nclient: cancelling; releasing active leases and exiting.\n";
+        ssize_t ignored;
+        g_shutdown = SHUTDOWN_CANCELLING;
+        ignored = write(STDERR_FILENO, msg, sizeof(msg) - 1);
+        (void)ignored;
+    }
+}
 
 /* ===================== misc helpers ===================================== */
 
@@ -93,6 +132,14 @@ static int file_exists(const char *path)
 {
     struct stat st;
     return stat(path, &st) == 0 && S_ISREG(st.st_mode);
+}
+
+static int regular_file_size(const char *path, off_t *out_size)
+{
+    struct stat st;
+    if (stat(path, &st) != 0 || !S_ISREG(st.st_mode)) return -1;
+    if (out_size) *out_size = st.st_size;
+    return 0;
 }
 
 static int parse_int64_arg(const char *s, int64_t *out)
@@ -250,7 +297,8 @@ static void sync_http_handler(struct mg_connection *c, int ev, void *ev_data)
 
 /* Block until the request completes (or times out). Returns 0 on success
  * (HTTP status now filled in) or -1 on connection-level failure. */
-static int http_request(struct mg_mgr *mgr, http_io_t *io, int timeout_ms)
+static int http_request(struct mg_mgr *mgr, http_io_t *io, int timeout_ms,
+                        int abort_on_cancel)
 {
     io->sent = io->done = io->err = 0;
     io->status = 0;
@@ -261,7 +309,8 @@ static int http_request(struct mg_mgr *mgr, http_io_t *io, int timeout_ms)
     if (!c) return -1;
 
     int waited_ms = 0;
-    while (!io->done && waited_ms < timeout_ms && !g_stop) {
+    while (!io->done && waited_ms < timeout_ms) {
+        if (abort_on_cancel && shutdown_phase() >= SHUTDOWN_CANCELLING) break;
         mg_mgr_poll(mgr, 200);
         waited_ms += 200;
     }
@@ -426,6 +475,26 @@ static int join_url(char *out, size_t out_n, const char *base, const char *suffi
     return snprintf(out, out_n, "%s%s%s", base, sep, suffix) >= (int)out_n ? -1 : 0;
 }
 
+static void active_lease_set(int idx, const char *workunit_id, const char *client_id)
+{
+    if (idx < 0 || idx >= g_active_count || !g_active) return;
+    pthread_mutex_lock(&g_active_mu);
+    g_active[idx].has_lease = 1;
+    snprintf(g_active[idx].workunit_id, sizeof(g_active[idx].workunit_id),
+             "%s", workunit_id ? workunit_id : "");
+    snprintf(g_active[idx].client_id, sizeof(g_active[idx].client_id),
+             "%s", client_id ? client_id : "");
+    pthread_mutex_unlock(&g_active_mu);
+}
+
+static void active_lease_clear(int idx)
+{
+    if (idx < 0 || idx >= g_active_count || !g_active) return;
+    pthread_mutex_lock(&g_active_mu);
+    memset(&g_active[idx], 0, sizeof(g_active[idx]));
+    pthread_mutex_unlock(&g_active_mu);
+}
+
 /* Fetch /file/<sha> into <workdir>/files/<sha>. No-op if already present. */
 static int ensure_file_cached(struct mg_mgr *mgr, const client_cfg_t *cfg,
                               const proto_lease_response_t *lease,
@@ -465,7 +534,7 @@ static int ensure_file_cached(struct mg_mgr *mgr, const client_cfg_t *cfg,
         .extra_headers = headers,
         .body = NULL, .body_len = 0,
     };
-    int rc = http_request(mgr, &io, 60000);
+    int rc = http_request(mgr, &io, 60000, 1);
     if (rc != 0) {
         fprintf(stderr, "client: file fetch failed (connection)\n");
         http_io_free(&io); free(local);
@@ -520,7 +589,7 @@ static int do_lease(struct mg_mgr *mgr, const client_cfg_t *cfg,
         .extra_headers = headers,
         .body = body, .body_len = body_len,
     };
-    int rc = http_request(mgr, &io, 30000);
+    int rc = http_request(mgr, &io, 30000, 1);
     free(body);
 
     if (rc != 0) { http_io_free(&io); return -2; }
@@ -597,7 +666,7 @@ static int do_submit(struct mg_mgr *mgr, const client_cfg_t *cfg,
         .extra_headers = headers,
         .body = body, .body_len = body_len,
     };
-    int rc = http_request(mgr, &io, 60000);
+    int rc = http_request(mgr, &io, 60000, 1);
     free(body);
     if (rc != 0) {
         http_io_free(&io);
@@ -621,35 +690,121 @@ static int do_submit(struct mg_mgr *mgr, const client_cfg_t *cfg,
     return result;
 }
 
+/* Returns 0 if the server released the lease or no longer has that lease for us;
+ * -1 on connection/server errors. Treat 409 as non-fatal during shutdown because
+ * the lease may already have expired or been submitted. */
+static int do_release(struct mg_mgr *mgr, const client_cfg_t *cfg,
+                      const char *workunit_id)
+{
+    char url[512];
+    if (join_url(url, sizeof(url), cfg->server_url, "/release") != 0) return -1;
+
+    char *body = proto_encode_release_request(workunit_id, cfg->client_id);
+    if (!body) return -1;
+    size_t body_len = strlen(body);
+
+    char headers[256];
+    build_auth_headers(headers, sizeof(headers), cfg->token,
+                       "application/json", NULL);
+
+    http_io_t io = {
+        .url = url, .method = "POST",
+        .extra_headers = headers,
+        .body = body, .body_len = body_len,
+    };
+    int rc = http_request(mgr, &io, 10000, 0);
+    free(body);
+    if (rc != 0) {
+        http_io_free(&io);
+        fprintf(stderr, "client: /release connection failure for %s\n", workunit_id);
+        return -1;
+    }
+    if (io.status == 200) {
+        printf("client: released %s\n", workunit_id);
+        http_io_free(&io);
+        return 0;
+    }
+    if (io.status == 409) {
+        fprintf(stderr, "client: release skipped for %s (not leased to us)\n", workunit_id);
+        http_io_free(&io);
+        return 0;
+    }
+    fprintf(stderr, "client: /release returned HTTP %d for %s\n", io.status, workunit_id);
+    http_io_free(&io);
+    return -1;
+}
+
+static void release_active_leases(const client_cfg_t *base_cfg)
+{
+    active_lease_t snapshot[CLIENT_MAX_WORKERS];
+    int n = 0;
+
+    pthread_mutex_lock(&g_active_mu);
+    n = g_active_count;
+    if (n > CLIENT_MAX_WORKERS) n = CLIENT_MAX_WORKERS;
+    for (int i = 0; i < n; i++) snapshot[i] = g_active[i];
+    pthread_mutex_unlock(&g_active_mu);
+
+    struct mg_mgr mgr;
+    mg_mgr_init(&mgr);
+    for (int i = 0; i < n; i++) {
+        if (!snapshot[i].has_lease || snapshot[i].workunit_id[0] == '\0')
+            continue;
+        client_cfg_t cfg = *base_cfg;
+        snprintf(cfg.client_id, sizeof(cfg.client_id), "%s", snapshot[i].client_id);
+        do_release(&mgr, &cfg, snapshot[i].workunit_id);
+    }
+    mg_mgr_free(&mgr);
+}
+
 /* The full lease -> fetch -> sieve -> submit cycle. Returns:
  *   1  - completed a workunit (caller may continue immediately)
  *   0  - no work right now (caller should backoff)
  *  -1  - job is done (caller should exit cleanly)
  *  -2  - transient failure (caller should backoff)
  */
-static int run_one_iteration(struct mg_mgr *mgr, const client_cfg_t *cfg)
+static int run_one_iteration(struct mg_mgr *mgr, const client_cfg_t *cfg, int worker_idx)
 {
+    if (shutdown_phase() >= SHUTDOWN_DRAINING) return -1;
+
     proto_lease_response_t lease;
     int lr = do_lease(mgr, cfg, &lease);
     if (lr == 0)  return 0;
     if (lr == -1) return -1;
     if (lr <  0)  return -2;
+    if (shutdown_phase() >= SHUTDOWN_DRAINING) {
+        do_release(mgr, cfg, lease.workunit_id);
+        return -1;
+    }
 
     printf("client: leased %s  q=[%lld,%lld)  side=%c  siever=%s\n",
            lease.workunit_id,
            (long long)lease.q_start,
            (long long)(lease.q_start + lease.q_range),
            lease.side, lease.siever);
+    active_lease_set(worker_idx, lease.workunit_id, cfg->client_id);
 
     /* Fetch input file (the .job) into the local cache. */
     char job_local[256];
     if (ensure_file_cached(mgr, cfg, &lease, job_local, sizeof(job_local)) != 0) {
+        if (shutdown_phase() >= SHUTDOWN_DRAINING &&
+            do_release(mgr, cfg, lease.workunit_id) == 0)
+            active_lease_clear(worker_idx);
         return -2;
     }
 
-    /* Local outfile path for the siever to write into. */
-    char *outfile = path_join(cfg->workdir, lease.output_name);
-    if (!outfile) return -2;
+    /* Local outfile path for the siever to write into. Use the workunit id
+     * rather than the server's generic output name so concurrent client
+     * processes sharing a workdir cannot unlink/replace each other's output. */
+    char output_name[sizeof(lease.workunit_id) + 4];
+    snprintf(output_name, sizeof(output_name), "%s.dat", lease.workunit_id);
+    char *outfile = path_join(cfg->workdir, output_name);
+    if (!outfile) {
+        if (shutdown_phase() >= SHUTDOWN_DRAINING &&
+            do_release(mgr, cfg, lease.workunit_id) == 0)
+            active_lease_clear(worker_idx);
+        return -2;
+    }
 
     /* The server tells us which siever name to use; we trust the operator
      * to have given --siever pointing at the right binary on disk. We can
@@ -673,16 +828,38 @@ static int run_one_iteration(struct mg_mgr *mgr, const client_cfg_t *cfg)
 
     if (sieve_rc != 0) {
         fprintf(stderr, "client: siever returned %d (skipping submit)\n", sieve_rc);
+        if (shutdown_phase() >= SHUTDOWN_DRAINING &&
+            do_release(mgr, cfg, lease.workunit_id) == 0)
+            active_lease_clear(worker_idx);
         free(outfile);
         return -2;
     }
-    if (!file_exists(outfile)) {
+    off_t outfile_size = 0;
+    if (regular_file_size(outfile, &outfile_size) != 0) {
         fprintf(stderr, "client: siever did not produce %s (skipping submit)\n", outfile);
+        if (shutdown_phase() >= SHUTDOWN_DRAINING &&
+            do_release(mgr, cfg, lease.workunit_id) == 0)
+            active_lease_clear(worker_idx);
+        free(outfile);
+        return -2;
+    }
+    if (outfile_size == 0) {
+        fprintf(stderr, "client: siever produced empty %s (skipping submit)\n", outfile);
+        if (shutdown_phase() >= SHUTDOWN_DRAINING &&
+            do_release(mgr, cfg, lease.workunit_id) == 0)
+            active_lease_clear(worker_idx);
+        unlink(outfile);
         free(outfile);
         return -2;
     }
 
     int sr = do_submit(mgr, cfg, &lease, outfile, sieve_seconds);
+    if (sr < 0 && shutdown_phase() >= SHUTDOWN_DRAINING) {
+        if (do_release(mgr, cfg, lease.workunit_id) == 0)
+            active_lease_clear(worker_idx);
+    } else {
+        active_lease_clear(worker_idx);
+    }
     /* Tidy: remove the local rels file so the next iteration starts clean.
      * (The local executor also calls remove() before invoking the siever,
      *  but we still want to free the disk after a successful submit.) */
@@ -691,7 +868,6 @@ static int run_one_iteration(struct mg_mgr *mgr, const client_cfg_t *cfg)
     if (sr < 0) return -2;
     return 1;
 }
-
 /* ===================== worker thread ==================================== */
 
 typedef struct {
@@ -699,9 +875,7 @@ typedef struct {
     const client_cfg_t *base_cfg;
 } worker_args_t;
 
-/* One worker = one mg_mgr + one workdir + one client_id. Workers share only
- * the global g_stop flag, which is sig_atomic_t and only ever transitions
- * 0 -> 1, so no mutex is needed. */
+/* One worker = one mg_mgr + one workdir + one client_id. */
 static void *worker_main(void *arg)
 {
     worker_args_t      *wa  = (worker_args_t *)arg;
@@ -744,18 +918,24 @@ static void *worker_main(void *arg)
                 idx, cfg.workdir, cfg.client_id);
     }
 
-    while (!g_stop) {
-        int r = run_one_iteration(&mgr, &cfg);
+    while (shutdown_phase() < SHUTDOWN_CANCELLING) {
+        int r = run_one_iteration(&mgr, &cfg, idx);
         if (r == 1) {
             if (cfg.once) break;
             continue;
         }
         if (r == -1) {
-            printf("[w%d] server reports job complete — exiting\n", idx);
+            if (shutdown_phase() >= SHUTDOWN_DRAINING)
+                printf("[w%d] drain requested — exiting\n", idx);
+            else
+                printf("[w%d] server reports job complete — exiting\n", idx);
             break;
         }
+        if (shutdown_phase() >= SHUTDOWN_DRAINING) break;
         /* r == 0 (no work) or r == -2 (transient failure) — backoff. */
-        for (int64_t i = 0; i < cfg.idle_backoff_seconds && !g_stop; i++) {
+        for (int64_t i = 0;
+             i < cfg.idle_backoff_seconds && shutdown_phase() == SHUTDOWN_RUNNING;
+             i++) {
             sleep(1);
         }
     }
@@ -793,9 +973,13 @@ int main(int argc, char **argv)
 
     pthread_t     *tids = calloc((size_t)cfg.workers, sizeof(pthread_t));
     worker_args_t *args = calloc((size_t)cfg.workers, sizeof(worker_args_t));
-    if (!tids || !args) {
+    int           *joined = calloc((size_t)cfg.workers, sizeof(int));
+    g_active = calloc((size_t)cfg.workers, sizeof(active_lease_t));
+    g_active_count = cfg.workers;
+    if (!tids || !args || !joined || !g_active) {
         fprintf(stderr, "client: alloc failed\n");
-        free(tids); free(args);
+        free(tids); free(args); free(joined); free(g_active);
+        g_active = NULL; g_active_count = 0;
         return 1;
     }
 
@@ -806,17 +990,37 @@ int main(int argc, char **argv)
         if (pthread_create(&tids[i], NULL, worker_main, &args[i]) != 0) {
             fprintf(stderr, "client: pthread_create failed for worker %d: %s\n",
                     i, strerror(errno));
-            g_stop = 1;
+            g_shutdown = SHUTDOWN_CANCELLING;
             break;
         }
         spawned++;
     }
 
-    for (int i = 0; i < spawned; i++) {
-        pthread_join(tids[i], NULL);
+    int done = 0;
+    int released_on_cancel = 0;
+    while (done < spawned) {
+        for (int i = 0; i < spawned; i++) {
+            if (joined[i]) continue;
+            if (pthread_tryjoin_np(tids[i], NULL) == 0) {
+                joined[i] = 1;
+                done++;
+            }
+        }
+        if (shutdown_phase() >= SHUTDOWN_CANCELLING && !released_on_cancel) {
+            release_active_leases(&cfg);
+            released_on_cancel = 1;
+            break;
+        }
+        if (done < spawned) usleep(100000);
     }
+    if (shutdown_phase() >= SHUTDOWN_DRAINING && !released_on_cancel)
+        release_active_leases(&cfg);
 
     free(tids);
     free(args);
+    free(joined);
+    free(g_active);
+    g_active = NULL;
+    g_active_count = 0;
     return 0;
 }

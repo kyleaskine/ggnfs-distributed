@@ -17,7 +17,7 @@ WARN     := -Wall
 
 CFLAGS   := $(OPT) $(CSTD) $(WARN) -fPIC -D_FILE_OFFSET_BITS=64
 LDFLAGS  :=
-LIBS     := -lpthread -lm -ldl
+LIBS     := -lpthread -lm -ldl -lgmp
 
 # Vendored sources are compiled with relaxed warnings; we don't own them.
 VENDOR_CFLAGS := $(OPT) -std=gnu99 -fPIC -w \
@@ -32,15 +32,15 @@ VENDOR_CFLAGS := $(OPT) -std=gnu99 -fPIC -w \
 
 INC := -I. -Ivendor
 
-# Server: db + protocol + mongoose + cJSON + sqlite
-SERVER_OBJS := server.o db.o protocol.o
+# Server: db + protocol + verify + mongoose + cJSON + sqlite
+SERVER_OBJS := server.o db.o protocol.o verify.o
 SERVER_VENDOR_OBJS := vendor/mongoose.o vendor/cJSON.o vendor/sqlite3.o
 
 # Client: protocol + sieve_executor + mongoose + cJSON  (no sqlite)
 CLIENT_OBJS := client.o protocol.o sieve_executor.o
 CLIENT_VENDOR_OBJS := vendor/mongoose.o vendor/cJSON.o
 
-ALL_OWN_OBJS    := server.o db.o protocol.o client.o sieve_executor.o
+ALL_OWN_OBJS    := server.o db.o protocol.o verify.o client.o sieve_executor.o
 ALL_VENDOR_OBJS := vendor/mongoose.o vendor/cJSON.o vendor/sqlite3.o
 
 SERVER_BIN := ggnfs-sieve-server

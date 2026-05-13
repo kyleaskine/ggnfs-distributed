@@ -173,6 +173,29 @@ char *proto_encode_submit_response(int accepted,
     return s;
 }
 
+char *proto_encode_release_request(const char *workunit_id, const char *client_id)
+{
+    cJSON *root = cJSON_CreateObject();
+    if (!root) return NULL;
+    cJSON_AddStringToObject(root, "workunit_id", workunit_id ? workunit_id : "");
+    cJSON_AddStringToObject(root, "client_id",   client_id   ? client_id   : "");
+    char *s = json_to_alloced(root);
+    cJSON_Delete(root);
+    return s;
+}
+
+int proto_decode_release_request(const char *body, size_t body_len,
+                                 char *workunit_id_buf, size_t workunit_id_buf_n,
+                                 char *client_id_buf,   size_t client_id_buf_n)
+{
+    cJSON *root = cJSON_ParseWithLength(body, body_len);
+    if (!root) return -1;
+    copy_str_field(root, "workunit_id", workunit_id_buf, workunit_id_buf_n);
+    copy_str_field(root, "client_id",   client_id_buf,   client_id_buf_n);
+    cJSON_Delete(root);
+    return 0;
+}
+
 char *proto_encode_health_response(int ok, const char *job_id,
                                    int64_t uptime_seconds)
 {
