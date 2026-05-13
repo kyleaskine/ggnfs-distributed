@@ -188,6 +188,12 @@ static const char *flag(int argc, char **argv, const char *key)
     return NULL;
 }
 
+static int has_flag(int argc, char **argv, const char *key)
+{
+    const char *v = flag(argc, argv, key);
+    return v != NULL && *v == '\0';
+}
+
 /* ===================== init subcommand ================================== */
 
 static void usage_init(void)
@@ -1185,6 +1191,126 @@ static int cmd_verify_parse(int argc, char **argv)
     return failed > 0 ? 1 : 0;
 }
 
+/* ===================== migrate-legacy subcommand ======================= */
+
+static void usage_migrate_legacy(void)
+{
+    fprintf(stderr,
+        "usage: ggnfs-sieve-server migrate-legacy \\\n"
+        "    --jobdir=<dir>          (required) existing initialized jobdir\n"
+        "    [--max-attempts=5]      poison failed legacy work after this many attempts\n"
+        "    [--spotcheck-k=50]      norm spot-check sample per submission; 0 disables\n"
+        "    [--no-validate-existing]\n"
+        "\nBackfills polynomial metadata from the stored .job file. By default,\n"
+        "also revalidates legacy skipped submissions whose workunits are still\n"
+        "submitted, using the same verifier path as serve. Run with serve stopped.\n");
+}
+
+static int cmd_migrate_legacy(int argc, char **argv)
+{
+    const char *jobdir      = flag(argc, argv, "--jobdir");
+    const char *max_s       = flag(argc, argv, "--max-attempts");
+    const char *spot_s      = flag(argc, argv, "--spotcheck-k");
+    int validate_existing   = !has_flag(argc, argv, "--no-validate-existing");
+
+    if (!jobdir || !*jobdir) {
+        usage_migrate_legacy();
+        return 2;
+    }
+
+    int64_t max_attempts = 5;
+    int64_t spotcheck_k  = 50;
+    if (max_s && *max_s && parse_int64_arg(max_s, &max_attempts) != 0) {
+        fprintf(stderr, "migrate-legacy: bad --max-attempts\n");
+        return 2;
+    }
+    if (spot_s && *spot_s && parse_int64_arg(spot_s, &spotcheck_k) != 0) {
+        fprintf(stderr, "migrate-legacy: bad --spotcheck-k\n");
+        return 2;
+    }
+    if (max_attempts < 1 || spotcheck_k < 0 || spotcheck_k > 100000) {
+        fprintf(stderr, "migrate-legacy: require max-attempts >= 1 and spotcheck-k >= 0\n");
+        return 2;
+    }
+
+    char *db_path = path_join(jobdir, "job.db");
+    if (!db_path) return 1;
+    ggnfs_db_t *db = db_open(db_path);
+    if (!db) {
+        fprintf(stderr, "migrate-legacy: cannot open %s\n", db_path);
+        free(db_path);
+        return 1;
+    }
+
+    char *job_sha = db_meta_get(db, "job_sha256");
+    if (!job_sha || !*job_sha) {
+        fprintf(stderr, "migrate-legacy: meta 'job_sha256' missing\n");
+        free(job_sha); db_close(db); free(db_path); return 1;
+    }
+    char *job_path = db_files_path_for(db, job_sha);
+    if (!job_path || access(job_path, R_OK) != 0) {
+        free(job_path);
+        char job_name[80];
+        snprintf(job_name, sizeof(job_name), "%s.job", job_sha);
+        char *files_dir = path_join(jobdir, "files");
+        job_path = files_dir ? path_join(files_dir, job_name) : NULL;
+        free(files_dir);
+    }
+    if (!job_path || access(job_path, R_OK) != 0) {
+        fprintf(stderr, "migrate-legacy: cannot find readable job file for sha %s\n", job_sha);
+        free(job_path); free(job_sha); db_close(db); free(db_path); return 1;
+    }
+
+    verify_poly_t poly;
+    if (verify_parse_job_file(job_path, &poly) != 0) {
+        fprintf(stderr, "migrate-legacy: failed to parse polynomial from %s\n", job_path);
+        free(job_path); free(job_sha); db_close(db); free(db_path); return 1;
+    }
+    if (verify_poly_save_to_meta(db, &poly) != 0) {
+        fprintf(stderr, "migrate-legacy: failed to store polynomial in meta\n");
+        verify_poly_free(&poly);
+        free(job_path); free(job_sha); db_close(db); free(db_path); return 1;
+    }
+    printf("migrate-legacy: backfilled polynomial meta from %s (degree %d)\n",
+           job_path, poly.degree);
+    verify_poly_free(&poly);
+
+    int64_t changed = 0;
+    if (validate_existing) {
+        char *rels_dir = path_join(jobdir, "rels");
+        int64_t relocated = 0;
+        if (!rels_dir ||
+            db_legacy_relocate_submission_paths(db, rels_dir, &relocated) != 0) {
+            free(rels_dir);
+            free(job_path); free(job_sha); db_close(db); free(db_path); return 1;
+        }
+        free(rels_dir);
+        if (relocated > 0) {
+            printf("migrate-legacy: relocated %lld legacy relation paths into jobdir\n",
+                   (long long)relocated);
+        }
+        if (db_legacy_skipped_to_pending(db, &changed) != 0) {
+            free(job_path); free(job_sha); db_close(db); free(db_path); return 1;
+        }
+        printf("migrate-legacy: moved %lld legacy skipped submissions to pending\n",
+               (long long)changed);
+    }
+
+    free(job_path);
+    free(job_sha);
+    db_close(db);
+
+    fflush(stdout);
+    if (validate_existing && verify_drain_pending_path(db_path, max_attempts,
+                                                       (int)spotcheck_k) != 0) {
+        free(db_path);
+        return 1;
+    }
+
+    free(db_path);
+    return 0;
+}
+
 /* ===================== main ============================================= */
 
 static void usage_top(void)
@@ -1195,6 +1321,7 @@ static void usage_top(void)
         "  ggnfs-sieve-server init         [args...]   create a new job\n"
         "  ggnfs-sieve-server extend       [args...]   add workunits to an existing job\n"
         "  ggnfs-sieve-server serve        [--bind=127.0.0.1] [--port=8080] [args...]\n"
+        "  ggnfs-sieve-server migrate-legacy [args...] backfill/verify old jobdirs\n"
         "  ggnfs-sieve-server verify-parse <file>      diagnostic: parse a relation file\n"
         "Run a subcommand without args to see its flags.\n");
 }
@@ -1205,6 +1332,7 @@ int main(int argc, char **argv)
     if (strcmp(argv[1], "init")         == 0) return cmd_init        (argc - 1, argv + 1);
     if (strcmp(argv[1], "extend")       == 0) return cmd_extend      (argc - 1, argv + 1);
     if (strcmp(argv[1], "serve")        == 0) return cmd_serve       (argc - 1, argv + 1);
+    if (strcmp(argv[1], "migrate-legacy") == 0) return cmd_migrate_legacy(argc - 1, argv + 1);
     if (strcmp(argv[1], "verify-parse") == 0) return cmd_verify_parse(argc - 1, argv + 1);
     if (strcmp(argv[1], "-h") == 0 || strcmp(argv[1], "--help") == 0) {
         usage_top(); return 0;

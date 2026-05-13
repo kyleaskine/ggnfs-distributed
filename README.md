@@ -109,6 +109,18 @@ The polynomial is parsed from the `.job` file at `init` time and stored
 in the `meta` table (`poly_degree`, `poly_c0..c<d>`, `poly_Y0`,
 `poly_Y1`) so the verifier doesn't re-read the file at startup.
 
+### Migrating old jobdirs
+
+For a jobdir created before verifier metadata existed, stop `serve` and run:
+
+    ./ggnfs-sieve-server migrate-legacy --jobdir=/tmp/myjob
+
+This backfills the polynomial `meta` rows from the stored `.job` file, then
+revalidates legacy `skipped` submissions whose workunits are still
+`submitted`. If a jobdir was copied from another machine, the command also
+rewrites those legacy relation paths to `<jobdir>/rels/<workunit>.dat` when
+that local file exists.
+
 ## More
 
 - **Architecture, threading invariants, load-bearing details:** see

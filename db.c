@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 struct ggnfs_db_s {
     sqlite3 *conn;
@@ -633,6 +634,102 @@ done:
         fprintf(stderr, "db_verify_fail: %s\n", sqlite3_errmsg(db->conn));
         sqlite3_exec(db->conn, "ROLLBACK;", NULL, NULL, NULL);
     }
+    return result;
+}
+
+int db_legacy_skipped_to_pending(ggnfs_db_t *db, int64_t *out_changed)
+{
+    if (out_changed) *out_changed = 0;
+    const char *sql =
+        "UPDATE submissions "
+        "  SET verify_status = 'pending', verify_reason = NULL "
+        "WHERE verify_status = 'skipped' "
+        "  AND workunit_id IN ("
+        "    SELECT id FROM workunits WHERE state = 'submitted'"
+        "  );";
+    if (sqlite3_exec(db->conn, sql, NULL, NULL, NULL) != SQLITE_OK) {
+        fprintf(stderr, "db_legacy_skipped_to_pending: %s\n",
+                sqlite3_errmsg(db->conn));
+        return -1;
+    }
+    if (out_changed) *out_changed = sqlite3_changes(db->conn);
+    return 0;
+}
+
+int db_legacy_relocate_submission_paths(ggnfs_db_t *db, const char *rels_dir,
+                                        int64_t *out_changed)
+{
+    if (out_changed) *out_changed = 0;
+    if (!rels_dir || !*rels_dir) return -1;
+
+    sqlite3_stmt *sel = NULL;
+    sqlite3_stmt *upd = NULL;
+    const char *select_sql =
+        "SELECT s.id, s.file_path "
+        "FROM submissions s JOIN workunits w ON w.id = s.workunit_id "
+        "WHERE s.verify_status = 'skipped' "
+        "  AND w.state = 'submitted';";
+    const char *update_sql =
+        "UPDATE submissions SET file_path = ?1 WHERE id = ?2;";
+
+    if (sqlite3_prepare_v2(db->conn, select_sql, -1, &sel, NULL) != SQLITE_OK) {
+        fprintf(stderr, "db_legacy_relocate_submission_paths: select: %s\n",
+                sqlite3_errmsg(db->conn));
+        return -1;
+    }
+    if (sqlite3_prepare_v2(db->conn, update_sql, -1, &upd, NULL) != SQLITE_OK) {
+        fprintf(stderr, "db_legacy_relocate_submission_paths: update: %s\n",
+                sqlite3_errmsg(db->conn));
+        sqlite3_finalize(sel);
+        return -1;
+    }
+
+    int result = 0;
+    int rc;
+    int64_t changed = 0;
+    while ((rc = sqlite3_step(sel)) == SQLITE_ROW) {
+        int64_t id = sqlite3_column_int64(sel, 0);
+        const unsigned char *old_u = sqlite3_column_text(sel, 1);
+        if (!old_u) continue;
+        const char *old = (const char *)old_u;
+        const char *base = strrchr(old, '/');
+        base = base ? base + 1 : old;
+        if (!*base) continue;
+
+        size_t lr = strlen(rels_dir), lb = strlen(base);
+        int needs_sep = (lr > 0 && rels_dir[lr - 1] != '/');
+        char *candidate = malloc(lr + (size_t)needs_sep + lb + 1);
+        if (!candidate) { result = -1; break; }
+        memcpy(candidate, rels_dir, lr);
+        if (needs_sep) candidate[lr] = '/';
+        memcpy(candidate + lr + (size_t)needs_sep, base, lb);
+        candidate[lr + (size_t)needs_sep + lb] = '\0';
+
+        if (strcmp(candidate, old) != 0 && access(candidate, R_OK) == 0) {
+            sqlite3_reset(upd);
+            sqlite3_clear_bindings(upd);
+            sqlite3_bind_text (upd, 1, candidate, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_int64(upd, 2, id);
+            if (sqlite3_step(upd) != SQLITE_DONE) {
+                fprintf(stderr, "db_legacy_relocate_submission_paths: step: %s\n",
+                        sqlite3_errmsg(db->conn));
+                free(candidate);
+                result = -1;
+                break;
+            }
+            changed++;
+        }
+        free(candidate);
+    }
+    if (result == 0 && rc != SQLITE_DONE) {
+        fprintf(stderr, "db_legacy_relocate_submission_paths: scan: %s\n",
+                sqlite3_errmsg(db->conn));
+        result = -1;
+    }
+
+    sqlite3_finalize(upd);
+    sqlite3_finalize(sel);
+    if (out_changed) *out_changed = changed;
     return result;
 }
 

@@ -15,3 +15,4 @@ files/
 rels/
 /.codex
 /.agents
+*.job
