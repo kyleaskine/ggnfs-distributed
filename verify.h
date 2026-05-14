@@ -191,10 +191,4 @@ void verify_thread_wake(verify_thread_t *vt);
  * handle. No-op if vt is NULL. */
 void verify_thread_stop(verify_thread_t *vt);
 
-/* Synchronously drain pending submissions using the same verifier path as the
- * background thread. Intended for one-shot admin/migration commands. */
-int verify_drain_pending_path(const char *db_path,
-                              int64_t max_attempts,
-                              int spotcheck_k);
-
 #endif /* GGNFS_SIEVE_VERIFY_H */

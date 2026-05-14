@@ -767,46 +767,6 @@ static void *verify_thread_run(void *arg)
     return NULL;
 }
 
-int verify_drain_pending_path(const char *db_path,
-                              int64_t max_attempts,
-                              int spotcheck_k)
-{
-    if (!db_path) return -1;
-
-    ggnfs_db_t *db = db_open(db_path);
-    if (!db) {
-        fprintf(stderr, "verify: cannot open %s\n", db_path);
-        return -1;
-    }
-
-    verify_poly_gmp_t *poly = NULL;
-    if (spotcheck_k > 0) {
-        verify_poly_t src;
-        if (verify_poly_load_from_meta(db, &src) == 0) {
-            poly = verify_poly_gmp_new(&src);
-            verify_poly_free(&src);
-            if (!poly) {
-                fprintf(stderr, "verify: poly_load failed — spot-check disabled\n");
-            } else {
-                fprintf(stderr, "verify: spot-check enabled (k=%d, poly degree %d)\n",
-                        spotcheck_k, poly->degree);
-            }
-        } else {
-            fprintf(stderr, "verify: meta has no poly — spot-check disabled\n");
-        }
-    }
-
-    verify_thread_t vt;
-    memset(&vt, 0, sizeof(vt));
-    vt.max_attempts = max_attempts;
-    vt.spotcheck_k  = spotcheck_k;
-    drain_pending(&vt, db, poly);
-
-    verify_poly_gmp_free(poly);
-    db_close(db);
-    return 0;
-}
-
 verify_thread_t *verify_thread_start(const char *db_path,
                                      int64_t max_attempts,
                                      int spotcheck_k)

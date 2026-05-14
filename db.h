@@ -122,18 +122,6 @@ int db_verify_fail(ggnfs_db_t *db, int64_t submission_id,
                    const char *reason, int64_t max_attempts,
                    int64_t now_unix, int *out_poisoned);
 
-/* Legacy migration helper: submissions accepted before the verifier existed
- * were recorded as verify_status='skipped' while their workunits remained in
- * state='submitted'. Move only that shape back to 'pending' so the normal
- * verifier can resolve them. Returns 0 on success, -1 on error. */
-int db_legacy_skipped_to_pending(ggnfs_db_t *db, int64_t *out_changed);
-
-/* For copied jobdirs, legacy submission file_path values may still point at
- * the original host's absolute jobdir. For skipped/submitted legacy rows only,
- * rewrite file_path to rels_dir/<basename> when that local file exists. */
-int db_legacy_relocate_submission_paths(ggnfs_db_t *db, const char *rels_dir,
-                                        int64_t *out_changed);
-
 /* ---- health/status ---- */
 
 typedef struct {
