@@ -693,11 +693,34 @@ int db_stats_snapshot(ggnfs_db_t *db, int64_t now_unix, db_stats_t *out)
         }
     }
 
-    /* Per-client. Joins each client to their submissions for SUM/AVG/COUNT,
-     * and looks up any current lease via a correlated subquery. Capped at
-     * 100 to keep the page snappy on huge fleets. */
+    /* Per-client. Include clients that have either contributed relations or
+     * currently hold a lease; hide idle zero-relation clients from stale test
+     * runs. The dashboard groups worker IDs client-side, so returning all
+     * productive/active workers is more useful than a recency cap. */
     {
         sqlite3_stmt *st = NULL;
+        const char *where_sql =
+            "WHERE c.total_relations > 0 "
+            "   OR EXISTS (SELECT 1 FROM workunits "
+            "              WHERE state='leased' AND leased_to=c.id) ";
+        int n_clients = 0;
+
+        char count_sql[512];
+        snprintf(count_sql, sizeof(count_sql),
+            "SELECT COUNT(*) FROM clients c %s;", where_sql);
+        if (sqlite3_prepare_v2(db->conn, count_sql, -1, &st, NULL) == SQLITE_OK) {
+            if (sqlite3_step(st) == SQLITE_ROW)
+                n_clients = sqlite3_column_int(st, 0);
+            sqlite3_finalize(st);
+            st = NULL;
+        }
+
+        if (n_clients <= 0) {
+            out->clients = NULL;
+            out->client_count = 0;
+            return 0;
+        }
+
         const char *sql =
             "SELECT "
             "  c.id, c.first_seen, c.last_seen, c.total_failures, "
@@ -708,14 +731,16 @@ int db_stats_snapshot(ggnfs_db_t *db, int64_t now_unix, db_stats_t *out)
             "            WHERE state='leased' AND leased_to=c.id LIMIT 1), '') "
             "FROM clients c "
             "LEFT JOIN submissions s ON s.client_id = c.id "
+            "WHERE c.total_relations > 0 "
+            "   OR EXISTS (SELECT 1 FROM workunits "
+            "              WHERE state='leased' AND leased_to=c.id) "
             "GROUP BY c.id "
-            "ORDER BY c.last_seen DESC "
-            "LIMIT 100;";
+            "ORDER BY c.last_seen DESC;";
         if (sqlite3_prepare_v2(db->conn, sql, -1, &st, NULL) == SQLITE_OK) {
-            db_stats_client_t *arr = calloc(100, sizeof(db_stats_client_t));
+            db_stats_client_t *arr = calloc((size_t)n_clients, sizeof(db_stats_client_t));
             int n = 0;
             if (arr) {
-                while (sqlite3_step(st) == SQLITE_ROW && n < 100) {
+                while (sqlite3_step(st) == SQLITE_ROW && n < n_clients) {
                     db_stats_client_t *cc = &arr[n++];
                     const unsigned char *id = sqlite3_column_text(st, 0);
                     if (id) snprintf(cc->id, sizeof(cc->id), "%s", id);

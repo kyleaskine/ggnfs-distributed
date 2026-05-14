@@ -164,7 +164,7 @@ typedef struct {
     int64_t  last_submit_unix;        /* 0 if no submissions yet          */
     double   avg_sieve_seconds;       /* across all submissions           */
 
-    /* clients (capped) */
+    /* clients */
     int                 client_count;
     db_stats_client_t  *clients;      /* malloc'd; caller frees           */
 } db_stats_t;
