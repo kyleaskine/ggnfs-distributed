@@ -288,10 +288,54 @@ int db_lease(ggnfs_db_t *db, const char *client_id,
              int64_t lease_seconds, int64_t now_unix,
              db_lease_result_t *out)
 {
+    memset(out, 0, sizeof(*out));
+
+    /* Idempotency guard: a worker client-id is expected to hold at most one
+     * active lease. If a prior /lease response was lost and the worker retries,
+     * renew and return the same workunit instead of accumulating another
+     * leased row. */
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db->conn,
+            "UPDATE workunits "
+            "   SET lease_expires = ?3 "
+            " WHERE id = (SELECT id FROM workunits "
+            "              WHERE state = 'leased' "
+            "                AND leased_to = ?1 "
+            "                AND lease_expires >= ?2 "
+            "              ORDER BY leased_at DESC, id DESC LIMIT 1) "
+            "RETURNING id, q_start, q_range, side;",
+            -1, &st, NULL) != SQLITE_OK) {
+        fprintf(stderr, "db_lease existing: %s\n", sqlite3_errmsg(db->conn));
+        return -1;
+    }
+    sqlite3_bind_text (st, 1, client_id, -1, SQLITE_STATIC);
+    sqlite3_bind_int64(st, 2, now_unix);
+    sqlite3_bind_int64(st, 3, now_unix + lease_seconds);
+
+    int rc = sqlite3_step(st);
+    if (rc == SQLITE_ROW) {
+        const unsigned char *id   = sqlite3_column_text (st, 0);
+        int64_t              qs   = sqlite3_column_int64(st, 1);
+        int64_t              qr   = sqlite3_column_int64(st, 2);
+        const unsigned char *side = sqlite3_column_text (st, 3);
+        snprintf(out->id, sizeof(out->id), "%s", id ? (const char *)id : "");
+        out->q_start = qs;
+        out->q_range = qr;
+        out->side    = side ? (char)side[0] : '?';
+        sqlite3_finalize(st);
+        return 0;
+    }
+    if (rc != SQLITE_DONE) {
+        fprintf(stderr, "db_lease existing step: %s\n", sqlite3_errmsg(db->conn));
+        sqlite3_finalize(st);
+        return -1;
+    }
+    sqlite3_finalize(st);
+    st = NULL;
+
     /* Atomic claim: pick lowest-q_start available row, flip it to 'leased',
      * return the columns the caller needs. SQLite RETURNING (3.35+) gives us
      * the post-update row in a single statement. */
-    sqlite3_stmt *st = NULL;
     if (sqlite3_prepare_v2(db->conn,
             "UPDATE workunits "
             "  SET state = 'leased',"
@@ -311,7 +355,7 @@ int db_lease(ggnfs_db_t *db, const char *client_id,
     sqlite3_bind_int64(st, 3, now_unix + lease_seconds);
 
     int result = -1;
-    int rc = sqlite3_step(st);
+    rc = sqlite3_step(st);
     if (rc == SQLITE_ROW) {
         const unsigned char *id   = sqlite3_column_text (st, 0);
         int64_t              qs   = sqlite3_column_int64(st, 1);

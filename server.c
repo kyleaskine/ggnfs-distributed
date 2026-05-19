@@ -245,7 +245,7 @@ static int cmd_init(int argc, char **argv)
     if (mkdir_p(jobdir) != 0) return 1;
     char *files_dir = path_join(jobdir, "files");
     char *rels_dir  = path_join(jobdir, "rels");
-    if (!files_dir || !rels_dir) return 1;
+    if (!files_dir || !rels_dir) { free(files_dir); free(rels_dir); return 1; }
     if (mkdir_p(files_dir) != 0 || mkdir_p(rels_dir) != 0) {
         free(files_dir); free(rels_dir); return 1;
     }
@@ -277,7 +277,7 @@ static int cmd_init(int argc, char **argv)
 
     /* Open db, seed workunits. */
     char *db_path = path_join(jobdir, "job.db");
-    if (!db_path) return 1;
+    if (!db_path) { free(files_dir); free(rels_dir); free(dst_path); return 1; }
     ggnfs_db_t *db = db_open(db_path);
     if (!db) {
         free(files_dir); free(rels_dir); free(dst_path); free(db_path); return 1;
@@ -286,6 +286,7 @@ static int cmd_init(int argc, char **argv)
     if (db_files_insert(db, job_sha, dst_path, dst_bytes, "job") != 0) {
         fprintf(stderr, "init: db_files_insert failed\n");
         db_close(db);
+        free(files_dir); free(rels_dir); free(dst_path); free(db_path);
         return 1;
     }
 
@@ -296,12 +297,14 @@ static int cmd_init(int argc, char **argv)
         if (verify_parse_job_file(dst_path, &poly) != 0) {
             fprintf(stderr, "init: failed to parse polynomial from %s\n", dst_path);
             db_close(db);
+            free(files_dir); free(rels_dir); free(dst_path); free(db_path);
             return 1;
         }
         if (verify_poly_save_to_meta(db, &poly) != 0) {
             fprintf(stderr, "init: failed to store polynomial in meta\n");
             verify_poly_free(&poly);
             db_close(db);
+            free(files_dir); free(rels_dir); free(dst_path); free(db_path);
             return 1;
         }
         verify_poly_free(&poly);
@@ -321,6 +324,7 @@ static int cmd_init(int argc, char **argv)
         if (db_workunit_insert(db, id, q, this_range, side, now) != 0) {
             fprintf(stderr, "init: db_workunit_insert failed at seq=%lld\n", (long long)seq);
             db_close(db);
+            free(files_dir); free(rels_dir); free(dst_path); free(db_path);
             return 1;
         }
         seq++;
@@ -328,14 +332,23 @@ static int cmd_init(int argc, char **argv)
 
     /* Token. Stash in meta for self-checking + write to <jobdir>/token. */
     char token[65];
-    if (random_token_hex(token) != 0) { db_close(db); return 1; }
+    if (random_token_hex(token) != 0) {
+        db_close(db);
+        free(files_dir); free(rels_dir); free(dst_path); free(db_path);
+        return 1;
+    }
     char *token_path = path_join(jobdir, "token");
-    if (!token_path) { db_close(db); return 1; }
+    if (!token_path) {
+        db_close(db);
+        free(files_dir); free(rels_dir); free(dst_path); free(db_path);
+        return 1;
+    }
     {
         int fd = open(token_path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
         if (fd < 0) {
             fprintf(stderr, "init: cannot write %s: %s\n", token_path, strerror(errno));
             db_close(db);
+            free(files_dir); free(rels_dir); free(dst_path); free(db_path); free(token_path);
             return 1;
         }
         ssize_t w1 = write(fd, token, 64);
@@ -344,6 +357,7 @@ static int cmd_init(int argc, char **argv)
         if (w1 != 64 || w2 != 1) {
             fprintf(stderr, "init: short write to %s\n", token_path);
             db_close(db);
+            free(files_dir); free(rels_dir); free(dst_path); free(db_path); free(token_path);
             return 1;
         }
     }
@@ -729,7 +743,9 @@ static void handle_submit(struct mg_connection *c, struct mg_http_message *hm,
             return;
         }
         if (fwrite(hm->body.buf, 1, hm->body.len, f) != hm->body.len) {
-            fclose(f); free(rel_path);
+            fclose(f);
+            unlink(rel_path);
+            free(rel_path);
             send_text(c, 500, "short write\n");
             return;
         }
@@ -748,11 +764,13 @@ static void handle_submit(struct mg_connection *c, struct mg_http_message *hm,
                        num_relations, sieve_seconds, now_unix());
     if (rc == 1) {
         /* Workunit not currently leased — re-issued or stale. */
+        unlink(rel_path);
         free(rel_path);
         send_text(c, 409, "workunit not leased\n");
         return;
     }
     if (rc != 0) {
+        unlink(rel_path);
         free(rel_path);
         send_text(c, 500, "internal error\n");
         return;
@@ -1065,6 +1083,7 @@ static int cmd_serve(int argc, char **argv)
         fprintf(stderr, "serve: db missing meta — was 'init' run on this jobdir?\n");
         free(m_token); free(m_jobid); free(m_siever); free(m_side); free(m_jobsha);
         db_close(ctx.db);
+        free(db_path);
         return 1;
     }
 
@@ -1101,7 +1120,13 @@ static int cmd_serve(int argc, char **argv)
     ctx.sweep_seconds = sweep_seconds;
     ctx.max_attempts  = max_attempts;
     ctx.started_at    = now_unix();
-    if (!ctx.jobdir || !ctx.rels_dir) { db_close(ctx.db); return 1; }
+    if (!ctx.jobdir || !ctx.rels_dir) {
+        free(ctx.jobdir);
+        free(ctx.rels_dir);
+        free(db_path);
+        db_close(ctx.db);
+        return 1;
+    }
 
     char listen_url[64];
     if (snprintf(listen_url, sizeof(listen_url), "http://%s:%lld",

@@ -243,6 +243,7 @@ typedef struct {
     int            sent;
     int            done;
     int            err;             /* 1 if connect/read failed */
+    int            closed;
     int            status;          /* HTTP status code */
 
     /* Response body */
@@ -253,6 +254,10 @@ typedef struct {
 static void sync_http_handler(struct mg_connection *c, int ev, void *ev_data)
 {
     http_io_t *io = (http_io_t *)c->fn_data;
+    if (!io) {
+        c->is_closing = 1;
+        return;
+    }
 
     if (ev == MG_EV_CONNECT) {
         /* Connection open — send the request line + headers + body. */
@@ -288,6 +293,7 @@ static void sync_http_handler(struct mg_connection *c, int ev, void *ev_data)
         io->err = 1;
         io->done = 1;
     } else if (ev == MG_EV_CLOSE) {
+        io->closed = 1;
         if (!io->done) {
             io->err = 1;
             io->done = 1;
@@ -300,7 +306,7 @@ static void sync_http_handler(struct mg_connection *c, int ev, void *ev_data)
 static int http_request(struct mg_mgr *mgr, http_io_t *io, int timeout_ms,
                         int abort_on_cancel)
 {
-    io->sent = io->done = io->err = 0;
+    io->sent = io->done = io->err = io->closed = 0;
     io->status = 0;
     io->resp_body = NULL;
     io->resp_body_len = 0;
@@ -314,6 +320,15 @@ static int http_request(struct mg_mgr *mgr, http_io_t *io, int timeout_ms,
         mg_mgr_poll(mgr, 200);
         waited_ms += 200;
     }
+    if (!io->done) {
+        c->is_closing = 1;
+        for (int close_waited_ms = 0;
+             !io->done && close_waited_ms < 1000;
+             close_waited_ms += 50) {
+            mg_mgr_poll(mgr, 50);
+        }
+    }
+    if (!io->closed) c->fn_data = NULL;
     if (!io->done || io->err) return -1;
     return 0;
 }

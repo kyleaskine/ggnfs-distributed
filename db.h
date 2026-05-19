@@ -52,8 +52,9 @@ int db_lease_expire_sweep(ggnfs_db_t *db,
                           int64_t now_unix, int64_t max_attempts,
                           int64_t *out_requeued, int64_t *out_poisoned);
 
-/* Atomically claim one available workunit for `client_id`.
- * On success (0) fills *out and transitions state available -> leased.
+/* Renew and return this client's current unexpired lease, or atomically claim one
+ * available workunit for `client_id`.
+ * On success (0) fills *out. A new claim transitions state available -> leased.
  * Returns 1 if no workunit is available, -1 on internal error. */
 typedef struct {
     char     id[64];
