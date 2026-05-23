@@ -20,6 +20,8 @@
 #include "vendor/cJSON.h"
 #include "vendor/mongoose.h"
 
+#include <zstd.h>
+
 /* xxd-generated; provides `dashboard_html[]` and `dashboard_html_len`. */
 #include "dashboard_html.h"
 
@@ -692,6 +694,49 @@ static int workunit_id_is_safe_for_job(const char *id, const char *job_id)
     return 1;
 }
 
+static int count_zstd_newlines(const void *src, size_t src_len,
+                               int64_t max_decoded_bytes,
+                               int64_t *out_newlines)
+{
+    ZSTD_DStream *ds = ZSTD_createDStream();
+    if (!ds) return -1;
+    size_t init = ZSTD_initDStream(ds);
+    if (ZSTD_isError(init)) {
+        ZSTD_freeDStream(ds);
+        return -1;
+    }
+
+    unsigned char outbuf[64 * 1024];
+    ZSTD_inBuffer in = { src, src_len, 0 };
+    int64_t nlines = 0;
+    int64_t decoded = 0;
+    size_t ret = 1;
+    while (in.pos < in.size || ret != 0) {
+        ZSTD_outBuffer out = { outbuf, sizeof(outbuf), 0 };
+        ret = ZSTD_decompressStream(ds, &out, &in);
+        if (ZSTD_isError(ret)) {
+            ZSTD_freeDStream(ds);
+            return -1;
+        }
+        decoded += (int64_t)out.pos;
+        if (decoded > max_decoded_bytes) {
+            ZSTD_freeDStream(ds);
+            errno = EFBIG;
+            return -1;
+        }
+        for (size_t i = 0; i < out.pos; i++) {
+            if (outbuf[i] == '\n') nlines++;
+        }
+        if (out.pos == 0 && in.pos == in.size && ret != 0) {
+            ZSTD_freeDStream(ds);
+            return -1;
+        }
+    }
+    ZSTD_freeDStream(ds);
+    if (out_newlines) *out_newlines = nlines;
+    return 0;
+}
+
 static void handle_submit(struct mg_connection *c, struct mg_http_message *hm,
                           server_ctx_t *ctx)
 {
@@ -710,6 +755,16 @@ static void handle_submit(struct mg_connection *c, struct mg_http_message *hm,
     /* X-Sha256 and X-Sieve-Seconds are advisory in Phase 1. */
     if (header_get_str(hm, "X-Sha256", client_sha, sizeof(client_sha)) != 0)
         client_sha[0] = '\0';
+    char compression[32];
+    int is_zstd = 0;
+    if (header_get_str(hm, "X-Compression", compression, sizeof(compression)) == 0) {
+        if (strcmp(compression, "zstd") == 0) {
+            is_zstd = 1;
+        } else if (strcmp(compression, "none") != 0) {
+            send_text(c, 400, "unsupported X-Compression\n");
+            return;
+        }
+    }
     char sieve_seconds_buf[32];
     double sieve_seconds = 0.0;
     if (header_get_str(hm, "X-Sieve-Seconds", sieve_seconds_buf,
@@ -729,9 +784,29 @@ static void handle_submit(struct mg_connection *c, struct mg_http_message *hm,
         return;
     }
 
-    /* Persist body to <jobdir>/rels/<workunit_id>.dat. */
+    /* Count newlines as a rough proxy for relation count. For compressed
+     * submissions this also rejects malformed zstd frames before storing. */
+    int64_t num_relations = 0;
+    if (is_zstd) {
+        if (count_zstd_newlines(hm->body.buf, hm->body.len,
+                                OUTPUT_MAX_BYTES, &num_relations) != 0) {
+            if (errno == EFBIG) {
+                send_text(c, 413, "decompressed submission too large\n");
+            } else {
+                send_text(c, 400, "invalid zstd submission\n");
+            }
+            return;
+        }
+    } else {
+        for (size_t i = 0; i < hm->body.len; i++) {
+            if (hm->body.buf[i] == '\n') num_relations++;
+        }
+    }
+
+    /* Persist body to <jobdir>/rels/<workunit_id>.dat[.zst]. */
     char rel_name[96];
-    snprintf(rel_name, sizeof(rel_name), "%s.dat", workunit_id);
+    snprintf(rel_name, sizeof(rel_name), "%s.dat%s", workunit_id,
+             is_zstd ? ".zst" : "");
     char *rel_path = path_join(ctx->rels_dir, rel_name);
     if (!rel_path) { send_text(c, 500, "oom\n"); return; }
     {
@@ -750,13 +825,6 @@ static void handle_submit(struct mg_connection *c, struct mg_http_message *hm,
             return;
         }
         fclose(f);
-    }
-
-    /* Count newlines as a rough proxy for relation count (good enough for
-     * Phase 1 — the verifier in Phase 3 will do parse-level counting). */
-    int64_t num_relations = 0;
-    for (size_t i = 0; i < hm->body.len; i++) {
-        if (hm->body.buf[i] == '\n') num_relations++;
     }
 
     db_clients_seen(ctx->db, client_id, now_unix());

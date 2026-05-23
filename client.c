@@ -36,6 +36,8 @@
 #include "vendor/cJSON.h"
 #include "vendor/mongoose.h"
 
+#include <zstd.h>
+
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -56,6 +58,7 @@
 #endif
 
 #define CLIENT_MAX_WORKERS 256
+#define SUBMIT_ZSTD_LEVEL 1
 
 #define CLIENT_VERSION "0.1.0"
 
@@ -192,6 +195,16 @@ static int sha256_file(const char *path, char hex_out[65])
     mg_sha256_final(dig, &ctx);
     hex_encode(dig, 32, hex_out);
     return 0;
+}
+
+static void sha256_buf(const void *buf, size_t len, char hex_out[65])
+{
+    mg_sha256_ctx ctx;
+    mg_sha256_init(&ctx);
+    mg_sha256_update(&ctx, (const unsigned char *)buf, len);
+    unsigned char dig[32];
+    mg_sha256_final(dig, &ctx);
+    hex_encode(dig, 32, hex_out);
 }
 
 /* Read entire file into a malloc'd buffer; *out_len receives byte count. */
@@ -644,19 +657,30 @@ static int do_submit(struct mg_mgr *mgr, const client_cfg_t *cfg,
                      const proto_lease_response_t *lease,
                      const char *outfile_path, double sieve_seconds)
 {
-    size_t  body_len = 0;
-    unsigned char *body = read_file(outfile_path, &body_len);
-    if (!body) {
+    size_t raw_len = 0;
+    unsigned char *raw = read_file(outfile_path, &raw_len);
+    if (!raw) {
         fprintf(stderr, "client: cannot read %s: %s\n", outfile_path, strerror(errno));
         return -1;
     }
 
-    char body_sha[65];
-    if (sha256_file(outfile_path, body_sha) != 0) {
-        fprintf(stderr, "client: sha256 of %s failed\n", outfile_path);
+    size_t bound = ZSTD_compressBound(raw_len);
+    unsigned char *body = malloc(bound);
+    if (!body) {
+        fprintf(stderr, "client: zstd output allocation failed\n");
+        free(raw);
+        return -1;
+    }
+    size_t body_len = ZSTD_compress(body, bound, raw, raw_len, SUBMIT_ZSTD_LEVEL);
+    free(raw);
+    if (ZSTD_isError(body_len)) {
+        fprintf(stderr, "client: zstd compress failed: %s\n", ZSTD_getErrorName(body_len));
         free(body);
         return -1;
     }
+
+    char body_sha[65];
+    sha256_buf(body, body_len, body_sha);
 
     char url[512];
     if (join_url(url, sizeof(url), cfg->server_url, "/submit") != 0) {
@@ -671,6 +695,11 @@ static int do_submit(struct mg_mgr *mgr, const client_cfg_t *cfg,
              "X-Sha256: %s\r\n"
              "X-Sieve-Seconds: %.3f\r\n",
              lease->workunit_id, cfg->client_id, body_sha, sieve_seconds);
+    snprintf(xtra + strlen(xtra), sizeof(xtra) - strlen(xtra),
+             "X-Compression: zstd\r\n"
+             "X-Uncompressed-Bytes: %llu\r\n"
+             "X-Zstd-Level: %d\r\n",
+             (unsigned long long)raw_len, SUBMIT_ZSTD_LEVEL);
 
     char headers[768];
     build_auth_headers(headers, sizeof(headers), cfg->token,
@@ -691,8 +720,9 @@ static int do_submit(struct mg_mgr *mgr, const client_cfg_t *cfg,
 
     int result;
     if (io.status == 200) {
-        printf("client: submitted %s (%lld bytes, %.3fs)\n",
-               lease->workunit_id, (long long)body_len, sieve_seconds);
+        printf("client: submitted %s (%lld bytes raw -> %lld bytes zstd, %.3fs)\n",
+               lease->workunit_id, (long long)raw_len, (long long)body_len,
+               sieve_seconds);
         result = 0;
     } else if (io.status == 409) {
         fprintf(stderr, "client: 409 conflict on %s (re-issued?)\n", lease->workunit_id);

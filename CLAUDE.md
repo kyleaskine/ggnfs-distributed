@@ -98,7 +98,8 @@ All JSON encode/decode lives here so `server.c` and `client.c` don't both link c
 ## Things that have bitten people (load-bearing detail)
 
 - `mfbr`/`mfba` and `lpbr`/`lpba` in `input.job` must match what you use for filtering later — `finalize-nfs.sh` aborts if `<yafu-dir>/nfs.job` SHA differs from the `.job` the server distributed, because mismatched factor base settings silently corrupt filtering.
-- `/submit` counts `\n` bytes in the body as a fast initial estimate (the JSON response carries that count). The verifier replaces it with the actual parsed line count when the submission passes, so stats / dashboard reflect real counts only after verification.
-- `OUTPUT_MAX_BYTES = 500 MiB`. The server's `MG_MAX_RECV_SIZE` is set to allow that — they need to stay in sync if either is bumped.
+- Clients submit relation files compressed with zstd level 1 (`X-Compression: zstd`). The server stores those as `<workunit>.dat.zst`; the verifier streams decompression while parsing. Raw uncompressed submissions are still accepted for compatibility.
+- `/submit` counts `\n` bytes in the submitted relation stream as a fast initial estimate (the JSON response carries that count). For zstd uploads the server counts while streaming decompression. The verifier replaces it with the actual parsed line count when the submission passes, so stats / dashboard reflect real counts only after verification.
+- `OUTPUT_MAX_BYTES = 500 MiB`. The server's `MG_MAX_RECV_SIZE` is set to allow that for compressed request bodies; the zstd submit path also rejects decoded relation streams above `OUTPUT_MAX_BYTES`. These limits need to stay in sync if either is bumped.
 - `sqlite3_busy_timeout=5s` in `db_open` is what lets the verifier and event-loop threads share a DB file without explicit locking. Dropping it would surface `SQLITE_BUSY` on the main thread under submit load.
 - The server has no graceful shutdown today (`for (;;) mg_mgr_poll(...)`); the cleanup code below the loop — including `verify_thread_stop` — is unreachable. SIGINT just kills it. The DB is in WAL mode so this is fine. (Tracked in `FUTURE.md`.)

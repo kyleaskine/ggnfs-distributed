@@ -24,12 +24,12 @@ public internet.**
 ## Build
 
 Depends on `libgmp` (the verifier recomputes algebraic and rational
-norms). On Debian/Ubuntu:
+norms) and `libzstd` (clients compress relation submissions before
+upload). On Debian/Ubuntu:
 
-    apt install libgmp-dev
+    apt install libgmp-dev libzstd-dev
 
-Everything else (mongoose, cJSON, SQLite) is vendored under `vendor/`
-so a clean clone builds offline.
+Everything else (mongoose, cJSON, SQLite) is vendored under `vendor/`.
 
     make
 

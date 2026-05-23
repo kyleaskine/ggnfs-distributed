@@ -17,7 +17,7 @@ WARN     := -Wall
 
 CFLAGS   := $(OPT) $(CSTD) $(WARN) -fPIC -D_FILE_OFFSET_BITS=64
 LDFLAGS  :=
-LIBS     := -lpthread -lm -ldl -lgmp
+LIBS     := -lpthread -lm -ldl -lgmp -lzstd
 
 # Vendored sources are compiled with relaxed warnings; we don't own them.
 VENDOR_CFLAGS := $(OPT) -std=gnu99 -fPIC -w \

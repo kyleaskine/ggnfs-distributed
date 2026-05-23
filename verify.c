@@ -8,13 +8,173 @@
 #include "verify.h"
 #include "db.h"
 
+#include <zstd.h>
+
 #include <errno.h>
 #include <gmp.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/types.h>
 #include <time.h>
+
+typedef struct {
+    FILE          *f;
+    int            zstd;
+    int            error;
+    ZSTD_DStream  *ds;
+    unsigned char *inbuf;
+    unsigned char *outbuf;
+    size_t         in_cap;
+    size_t         out_cap;
+    ZSTD_inBuffer  in;
+    size_t         out_pos;
+    size_t         out_len;
+    size_t         remaining;
+    int            eof;
+} rel_reader_t;
+
+static void rel_reader_close(rel_reader_t *r);
+
+static int has_suffix(const char *s, const char *suffix)
+{
+    size_t n = strlen(s), m = strlen(suffix);
+    return n >= m && strcmp(s + n - m, suffix) == 0;
+}
+
+static int rel_reader_open(rel_reader_t *r, const char *path)
+{
+    memset(r, 0, sizeof(*r));
+    r->f = fopen(path, "rb");
+    if (!r->f) return -1;
+    r->zstd = has_suffix(path, ".zst");
+    if (!r->zstd) return 0;
+
+    r->in_cap = ZSTD_DStreamInSize();
+    r->out_cap = ZSTD_DStreamOutSize();
+    r->inbuf = malloc(r->in_cap);
+    r->outbuf = malloc(r->out_cap);
+    r->ds = ZSTD_createDStream();
+    if (!r->inbuf || !r->outbuf || !r->ds) {
+        r->error = 1;
+        rel_reader_close(r);
+        errno = ENOMEM;
+        return -1;
+    }
+    size_t rc = ZSTD_initDStream(r->ds);
+    if (ZSTD_isError(rc)) {
+        r->error = 1;
+        rel_reader_close(r);
+        errno = EIO;
+        return -1;
+    }
+    r->in.src = r->inbuf;
+    r->in.size = 0;
+    r->in.pos = 0;
+    return 0;
+}
+
+static int rel_reader_fill_zstd(rel_reader_t *r)
+{
+    r->out_pos = 0;
+    r->out_len = 0;
+
+    for (;;) {
+        if (r->in.pos == r->in.size && !r->eof) {
+            size_t n = fread(r->inbuf, 1, r->in_cap, r->f);
+            if (n == 0) {
+                if (ferror(r->f)) { r->error = 1; return -1; }
+                r->eof = 1;
+            }
+            r->in.src = r->inbuf;
+            r->in.size = n;
+            r->in.pos = 0;
+        }
+        if (r->in.pos == r->in.size && r->eof) {
+            if (r->remaining != 0) {
+                r->error = 1;
+                errno = EIO;
+                return -1;
+            }
+            return 0;
+        }
+
+        ZSTD_outBuffer out = { r->outbuf, r->out_cap, 0 };
+        size_t rc = ZSTD_decompressStream(r->ds, &out, &r->in);
+        if (ZSTD_isError(rc)) {
+            r->error = 1;
+            errno = EIO;
+            return -1;
+        }
+        r->remaining = rc;
+        r->out_len = out.pos;
+        if (r->out_len > 0) return 1;
+        if (r->eof && rc != 0) {
+            r->error = 1;
+            errno = EIO;
+            return -1;
+        }
+    }
+}
+
+static ssize_t rel_reader_getline(rel_reader_t *r, char **line, size_t *cap)
+{
+    if (!r->zstd) return getline(line, cap, r->f);
+
+    size_t len = 0;
+    for (;;) {
+        if (r->out_pos >= r->out_len) {
+            int fill = rel_reader_fill_zstd(r);
+            if (fill < 0) return -1;
+            if (fill == 0) {
+                if (len == 0) return -1;
+                if (len >= *cap) {
+                    char *new_line = realloc(*line, len + 1);
+                    if (!new_line) {
+                        r->error = 1;
+                        return -1;
+                    }
+                    *line = new_line;
+                    *cap = len + 1;
+                }
+                (*line)[len] = '\0';
+                return (ssize_t)len;
+            }
+        }
+
+        char ch = (char)r->outbuf[r->out_pos++];
+        if (len + 1 >= *cap) {
+            size_t new_cap = *cap ? *cap * 2 : 256;
+            char *new_line = realloc(*line, new_cap);
+            if (!new_line) {
+                r->error = 1;
+                return -1;
+            }
+            *line = new_line;
+            *cap = new_cap;
+        }
+        (*line)[len++] = ch;
+        if (ch == '\n') {
+            (*line)[len] = '\0';
+            return (ssize_t)len;
+        }
+    }
+}
+
+static int rel_reader_error(const rel_reader_t *r)
+{
+    return r->error || (!r->zstd && ferror(r->f));
+}
+
+static void rel_reader_close(rel_reader_t *r)
+{
+    if (r->f) fclose(r->f);
+    if (r->ds) ZSTD_freeDStream(r->ds);
+    free(r->inbuf);
+    free(r->outbuf);
+    memset(r, 0, sizeof(*r));
+}
 
 /* ===================== primitive integer parsers ======================== */
 
@@ -175,8 +335,8 @@ int verify_parse_file_check(const char *path,
                             char    *out_first_reason,
                             size_t   reason_buflen)
 {
-    FILE *f = fopen(path, "rb");
-    if (!f) {
+    rel_reader_t reader;
+    if (rel_reader_open(&reader, path) != 0) {
         fprintf(stderr, "verify_parse_file_check: open %s: %s\n", path, strerror(errno));
         return -1;
     }
@@ -190,7 +350,7 @@ int verify_parse_file_check(const char *path,
     int     check_q = (check && (check->side == 'a' || check->side == 'r'));
     ssize_t n;
 
-    while ((n = getline(&line, &cap, f)) > 0) {
+    while ((n = rel_reader_getline(&reader, &line, &cap)) > 0) {
         lineno++;
         size_t len = rstrip_eol(line, (size_t)n);
         if (len == 0) continue;
@@ -232,8 +392,14 @@ int verify_parse_file_check(const char *path,
             }
         }
     }
+    int read_error = rel_reader_error(&reader);
     free(line);
-    fclose(f);
+    rel_reader_close(&reader);
+    if (read_error) {
+        fprintf(stderr, "verify_parse_file_check: read %s: %s\n",
+                path, strerror(errno));
+        return -1;
+    }
 
     if (out_parsed)        *out_parsed        = parsed;
     if (out_failed)        *out_failed        = failed;
