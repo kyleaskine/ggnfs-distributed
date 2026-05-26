@@ -67,6 +67,12 @@ On each worker box (every machine must already have a matching
         --workers=4 \
         --cpu-pin=0,2,4,6        # optional, Linux only
 
+If the server is temporarily down when a worker finishes sieving, the
+client keeps the completed relation file in its workdir and retries
+`/submit` instead of leasing new work. Press Ctrl-C once to drain
+without starting more work; press it again to cancel, release active
+leases, and leave any unsubmitted local relation file for inspection.
+
 When enough relations have come back, assemble `nfs.dat` and feed it
 to YAFU:
 

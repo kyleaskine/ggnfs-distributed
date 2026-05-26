@@ -652,7 +652,7 @@ static int do_lease(struct mg_mgr *mgr, const client_cfg_t *cfg,
 }
 
 /* Returns 0 on success (workunit accepted), 1 on 409 (workunit was reissued),
- * -1 on other errors. */
+ * -1 on transient errors worth retrying, -2 on permanent submit rejection. */
 static int do_submit(struct mg_mgr *mgr, const client_cfg_t *cfg,
                      const proto_lease_response_t *lease,
                      const char *outfile_path, double sieve_seconds)
@@ -727,12 +727,43 @@ static int do_submit(struct mg_mgr *mgr, const client_cfg_t *cfg,
     } else if (io.status == 409) {
         fprintf(stderr, "client: 409 conflict on %s (re-issued?)\n", lease->workunit_id);
         result = 1;
-    } else {
+    } else if (io.status >= 500 || io.status == 0) {
         fprintf(stderr, "client: /submit returned HTTP %d\n", io.status);
         result = -1;
+    } else {
+        fprintf(stderr, "client: /submit returned HTTP %d (not retrying)\n", io.status);
+        result = -2;
     }
     http_io_free(&io);
     return result;
+}
+
+/* Keep a completed relation file tied to its active lease until the server
+ * accepts it or tells us that the workunit has already moved on. */
+static int submit_with_retries(struct mg_mgr *mgr, const client_cfg_t *cfg,
+                               const proto_lease_response_t *lease,
+                               const char *outfile_path, double sieve_seconds)
+{
+    int attempt = 0;
+
+    for (;;) {
+        int sr = do_submit(mgr, cfg, lease, outfile_path, sieve_seconds);
+        if (sr == 0 || sr == 1 || sr == -2) return sr;
+
+        attempt++;
+        if (shutdown_phase() >= SHUTDOWN_CANCELLING) return -1;
+
+        fprintf(stderr,
+                "client: will retry /submit for %s in %llds (retry %d)\n",
+                lease->workunit_id, (long long)cfg->idle_backoff_seconds,
+                attempt);
+        for (int64_t i = 0;
+             i < cfg->idle_backoff_seconds &&
+             shutdown_phase() < SHUTDOWN_CANCELLING;
+             i++) {
+            sleep(1);
+        }
+    }
 }
 
 /* Returns 0 if the server released the lease or no longer has that lease for us;
@@ -898,19 +929,25 @@ static int run_one_iteration(struct mg_mgr *mgr, const client_cfg_t *cfg, int wo
         return -2;
     }
 
-    int sr = do_submit(mgr, cfg, &lease, outfile, sieve_seconds);
-    if (sr < 0 && shutdown_phase() >= SHUTDOWN_DRAINING) {
-        if (do_release(mgr, cfg, lease.workunit_id) == 0)
-            active_lease_clear(worker_idx);
-    } else {
-        active_lease_clear(worker_idx);
+    int sr = submit_with_retries(mgr, cfg, &lease, outfile, sieve_seconds);
+    if (sr == -1) {
+        fprintf(stderr, "client: submit cancelled; leaving %s for inspection\n", outfile);
+        free(outfile);
+        return -2;
     }
-    /* Tidy: remove the local rels file so the next iteration starts clean.
-     * (The local executor also calls remove() before invoking the siever,
-     *  but we still want to free the disk after a successful submit.) */
+    if (sr == -2) {
+        fprintf(stderr, "client: submit failed permanently; leaving %s for inspection\n",
+                outfile);
+        active_lease_clear(worker_idx);
+        free(outfile);
+        return -2;
+    }
+
+    active_lease_clear(worker_idx);
+    /* Tidy: remove the local rels file once the server accepted it, or once
+     * the server says the workunit has already moved on. */
     unlink(outfile);
     free(outfile);
-    if (sr < 0) return -2;
     return 1;
 }
 /* ===================== worker thread ==================================== */

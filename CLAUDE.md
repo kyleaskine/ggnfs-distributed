@@ -81,7 +81,7 @@ Input files (currently just the single `.job`) are stored under `<jobdir>/files/
 `wu-<jobhash>-<seq>` where `<jobhash>` is the first 8 hex chars of the `.job` SHA. `init` numbers from 0; `extend` continues the sequence using `db_workunit_extent` so IDs never collide.
 
 ### Client worker model
-Each `--workers=N` spawns a pthread with its own `mg_mgr`, its own `<workdir>/wN`, its own `client_id` (`<base>-wN`). Workers share shutdown phase (`running → draining → cancelling`) plus a mutex-protected active-lease table. First Ctrl-C enters draining mode: finish active work, submit it, and stop requesting new leases. Second Ctrl-C enters cancelling mode: the main thread POSTs `/release` for active leases and exits. On Linux, `--cpu-pin=a,b,c,…` pins each worker (and the siever it `system()`s, which inherits affinity).
+Each `--workers=N` spawns a pthread with its own `mg_mgr`, its own `<workdir>/wN`, its own `client_id` (`<base>-wN`). Workers share shutdown phase (`running → draining → cancelling`) plus a mutex-protected active-lease table. First Ctrl-C enters draining mode: finish active work, retry `/submit` for completed relation files if the server is unavailable, and stop requesting new leases. Second Ctrl-C enters cancelling mode: the main thread POSTs `/release` for active leases and exits; any relation file that never got accepted is left in the worker workdir for inspection. On Linux, `--cpu-pin=a,b,c,…` pins each worker (and the siever it `system()`s, which inherits affinity).
 
 ### Sieve executor (`sieve_executor.[ch]`)
 One function: `sieve_run_local()` formats the `gnfs-lasieve4*` command line and invokes it via `system()`. It also `remove()`s any prior file at the output path because the siever opens its `-o` argument in append mode.
