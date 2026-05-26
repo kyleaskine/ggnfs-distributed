@@ -72,6 +72,15 @@ to YAFU:
 
     ./finalize-nfs.sh --jobdir=/tmp/myjob --yafu-dir=/path/to/yafu --threads=8 --run
 
+To stage relation files for download before validating or deleting them
+from the server, move the contents of `<jobdir>/rels` into a separate
+folder:
+
+    ./move-rels.sh --jobdir=/tmp/myjob --dest=/tmp/myjob-relsBackup
+
+Use `--dry-run` first to preview the move, and `--overwrite` only if
+replacing same-named files in the destination is intentional.
+
 `finalize-nfs.sh` aborts if `<yafu-dir>/nfs.job` differs from the `.job`
 the server distributed — mismatched factor-base settings silently
 corrupt filtering, so the script enforces a SHA match.
