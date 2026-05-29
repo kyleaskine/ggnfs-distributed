@@ -80,6 +80,13 @@ static pthread_mutex_t g_active_mu = PTHREAD_MUTEX_INITIALIZER;
 static active_lease_t *g_active = NULL;
 static int g_active_count = 0;
 
+static pthread_mutex_t g_http_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  g_http_cv = PTHREAD_COND_INITIALIZER;
+static int g_http_limit = 16;
+static int g_http_in_use = 0;
+
+static pthread_mutex_t g_file_cache_mu = PTHREAD_MUTEX_INITIALIZER;
+
 static int shutdown_phase(void)
 {
     return (int)g_shutdown;
@@ -236,13 +243,73 @@ static int write_file(const char *path, const void *buf, size_t len)
     return rc;
 }
 
+static int write_file_atomic(const char *path, const void *buf, size_t len)
+{
+    size_t n = strlen(path) + 64;
+    char *tmp = malloc(n);
+    if (!tmp) return -1;
+    snprintf(tmp, n, "%s.tmp.%ld", path, (long)getpid());
+
+    int rc = write_file(tmp, buf, len);
+    int saved_errno = errno;
+    if (rc == 0 && rename(tmp, path) != 0) {
+        rc = -1;
+        saved_errno = errno;
+    }
+    if (rc != 0) {
+        unlink(tmp);
+        errno = saved_errno;
+    }
+    free(tmp);
+    return rc;
+}
+
 static double elapsed_seconds(struct timeval start, struct timeval stop)
 {
     return (double)(stop.tv_sec - start.tv_sec)
          + (double)(stop.tv_usec - start.tv_usec) / 1e6;
 }
 
+static int cached_file_has_sha(const char *path, const char *sha_hex)
+{
+    char have[65];
+    return file_exists(path) &&
+           sha256_file(path, have) == 0 &&
+           strcmp(have, sha_hex) == 0;
+}
+
 /* ===================== sync HTTP wrapper ================================ */
+
+static void http_limiter_init(int limit)
+{
+    pthread_mutex_lock(&g_http_mu);
+    g_http_limit = limit;
+    g_http_in_use = 0;
+    pthread_mutex_unlock(&g_http_mu);
+}
+
+static int http_slot_acquire(int abort_on_cancel)
+{
+    pthread_mutex_lock(&g_http_mu);
+    while (g_http_limit > 0 && g_http_in_use >= g_http_limit) {
+        if (abort_on_cancel && shutdown_phase() >= SHUTDOWN_CANCELLING) {
+            pthread_mutex_unlock(&g_http_mu);
+            return -1;
+        }
+        pthread_cond_wait(&g_http_cv, &g_http_mu);
+    }
+    g_http_in_use++;
+    pthread_mutex_unlock(&g_http_mu);
+    return 0;
+}
+
+static void http_slot_release(void)
+{
+    pthread_mutex_lock(&g_http_mu);
+    if (g_http_in_use > 0) g_http_in_use--;
+    pthread_cond_broadcast(&g_http_cv);
+    pthread_mutex_unlock(&g_http_mu);
+}
 
 typedef struct {
     /* Request inputs */
@@ -324,8 +391,13 @@ static int http_request(struct mg_mgr *mgr, http_io_t *io, int timeout_ms,
     io->resp_body = NULL;
     io->resp_body_len = 0;
 
+    if (http_slot_acquire(abort_on_cancel) != 0) return -1;
+
     struct mg_connection *c = mg_http_connect(mgr, io->url, sync_http_handler, io);
-    if (!c) return -1;
+    if (!c) {
+        http_slot_release();
+        return -1;
+    }
 
     int waited_ms = 0;
     while (!io->done && waited_ms < timeout_ms) {
@@ -342,8 +414,9 @@ static int http_request(struct mg_mgr *mgr, http_io_t *io, int timeout_ms,
         }
     }
     if (!io->closed) c->fn_data = NULL;
-    if (!io->done || io->err) return -1;
-    return 0;
+    int rc = (!io->done || io->err) ? -1 : 0;
+    http_slot_release();
+    return rc;
 }
 
 static void http_io_free(http_io_t *io)
@@ -360,8 +433,10 @@ typedef struct {
     char        client_id[64];
     char        siever_path[256];
     char        workdir[256];
+    char        file_cache_dir[256];
     int64_t     idle_backoff_seconds;
     int         workers;
+    int         http_concurrency;
     int         once;
 
     /* --cpu-pin parsed list. cpu_pin_count == 0 disables pinning. */
@@ -380,6 +455,7 @@ static void usage(void)
         "    [--workdir=/tmp/ggnfs-client]\n"
         "    [--idle-backoff=30]\n"
         "    [--workers=1]                  pthread workers (each runs an independent siever)\n"
+        "    [--http-concurrency=16]        max simultaneous coordinator HTTP requests\n"
         "    [--cpu-pin=0,2,4,6]            (Linux) pin worker K to the K'th CPU in the list;\n"
         "                                   list length must equal --workers\n"
         "    [--once]                       single-shot: each worker does one workunit and exits\n");
@@ -390,6 +466,7 @@ static int parse_config(int argc, char **argv, client_cfg_t *cfg)
     memset(cfg, 0, sizeof(*cfg));
     cfg->idle_backoff_seconds = 30;
     cfg->workers = 1;
+    cfg->http_concurrency = 16;
     snprintf(cfg->workdir, sizeof(cfg->workdir), "%s", "/tmp/ggnfs-client");
 
     const char *url     = flag(argc, argv, "--server-url");
@@ -399,6 +476,7 @@ static int parse_config(int argc, char **argv, client_cfg_t *cfg)
     const char *wdir    = flag(argc, argv, "--workdir");
     const char *ib      = flag(argc, argv, "--idle-backoff");
     const char *workers = flag(argc, argv, "--workers");
+    const char *httpc   = flag(argc, argv, "--http-concurrency");
     const char *once    = flag(argc, argv, "--once");
 
     if (!url || !*url || !token || !*token || !siever || !*siever) {
@@ -419,6 +497,11 @@ static int parse_config(int argc, char **argv, client_cfg_t *cfg)
     }
 
     if (wdir && *wdir) snprintf(cfg->workdir, sizeof(cfg->workdir), "%s", wdir);
+    if (snprintf(cfg->file_cache_dir, sizeof(cfg->file_cache_dir), "%s/files",
+                 cfg->workdir) >= (int)sizeof(cfg->file_cache_dir)) {
+        fprintf(stderr, "client: --workdir too long\n");
+        return -1;
+    }
 
     if (ib && *ib && parse_int64_arg(ib, &cfg->idle_backoff_seconds) != 0) {
         fprintf(stderr, "client: --idle-backoff must be an integer\n");
@@ -434,6 +517,16 @@ static int parse_config(int argc, char **argv, client_cfg_t *cfg)
             return -1;
         }
         cfg->workers = (int)n;
+    }
+
+    if (httpc && *httpc) {
+        int64_t n;
+        if (parse_int64_arg(httpc, &n) != 0 || n < 1 || n > CLIENT_MAX_WORKERS) {
+            fprintf(stderr, "client: --http-concurrency must be an integer in 1..%d\n",
+                    CLIENT_MAX_WORKERS);
+            return -1;
+        }
+        cfg->http_concurrency = (int)n;
     }
 
     const char *cpu_pin = flag(argc, argv, "--cpu-pin");
@@ -523,33 +616,32 @@ static void active_lease_clear(int idx)
     pthread_mutex_unlock(&g_active_mu);
 }
 
-/* Fetch /file/<sha> into <workdir>/files/<sha>. No-op if already present. */
+/* Fetch /file/<sha> into the shared cache. No-op if already present. */
 static int ensure_file_cached(struct mg_mgr *mgr, const client_cfg_t *cfg,
                               const proto_lease_response_t *lease,
                               char *out_path, size_t out_path_n)
 {
-    char *files_dir = path_join(cfg->workdir, "files");
-    if (!files_dir) return -1;
-    if (mkdir_p(files_dir) != 0) { free(files_dir); return -1; }
-    char *local = path_join(files_dir, lease->file_sha256_hex);
-    free(files_dir);
+    if (mkdir_p(cfg->file_cache_dir) != 0) return -1;
+    char *local = path_join(cfg->file_cache_dir, lease->file_sha256_hex);
     if (!local) return -1;
     snprintf(out_path, out_path_n, "%s", local);
 
+    pthread_mutex_lock(&g_file_cache_mu);
+
+    if (cached_file_has_sha(local, lease->file_sha256_hex)) {
+        pthread_mutex_unlock(&g_file_cache_mu);
+        free(local);
+        return 0;
+    }
+
     if (file_exists(local)) {
-        /* Verify cache integrity — if sha doesn't match, refetch. */
-        char have[65];
-        if (sha256_file(local, have) == 0 &&
-            strcmp(have, lease->file_sha256_hex) == 0) {
-            free(local);
-            return 0;
-        }
         unlink(local);
     }
 
     char url[512];
     if (join_url(url, sizeof(url), cfg->server_url, lease->file_url) != 0) {
         fprintf(stderr, "client: file url too long\n");
+        pthread_mutex_unlock(&g_file_cache_mu);
         free(local);
         return -1;
     }
@@ -565,29 +657,35 @@ static int ensure_file_cached(struct mg_mgr *mgr, const client_cfg_t *cfg,
     int rc = http_request(mgr, &io, 60000, 1);
     if (rc != 0) {
         fprintf(stderr, "client: file fetch failed (connection)\n");
+        pthread_mutex_unlock(&g_file_cache_mu);
         http_io_free(&io); free(local);
         return -1;
     }
     if (io.status != 200) {
         fprintf(stderr, "client: file fetch returned HTTP %d\n", io.status);
+        pthread_mutex_unlock(&g_file_cache_mu);
         http_io_free(&io); free(local);
         return -1;
     }
-    if (write_file(local, io.resp_body, io.resp_body_len) != 0) {
+    if (write_file_atomic(local, io.resp_body, io.resp_body_len) != 0) {
         fprintf(stderr, "client: cannot write %s: %s\n", local, strerror(errno));
+        pthread_mutex_unlock(&g_file_cache_mu);
         http_io_free(&io); free(local);
         return -1;
     }
     http_io_free(&io);
 
-    char have[65];
+    char have[65] = {0};
     if (sha256_file(local, have) != 0 ||
         strcmp(have, lease->file_sha256_hex) != 0) {
         fprintf(stderr, "client: fetched file sha mismatch (got %s, want %s)\n",
                 have, lease->file_sha256_hex);
-        unlink(local); free(local);
+        unlink(local);
+        pthread_mutex_unlock(&g_file_cache_mu);
+        free(local);
         return -1;
     }
+    pthread_mutex_unlock(&g_file_cache_mu);
     free(local);
     return 0;
 }
@@ -1048,10 +1146,13 @@ int main(int argc, char **argv)
         "  siever   : %s\n"
         "  workdir  : %s\n"
         "  workers  : %d\n"
+        "  http max : %d\n"
         "  backoff  : %llds   once=%d\n",
         CLIENT_VERSION, cfg.server_url, cfg.client_id, cfg.siever_path,
-        cfg.workdir, cfg.workers,
+        cfg.workdir, cfg.workers, cfg.http_concurrency,
         (long long)cfg.idle_backoff_seconds, cfg.once);
+
+    http_limiter_init(cfg.http_concurrency);
 
     pthread_t     *tids = calloc((size_t)cfg.workers, sizeof(pthread_t));
     worker_args_t *args = calloc((size_t)cfg.workers, sizeof(worker_args_t));

@@ -67,6 +67,12 @@ On each worker box (every machine must already have a matching
         --workers=4 \
         --cpu-pin=0,2,4,6        # optional, Linux only
 
+For large machines, set `--workers` to the number of sievers you want to run
+and leave `--http-concurrency` at its default of 16 unless the coordinator can
+comfortably handle more simultaneous client sockets. The workers share a single
+input-file cache under `<workdir>/files`, so high worker counts do not need to
+download the job file once per core.
+
 If the server is temporarily down when a worker finishes sieving, the
 client keeps the completed relation file in its workdir and retries
 `/submit` instead of leasing new work. Press Ctrl-C once to drain
