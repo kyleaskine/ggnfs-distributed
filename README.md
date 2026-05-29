@@ -71,7 +71,9 @@ For large machines, set `--workers` to the number of sievers you want to run
 and leave `--http-concurrency` at its default of 16 unless the coordinator can
 comfortably handle more simultaneous client sockets. The workers share a single
 input-file cache under `<workdir>/files`, so high worker counts do not need to
-download the job file once per core.
+download the job file once per core. The client also spaces new coordinator
+connections by `--http-interval-ms=50` by default; increase that to 100 or 200
+if a provider or firewall still gets overwhelmed during startup.
 
 If the server is temporarily down when a worker finishes sieving, the
 client keeps the completed relation file in its workdir and retries

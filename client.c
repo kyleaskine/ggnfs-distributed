@@ -84,6 +84,9 @@ static pthread_mutex_t g_http_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t  g_http_cv = PTHREAD_COND_INITIALIZER;
 static int g_http_limit = 16;
 static int g_http_in_use = 0;
+static int64_t g_http_interval_ms = 50;
+static int64_t g_http_next_start_ms = 0;
+static int g_http_error_streak = 0;
 
 static pthread_mutex_t g_file_cache_mu = PTHREAD_MUTEX_INITIALIZER;
 
@@ -270,6 +273,13 @@ static double elapsed_seconds(struct timeval start, struct timeval stop)
          + (double)(stop.tv_usec - start.tv_usec) / 1e6;
 }
 
+static int64_t monotonic_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000 + (int64_t)ts.tv_nsec / 1000000;
+}
+
 static int cached_file_has_sha(const char *path, const char *sha_hex)
 {
     char have[65];
@@ -280,33 +290,74 @@ static int cached_file_has_sha(const char *path, const char *sha_hex)
 
 /* ===================== sync HTTP wrapper ================================ */
 
-static void http_limiter_init(int limit)
+static void http_limiter_init(int limit, int64_t interval_ms)
 {
     pthread_mutex_lock(&g_http_mu);
     g_http_limit = limit;
+    g_http_interval_ms = interval_ms;
     g_http_in_use = 0;
+    g_http_next_start_ms = 0;
+    g_http_error_streak = 0;
     pthread_mutex_unlock(&g_http_mu);
+}
+
+static int http_sleep_ms(int64_t ms, int abort_on_cancel)
+{
+    while (ms > 0) {
+        if (abort_on_cancel && shutdown_phase() >= SHUTDOWN_CANCELLING)
+            return -1;
+        int64_t chunk = ms > 100 ? 100 : ms;
+        usleep((useconds_t)chunk * 1000);
+        ms -= chunk;
+    }
+    return 0;
 }
 
 static int http_slot_acquire(int abort_on_cancel)
 {
-    pthread_mutex_lock(&g_http_mu);
-    while (g_http_limit > 0 && g_http_in_use >= g_http_limit) {
-        if (abort_on_cancel && shutdown_phase() >= SHUTDOWN_CANCELLING) {
-            pthread_mutex_unlock(&g_http_mu);
-            return -1;
+    for (;;) {
+        int64_t wait_ms = 0;
+
+        pthread_mutex_lock(&g_http_mu);
+        while (g_http_limit > 0 && g_http_in_use >= g_http_limit) {
+            if (abort_on_cancel && shutdown_phase() >= SHUTDOWN_CANCELLING) {
+                pthread_mutex_unlock(&g_http_mu);
+                return -1;
+            }
+            pthread_cond_wait(&g_http_cv, &g_http_mu);
         }
-        pthread_cond_wait(&g_http_cv, &g_http_mu);
+
+        int64_t now = monotonic_ms();
+        if (g_http_next_start_ms > now) wait_ms = g_http_next_start_ms - now;
+        if (wait_ms == 0) {
+            g_http_in_use++;
+            if (g_http_interval_ms > 0) {
+                g_http_next_start_ms = now + g_http_interval_ms;
+            }
+            pthread_mutex_unlock(&g_http_mu);
+            return 0;
+        }
+
+        pthread_mutex_unlock(&g_http_mu);
+        if (http_sleep_ms(wait_ms, abort_on_cancel) != 0) return -1;
     }
-    g_http_in_use++;
-    pthread_mutex_unlock(&g_http_mu);
-    return 0;
 }
 
-static void http_slot_release(void)
+static void http_slot_release(int ok)
 {
     pthread_mutex_lock(&g_http_mu);
     if (g_http_in_use > 0) g_http_in_use--;
+    if (ok) {
+        g_http_error_streak = 0;
+    } else {
+        int64_t pause_ms;
+        int64_t until_ms;
+        if (g_http_error_streak < 20) g_http_error_streak++;
+        pause_ms = 250 * (int64_t)g_http_error_streak;
+        if (pause_ms > 5000) pause_ms = 5000;
+        until_ms = monotonic_ms() + pause_ms;
+        if (g_http_next_start_ms < until_ms) g_http_next_start_ms = until_ms;
+    }
     pthread_cond_broadcast(&g_http_cv);
     pthread_mutex_unlock(&g_http_mu);
 }
@@ -395,7 +446,7 @@ static int http_request(struct mg_mgr *mgr, http_io_t *io, int timeout_ms,
 
     struct mg_connection *c = mg_http_connect(mgr, io->url, sync_http_handler, io);
     if (!c) {
-        http_slot_release();
+        http_slot_release(0);
         return -1;
     }
 
@@ -415,7 +466,7 @@ static int http_request(struct mg_mgr *mgr, http_io_t *io, int timeout_ms,
     }
     if (!io->closed) c->fn_data = NULL;
     int rc = (!io->done || io->err) ? -1 : 0;
-    http_slot_release();
+    http_slot_release(rc == 0);
     return rc;
 }
 
@@ -435,6 +486,7 @@ typedef struct {
     char        workdir[256];
     char        file_cache_dir[256];
     int64_t     idle_backoff_seconds;
+    int64_t     http_interval_ms;
     int         workers;
     int         http_concurrency;
     int         once;
@@ -456,6 +508,7 @@ static void usage(void)
         "    [--idle-backoff=30]\n"
         "    [--workers=1]                  pthread workers (each runs an independent siever)\n"
         "    [--http-concurrency=16]        max simultaneous coordinator HTTP requests\n"
+        "    [--http-interval-ms=50]        minimum spacing between coordinator HTTP starts\n"
         "    [--cpu-pin=0,2,4,6]            (Linux) pin worker K to the K'th CPU in the list;\n"
         "                                   list length must equal --workers\n"
         "    [--once]                       single-shot: each worker does one workunit and exits\n");
@@ -465,6 +518,7 @@ static int parse_config(int argc, char **argv, client_cfg_t *cfg)
 {
     memset(cfg, 0, sizeof(*cfg));
     cfg->idle_backoff_seconds = 30;
+    cfg->http_interval_ms = 50;
     cfg->workers = 1;
     cfg->http_concurrency = 16;
     snprintf(cfg->workdir, sizeof(cfg->workdir), "%s", "/tmp/ggnfs-client");
@@ -477,6 +531,7 @@ static int parse_config(int argc, char **argv, client_cfg_t *cfg)
     const char *ib      = flag(argc, argv, "--idle-backoff");
     const char *workers = flag(argc, argv, "--workers");
     const char *httpc   = flag(argc, argv, "--http-concurrency");
+    const char *httpi   = flag(argc, argv, "--http-interval-ms");
     const char *once    = flag(argc, argv, "--once");
 
     if (!url || !*url || !token || !*token || !siever || !*siever) {
@@ -527,6 +582,15 @@ static int parse_config(int argc, char **argv, client_cfg_t *cfg)
             return -1;
         }
         cfg->http_concurrency = (int)n;
+    }
+
+    if (httpi && *httpi) {
+        int64_t n;
+        if (parse_int64_arg(httpi, &n) != 0 || n < 0 || n > 60000) {
+            fprintf(stderr, "client: --http-interval-ms must be an integer in 0..60000\n");
+            return -1;
+        }
+        cfg->http_interval_ms = n;
     }
 
     const char *cpu_pin = flag(argc, argv, "--cpu-pin");
@@ -1147,12 +1211,14 @@ int main(int argc, char **argv)
         "  workdir  : %s\n"
         "  workers  : %d\n"
         "  http max : %d\n"
+        "  http gap : %lldms\n"
         "  backoff  : %llds   once=%d\n",
         CLIENT_VERSION, cfg.server_url, cfg.client_id, cfg.siever_path,
         cfg.workdir, cfg.workers, cfg.http_concurrency,
+        (long long)cfg.http_interval_ms,
         (long long)cfg.idle_backoff_seconds, cfg.once);
 
-    http_limiter_init(cfg.http_concurrency);
+    http_limiter_init(cfg.http_concurrency, cfg.http_interval_ms);
 
     pthread_t     *tids = calloc((size_t)cfg.workers, sizeof(pthread_t));
     worker_args_t *args = calloc((size_t)cfg.workers, sizeof(worker_args_t));
