@@ -2,7 +2,7 @@
  *
  * Sieves special-q range [startq, startq+qrange) on `side` ('a' or 'r') for
  * the polynomial in `job_infile`, writing relations to `outfile`. Returns the
- * siever's exit code (mirrors system()).
+ * siever's exit code, or 128+signal if it died from a signal.
  *
  * `extra_args` is appended to the command line verbatim. Pass NULL or "" for
  * none. Used for tunables the operator wants on every worker — typically
@@ -17,12 +17,16 @@
 
 #include <stdint.h>
 
+typedef int (*sieve_cancel_fn)(void *ctx);
+
 int sieve_run_local(const char *siever_path,
                     const char *job_infile,
                     const char *outfile,
                     uint32_t startq,
                     uint32_t qrange,
                     char side,
-                    const char *extra_args);
+                    const char *extra_args,
+                    sieve_cancel_fn should_cancel,
+                    void *cancel_ctx);
 
 #endif /* GGNFS_SIEVE_EXECUTOR_H */

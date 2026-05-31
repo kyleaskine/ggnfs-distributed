@@ -7,7 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 A distributed coordinator for GGNFS lattice sieving (the special-q sieving phase of the General Number Field Sieve). Two binaries built from one Makefile:
 
 - `ggnfs-sieve-server` — HTTP coordinator: chops a Q-range into workunits, hands them out under lease, receives relation files back, persists state in SQLite, serves a dashboard.
-- `ggnfs-sieve-client` — polls the server, leases a workunit, fetches the `.job`, shells out to `gnfs-lasieve4*` via `system()`, posts the relations back.
+- `ggnfs-sieve-client` — polls the server, leases a workunit, fetches the `.job`, runs `gnfs-lasieve4*` in an isolated child process group, posts the relations back.
 
 Output is consumed by `finalize-nfs.sh`, which assembles `nfs.dat` and feeds YAFU's filter / LA / sqrt pipeline.
 
@@ -81,10 +81,10 @@ Input files (currently just the single `.job`) are stored under `<jobdir>/files/
 `wu-<jobhash>-<seq>` where `<jobhash>` is the first 8 hex chars of the `.job` SHA. `init` numbers from 0; `extend` continues the sequence using `db_workunit_extent` so IDs never collide.
 
 ### Client worker model
-Each `--workers=N` spawns a pthread with its own `mg_mgr`, its own `<workdir>/wN`, its own `client_id` (`<base>-wN`). Workers share shutdown phase (`running → draining → cancelling`) plus a mutex-protected active-lease table. First Ctrl-C enters draining mode: finish active work, retry `/submit` for completed relation files if the server is unavailable, and stop requesting new leases. Second Ctrl-C enters cancelling mode: the main thread POSTs `/release` for active leases and exits; any relation file that never got accepted is left in the worker workdir for inspection. On Linux, `--cpu-pin=a,b,c,…` pins each worker (and the siever it `system()`s, which inherits affinity).
+Each `--workers=N` spawns a pthread with its own `mg_mgr`, its own `<workdir>/wN`, its own `client_id` (`<base>-wN`). Workers share shutdown phase (`running → draining → cancelling`) plus a mutex-protected active-lease table. First Ctrl-C enters draining mode: finish active work, retry `/submit` for completed relation files if the server is unavailable, and stop requesting new leases. Second Ctrl-C enters cancelling mode: the main thread POSTs `/release` for active leases, while workers terminate active siever process groups and exit; any relation file that never got accepted is left in the worker workdir for inspection. On Linux, `--cpu-pin=a,b,c,…` pins each worker and the siever child inherits affinity.
 
 ### Sieve executor (`sieve_executor.[ch]`)
-One function: `sieve_run_local()` formats the `gnfs-lasieve4*` command line and invokes it via `system()`. It also `remove()`s any prior file at the output path because the siever opens its `-o` argument in append mode.
+One function: `sieve_run_local()` formats the `gnfs-lasieve4*` command line, runs it through `/bin/sh -c` in a separate process group, and polls a cancellation callback while waiting. The process-group isolation keeps terminal Ctrl-C from reaching active sievers during drain; cancellation explicitly sends SIGTERM/SIGKILL to that process group. It also `remove()`s any prior file at the output path because the siever opens its `-o` argument in append mode.
 
 ### Protocol layer (`protocol.[ch]`)
 All JSON encode/decode lives here so `server.c` and `client.c` don't both link cJSON usage directly. Encoders return `malloc`'d strings the caller must `free()`. `proto_decode_lease_response` enforces required-field presence and returns -1 if any are missing — the client treats that as "malformed response, back off". `POST /release` is a voluntary lease return used by client cancellation; it only succeeds for a workunit currently leased to that client and does not increment `attempt_count`.

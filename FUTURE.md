@@ -13,13 +13,6 @@ without re-litigating.
   handler that flips a flag, exit the poll loop, stop the verifier,
   free mongoose.
 
-- **Replace client `system()` with child PID management.** Client Ctrl-C
-  now has drain/cancel phases and `/release`, but the siever still runs
-  through `system("gnfs-lasieve4...")`. Ctrl-C is delivered to the whole
-  process group in normal terminal use, so cancellation usually interrupts
-  the shell/siever, but precise process control wants `fork`/`exec` or
-  `posix_spawn` plus a stored child PID per worker.
-
 - **Legacy submission migration.** Submissions written before the
   verifier landed have `verify_status='skipped'` and their workunits
   are stuck in `'submitted'` because nothing transitions them. A one-

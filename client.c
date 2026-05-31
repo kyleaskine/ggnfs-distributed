@@ -3,7 +3,7 @@
  * Polls a ggnfs-sieve-server in a loop:
  *   POST /lease   -> get a workunit
  *   GET  /file/X  -> fetch any input files (sha-cached)
- *   run gnfs-lasieve4* via system()
+ *   run gnfs-lasieve4* in an isolated child process group
  *   POST /submit  -> hand the relation file back
  *
  *   ggnfs-sieve-client \
@@ -23,7 +23,7 @@
  * threads beyond shutdown state and active-lease bookkeeping.
  *
  * --cpu-pin (Linux only) gives each worker an explicit CPU. Worker K pins
- * itself to the K'th CPU in the list, and the siever (spawned via system())
+ * itself to the K'th CPU in the list, and the siever child process
  * inherits that affinity. Useful on heterogeneous CPUs (Zen 5, Intel
  * P+E-cores) where the OS migrating threads between CCDs/cache domains
  * tanks performance.
@@ -113,6 +113,12 @@ static void on_signal(int sig)
         ignored = write(STDERR_FILENO, msg, sizeof(msg) - 1);
         (void)ignored;
     }
+}
+
+static int should_cancel_siever(void *ctx)
+{
+    (void)ctx;
+    return shutdown_phase() >= SHUTDOWN_CANCELLING;
 }
 
 /* ===================== misc helpers ===================================== */
@@ -1060,7 +1066,9 @@ static int run_one_iteration(struct mg_mgr *mgr, const client_cfg_t *cfg, int wo
                                    (uint32_t)lease.q_start,
                                    (uint32_t)lease.q_range,
                                    lease.side,
-                                   lease.siever_args);
+                                   lease.siever_args,
+                                   should_cancel_siever,
+                                   NULL);
     gettimeofday(&t1, NULL);
     double sieve_seconds = elapsed_seconds(t0, t1);
 
@@ -1137,8 +1145,8 @@ static void *worker_main(void *arg)
     if (mkdir_p(cfg.workdir) != 0) return NULL;
 
 #ifdef __linux__
-    /* Pin this worker (and the sievers it spawns via system(), which inherit
-     * affinity from the calling thread) to its assigned CPU. */
+    /* Pin this worker and its siever children, which inherit affinity from the
+     * calling thread, to the assigned CPU. */
     if (cfg.cpu_pin_count > 0) {
         int cpu = cfg.cpu_pin_list[idx];
         cpu_set_t set;
@@ -1258,7 +1266,6 @@ int main(int argc, char **argv)
         if (shutdown_phase() >= SHUTDOWN_CANCELLING && !released_on_cancel) {
             release_active_leases(&cfg);
             released_on_cancel = 1;
-            break;
         }
         if (done < spawned) usleep(100000);
     }
