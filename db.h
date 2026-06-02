@@ -43,6 +43,13 @@ int db_workunit_insert(ggnfs_db_t *db, const char *id,
  * q_start+q_range, i.e. one past the highest-Q workunit (0 if empty). */
 int db_workunit_extent(ggnfs_db_t *db, int64_t *out_count, int64_t *out_q_end);
 
+/* Check whether the half-open range [qmin, qmax) overlaps any existing
+ * workunit. Returns 1 if there is an overlap (and fills *out_q_start /
+ * *out_q_range with the first overlapping workunit found, if non-NULL),
+ * 0 if there is no overlap, -1 on internal error. */
+int db_workunit_overlap(ggnfs_db_t *db, int64_t qmin, int64_t qmax,
+                        int64_t *out_q_start, int64_t *out_q_range);
+
 /* Re-queue any leased workunits whose lease has expired. If a workunit's
  * attempt_count would reach `max_attempts`, mark it 'poisoned' instead of
  * available so we stop re-issuing a workunit that keeps timing out.
@@ -63,8 +70,11 @@ typedef struct {
     char     side;
 } db_lease_result_t;
 
+/* `lease_desc` picks the order in which available workunits are handed out:
+ * 0 = ascending q_start (default), 1 = descending q_start. */
 int db_lease(ggnfs_db_t *db, const char *client_id,
              int64_t lease_seconds, int64_t now_unix,
+             int lease_desc,
              db_lease_result_t *out);
 
 /* Record a relation file submission and mark the workunit submitted.

@@ -19,6 +19,7 @@ REPO_URL="https://github.com/kyleaskine/ggnfs-distributed"
 REPO_DIR="ggnfs-distributed"
 SIEVER_NAME="gnfs-lasieve4I16e"
 SIEVER_AVX_URL="https://ecm.kyleaskine.com/downloads/ggnfs/${SIEVER_NAME}"
+SIEVER_NOIFMA_URL="https://ecm.kyleaskine.com/downloads/ggnfs-noifma/${SIEVER_NAME}"
 SIEVER_NOAVX_URL="https://ecm.kyleaskine.com/downloads/ggnfs-noavx/${SIEVER_NAME}"
 
 DEFAULT_SERVER="http://165.227.115.69:8080"
@@ -78,21 +79,24 @@ else
     make client
 fi
 
-# 3. Pick the right siever for this CPU.
-# The AVX-512 binary was built with -march=native on a CPU with Ice-Lake-era
-# AVX-512 extensions (IFMA, VBMI, VNNI, ...) — gcc emits those instructions
-# even though the source mostly uses base AVX-512F intrinsics. Skylake-X/SP
-# (Xeon Gold 61xx/Platinum 81xx), Cascade Lake, and Cooper Lake have only the
-# original AVX-512 set and will SIGILL on the AVX-512 build. Use IFMA as the
-# Ice-Lake-or-newer gate: any CPU with avx512ifma also has the other modern
-# sub-features the binary may use.
+# 3. Pick the right siever for this CPU. Three tiers:
+#   * AVX-512 + IFMA (Ice Lake / Sapphire Rapids / Zen4+): the full build,
+#     compiled -march=native. gcc emits Ice-Lake-only ops (e.g. VBMI
+#     vpermi2b/vpermt2b) so it SIGILLs on older AVX-512 parts.
+#   * AVX-512 without IFMA (Skylake-SP/Platinum 61xx/81xx, Cascade/Cooper Lake):
+#     the no-IFMA build — the sieve compiled -march=skylake-avx512 (runs 16-wide),
+#     with no Ice-Lake-only instructions. Runs the sieve in AVX-512 without SIGILL.
+#   * No AVX-512 (Zen2/3, Broadwell, older laptops): generic scalar+asm build.
+# IFMA is the Ice-Lake-or-newer gate: every CPU with avx512ifma also has the
+# other modern sub-features (VBMI, ...); every AVX-512 CPU that lacks IFMA also
+# lacks them, so it gets the Skylake build.
 if grep -qw avx512f /proc/cpuinfo && grep -qw avx512ifma /proc/cpuinfo; then
     SIEVER_URL="$SIEVER_AVX_URL"
-    echo "==> AVX-512 + IFMA detected; will fetch AVX-512 siever"
+    echo "==> AVX-512 + IFMA detected; will fetch full AVX-512 siever"
 elif grep -qw avx512f /proc/cpuinfo; then
-    SIEVER_URL="$SIEVER_NOAVX_URL"
-    echo "==> AVX-512 present but no IFMA (Skylake-SP / Cascade Lake / Cooper Lake);"
-    echo "    falling back to generic siever to avoid SIGILL"
+    SIEVER_URL="$SIEVER_NOIFMA_URL"
+    echo "==> AVX-512 without IFMA (Skylake-SP / Cascade Lake / Cooper Lake);"
+    echo "    will fetch the AVX-512-sieve (no-IFMA) siever"
 else
     SIEVER_URL="$SIEVER_NOAVX_URL"
     echo "==> No AVX-512; will fetch generic siever"

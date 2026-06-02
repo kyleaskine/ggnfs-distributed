@@ -41,7 +41,9 @@ Vendored sources are compiled with `-w` and a pile of `-DSQLITE_*` / `-DMG_*` fl
 # 2. Serve
 ./ggnfs-sieve-server serve --jobdir=/tmp/ggnfs-job --bind=127.0.0.1 --port=8080
 
-# 3. Add more workunits later without restarting state (qmin must be >= existing q_end)
+# 3. Add more workunits later without restarting state. The new [qmin, qmax) can
+#    sit above, below, or in a gap between existing workunits — any non-overlapping
+#    placement is accepted.
 ./ggnfs-sieve-server extend --jobdir=/tmp/ggnfs-job --qmin=100000000 --qmax=120000000 --qrange=10000
 
 # 4. On worker machines

@@ -203,6 +203,10 @@ static void usage_init(void)
         "    --qrange=<int>          (required) per-workunit range size\n"
         "    [--side=a|r]            default a\n"
         "    [--siever-args=<flags>] extra args appended to the siever command, e.g. \"-J 16\"\n"
+        "    [--lease-order=asc|desc] default asc; 'desc' hands out highest-q workunits\n"
+        "                            first (useful when another sieve is working upward\n"
+        "                            from a higher q and you want to close the gap from\n"
+        "                            the top)\n"
         "    [--jobdir=<dir>]        default current dir\n");
 }
 
@@ -215,6 +219,7 @@ static int cmd_init(int argc, char **argv)
     const char *qrange_s    = flag(argc, argv, "--qrange");
     const char *side_s      = flag(argc, argv, "--side");
     const char *siever_args = flag(argc, argv, "--siever-args");
+    const char *lease_order = flag(argc, argv, "--lease-order");
     const char *jobdir      = flag(argc, argv, "--jobdir");
 
     if (!job_path || !siever || !qmin_s || !qmax_s || !qrange_s) {
@@ -241,6 +246,15 @@ static int cmd_init(int argc, char **argv)
             return 2;
         }
         side = side_s[0];
+    }
+    const char *lease_order_norm = "asc";
+    if (lease_order && *lease_order) {
+        if (strcmp(lease_order, "asc") == 0 || strcmp(lease_order, "desc") == 0) {
+            lease_order_norm = lease_order;
+        } else {
+            fprintf(stderr, "init: --lease-order must be 'asc' or 'desc'\n");
+            return 2;
+        }
     }
 
     /* Layout. */
@@ -373,6 +387,7 @@ static int cmd_init(int argc, char **argv)
     }
     db_meta_set(db, "job_sha256",  job_sha);
     db_meta_set(db, "siever_args", siever_args ? siever_args : "");
+    db_meta_set(db, "lease_order", lease_order_norm);
 
     db_close(db);
 
@@ -380,8 +395,8 @@ static int cmd_init(int argc, char **argv)
     printf("  jobdir   : %s\n", jobdir);
     printf("  job.db   : %s\n", db_path);
     printf("  job file : %s  (sha=%s, %lld bytes)\n", dst_path, job_sha, (long long)dst_bytes);
-    printf("  workunits: %lld   (q_range=%lld, side=%c, siever=%s)\n",
-           (long long)seq, (long long)qrange, side, siever);
+    printf("  workunits: %lld   (q_range=%lld, side=%c, siever=%s, lease_order=%s)\n",
+           (long long)seq, (long long)qrange, side, siever, lease_order_norm);
     printf("  token    : written to %s (chmod 600)\n", token_path);
     printf("\nNext: ggnfs-sieve-server serve --jobdir=%s\n", jobdir);
 
@@ -396,12 +411,15 @@ static void usage_extend(void)
     fprintf(stderr,
         "usage: ggnfs-sieve-server extend \\\n"
         "    --jobdir=<dir>          (required) existing initialized jobdir\n"
-        "    --qmin=<int>            (required) start of new range — must be >= existing q_end\n"
-        "    --qmax=<int>            (required) end (exclusive)\n"
+        "    --qmin=<int>            (required) start of new range\n"
+        "    --qmax=<int>            (required) end (exclusive); [qmin, qmax) must not\n"
+        "                            overlap any existing workunit\n"
         "    --qrange=<int>          (required) per-workunit range size\n"
-        "\nAdds workunits to an existing job. Token, .job file, siever, and side\n"
-        "are inherited from init. Sequence numbering continues from the last\n"
-        "init/extend so workunit IDs stay unique.\n");
+        "\nAdds workunits to an existing job. The new range can sit above, below, or\n"
+        "in a gap between existing workunits — any non-overlapping placement is OK.\n"
+        "Token, .job file, siever, and side are inherited from init. Sequence\n"
+        "numbering continues from the last init/extend so workunit IDs stay unique\n"
+        "(they no longer track q-order once you extend below or into a gap).\n");
 }
 
 static int cmd_extend(int argc, char **argv)
@@ -456,9 +474,10 @@ static int cmd_extend(int argc, char **argv)
     snprintf(job_id, sizeof(job_id), "%s", m_jobid);
     free(m_jobid);
 
-    /* Find next sequence number and existing high-water q. */
-    int64_t existing_count = 0, q_end = 0;
-    if (db_workunit_extent(db, &existing_count, &q_end) != 0) {
+    /* Find next sequence number. Sequence IDs are just unique handles; they
+     * don't need to track q-order, so extending below or into a gap is fine. */
+    int64_t existing_count = 0;
+    if (db_workunit_extent(db, &existing_count, NULL) != 0) {
         fprintf(stderr, "extend: cannot read existing workunits\n");
         db_close(db); free(db_path); return 1;
     }
@@ -466,11 +485,20 @@ static int cmd_extend(int argc, char **argv)
         fprintf(stderr, "extend: no existing workunits — use 'init' first\n");
         db_close(db); free(db_path); return 1;
     }
-    if (qmin < q_end) {
+
+    /* Reject only on actual overlap with an already-sieved range. */
+    int64_t over_q_start = 0, over_q_range = 0;
+    int ov = db_workunit_overlap(db, qmin, qmax, &over_q_start, &over_q_range);
+    if (ov < 0) {
+        fprintf(stderr, "extend: cannot check for overlap\n");
+        db_close(db); free(db_path); return 1;
+    }
+    if (ov == 1) {
         fprintf(stderr,
-            "extend: qmin=%lld would overlap existing range (q_end=%lld). "
-            "Pick qmin >= %lld.\n",
-            (long long)qmin, (long long)q_end, (long long)q_end);
+            "extend: [%lld, %lld) overlaps existing workunit [%lld, %lld).\n",
+            (long long)qmin, (long long)qmax,
+            (long long)over_q_start,
+            (long long)(over_q_start + over_q_range));
         db_close(db); free(db_path); return 1;
     }
 
@@ -520,6 +548,7 @@ typedef struct {
     int64_t     sweep_seconds;
     int64_t     started_at;
     int64_t     max_attempts;       /* mark workunit poisoned after this many lease expiries */
+    int         lease_desc;         /* 0 = hand out lowest-q_start first, 1 = highest first */
     verify_thread_t *verifier;      /* background parse-pass verifier; may be NULL */
 } server_ctx_t;
 
@@ -605,7 +634,8 @@ static void handle_lease(struct mg_connection *c, struct mg_http_message *hm,
     db_clients_seen(ctx->db, client_id, now_unix());
 
     db_lease_result_t r;
-    int rc = db_lease(ctx->db, client_id, ctx->lease_seconds, now_unix(), &r);
+    int rc = db_lease(ctx->db, client_id, ctx->lease_seconds, now_unix(),
+                      ctx->lease_desc, &r);
     if (rc == 1) {
         /* No work right now. Job is still running. */
         mg_http_reply(c, 204, "", "");
@@ -1182,6 +1212,16 @@ static int cmd_serve(int argc, char **argv)
         free(m_args);
     }
 
+    /* lease_order is optional; absence (or unrecognized value) means ascending,
+     * which preserves the historical behavior for jobs initialized before this
+     * flag existed. */
+    ctx.lease_desc = 0;
+    {
+        char *m_order = db_meta_get(ctx.db, "lease_order");
+        if (m_order && strcmp(m_order, "desc") == 0) ctx.lease_desc = 1;
+        free(m_order);
+    }
+
     ctx.jobdir        = strdup(jobdir);
     ctx.rels_dir      = path_join(jobdir, "rels");
     ctx.lease_seconds = lease_seconds;
@@ -1238,6 +1278,7 @@ static int cmd_serve(int argc, char **argv)
         "  jobdir       : %s\n"
         "  siever       : %s   side=%c   lease=%llds\n"
         "  siever_args  : %s\n"
+        "  lease_order  : %s\n"
         "  sweep        : every %llds   max_attempts=%lld\n"
         "  job .job sha : %s\n"
         "  token        : %.8s... (read from <jobdir>/token)\n"
@@ -1245,6 +1286,7 @@ static int cmd_serve(int argc, char **argv)
         ctx.job_id, listen_url, ctx.jobdir, ctx.siever, ctx.side,
         (long long)ctx.lease_seconds,
         ctx.siever_args[0] ? ctx.siever_args : "(none)",
+        ctx.lease_desc ? "desc (highest q first)" : "asc (lowest q first)",
         (long long)sweep_seconds, (long long)ctx.max_attempts,
         ctx.job_sha256, ctx.token,
         listen_url, ctx.token);

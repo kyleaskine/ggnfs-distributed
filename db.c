@@ -241,6 +241,37 @@ int db_workunit_extent(ggnfs_db_t *db, int64_t *out_count, int64_t *out_q_end)
     return -1;
 }
 
+/* [a,b) and [c,d) overlap iff a < d AND c < b. Here [qmin,qmax) is the new
+ * range and [q_start, q_start+q_range) is the existing workunit row. */
+int db_workunit_overlap(ggnfs_db_t *db, int64_t qmin, int64_t qmax,
+                        int64_t *out_q_start, int64_t *out_q_range)
+{
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db->conn,
+            "SELECT q_start, q_range FROM workunits "
+            "WHERE q_start < ?1 AND (q_start + q_range) > ?2 "
+            "ORDER BY q_start LIMIT 1;",
+            -1, &st, NULL) != SQLITE_OK) {
+        fprintf(stderr, "db_workunit_overlap: %s\n", sqlite3_errmsg(db->conn));
+        return -1;
+    }
+    sqlite3_bind_int64(st, 1, qmax);
+    sqlite3_bind_int64(st, 2, qmin);
+    int rc = sqlite3_step(st);
+    int result = -1;
+    if (rc == SQLITE_ROW) {
+        if (out_q_start) *out_q_start = sqlite3_column_int64(st, 0);
+        if (out_q_range) *out_q_range = sqlite3_column_int64(st, 1);
+        result = 1;
+    } else if (rc == SQLITE_DONE) {
+        result = 0;
+    } else {
+        fprintf(stderr, "db_workunit_overlap: %s\n", sqlite3_errmsg(db->conn));
+    }
+    sqlite3_finalize(st);
+    return result;
+}
+
 int db_lease_expire_sweep(ggnfs_db_t *db,
                           int64_t now_unix, int64_t max_attempts,
                           int64_t *out_requeued, int64_t *out_poisoned)
@@ -286,6 +317,7 @@ int db_lease_expire_sweep(ggnfs_db_t *db,
 
 int db_lease(ggnfs_db_t *db, const char *client_id,
              int64_t lease_seconds, int64_t now_unix,
+             int lease_desc,
              db_lease_result_t *out)
 {
     memset(out, 0, sizeof(*out));
@@ -333,10 +365,13 @@ int db_lease(ggnfs_db_t *db, const char *client_id,
     sqlite3_finalize(st);
     st = NULL;
 
-    /* Atomic claim: pick lowest-q_start available row, flip it to 'leased',
-     * return the columns the caller needs. SQLite RETURNING (3.35+) gives us
-     * the post-update row in a single statement. */
-    if (sqlite3_prepare_v2(db->conn,
+    /* Atomic claim: pick the next available row, flip it to 'leased', return
+     * the columns the caller needs. SQLite RETURNING (3.35+) gives us the
+     * post-update row in a single statement. `lease_desc` selects the q_start
+     * ordering: ascending (default) or descending (useful when neighboring
+     * sieve work is going up from a higher q, so we want to close the gap
+     * downward and avoid stranding a small leftover band). */
+    const char *sql_asc =
             "UPDATE workunits "
             "  SET state = 'leased',"
             "      leased_at = ?1,"
@@ -344,8 +379,20 @@ int db_lease(ggnfs_db_t *db, const char *client_id,
             "      lease_expires = ?3 "
             "  WHERE id = (SELECT id FROM workunits "
             "              WHERE state = 'available' "
-            "              ORDER BY q_start LIMIT 1) "
-            "RETURNING id, q_start, q_range, side;",
+            "              ORDER BY q_start ASC LIMIT 1) "
+            "RETURNING id, q_start, q_range, side;";
+    const char *sql_desc =
+            "UPDATE workunits "
+            "  SET state = 'leased',"
+            "      leased_at = ?1,"
+            "      leased_to = ?2,"
+            "      lease_expires = ?3 "
+            "  WHERE id = (SELECT id FROM workunits "
+            "              WHERE state = 'available' "
+            "              ORDER BY q_start DESC LIMIT 1) "
+            "RETURNING id, q_start, q_range, side;";
+    if (sqlite3_prepare_v2(db->conn,
+            lease_desc ? sql_desc : sql_asc,
             -1, &st, NULL) != SQLITE_OK) {
         fprintf(stderr, "db_lease: %s\n", sqlite3_errmsg(db->conn));
         return -1;
