@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
-# bootstrap-client.sh — one-shot setup for a ggnfs-distributed worker.
+# ggnfs-client.sh -- one-shot setup for a ggnfs-distributed worker.
 #
-# Clones the repo, builds the client, downloads a gnfs-lasieve4I16e binary
+# Clones the repo, builds the client, installs a gnfs-lasieve4I16e binary
 # matched to this CPU (AVX-512 build vs. generic), prompts for connection
 # settings, and writes a run-client.sh that you can launch.
 #
 # Usage (host this on your webserver, then on each worker box):
-#   curl -fsSL https://ecm.kyleaskine.com/bootstrap-client.sh | bash
+#   curl -fsSL https://ecm.kyleaskine.com/ggnfs-client.sh | bash
 #   # or
-#   wget -qO- https://ecm.kyleaskine.com/bootstrap-client.sh | bash
+#   wget -qO- https://ecm.kyleaskine.com/ggnfs-client.sh | bash
 #
 # Or download and run directly:
-#   wget https://ecm.kyleaskine.com/bootstrap-client.sh && bash bootstrap-client.sh
+#   wget https://ecm.kyleaskine.com/ggnfs-client.sh && bash ggnfs-client.sh
 
 set -euo pipefail
 
@@ -53,7 +53,7 @@ need_header zstd.h libzstd-dev
 
 if [ -n "$missing_pkgs" ]; then
     # Dedup while preserving order.
-    pkgs=$(printf '%s\n' $missing_pkgs | awk '!seen[$0]++' | tr '\n' ' ')
+    pkgs=$(printf '%s\n' "$missing_pkgs" | tr ' ' '\n' | awk 'NF && !seen[$0]++' | tr '\n' ' ')
     echo "error: missing prerequisites" >&2
     echo "       Debian/Ubuntu: sudo apt-get install -y $pkgs" >&2
     exit 1
@@ -84,7 +84,7 @@ fi
 #     compiled -march=native. gcc emits Ice-Lake-only ops (e.g. VBMI
 #     vpermi2b/vpermt2b) so it SIGILLs on older AVX-512 parts.
 #   * AVX-512 without IFMA (Skylake-SP/Platinum 61xx/81xx, Cascade/Cooper Lake):
-#     the no-IFMA build — the sieve compiled -march=skylake-avx512 (runs 16-wide),
+#     the no-IFMA build -- the sieve compiled -march=skylake-avx512 (runs 16-wide),
 #     with no Ice-Lake-only instructions. Runs the sieve in AVX-512 without SIGILL.
 #   * No AVX-512 (Zen2/3, Broadwell, older laptops): generic scalar+asm build.
 # IFMA is the Ice-Lake-or-newer gate: every CPU with avx512ifma also has the
@@ -92,18 +92,25 @@ fi
 # lacks them, so it gets the Skylake build.
 if grep -qw avx512f /proc/cpuinfo && grep -qw avx512ifma /proc/cpuinfo; then
     SIEVER_URL="$SIEVER_AVX_URL"
-    echo "==> AVX-512 + IFMA detected; will fetch full AVX-512 siever"
+    SIEVER_DIST_PATH="dist/ggnfs/$SIEVER_NAME"
+    echo "==> AVX-512 + IFMA detected; will use full AVX-512 siever"
 elif grep -qw avx512f /proc/cpuinfo; then
     SIEVER_URL="$SIEVER_NOIFMA_URL"
+    SIEVER_DIST_PATH="dist/ggnfs-noifma/$SIEVER_NAME"
     echo "==> AVX-512 without IFMA (Skylake-SP / Cascade Lake / Cooper Lake);"
-    echo "    will fetch the AVX-512-sieve (no-IFMA) siever"
+    echo "    will use the AVX-512-sieve (no-IFMA) siever"
 else
     SIEVER_URL="$SIEVER_NOAVX_URL"
-    echo "==> No AVX-512; will fetch generic siever"
+    SIEVER_DIST_PATH="dist/ggnfs-noavx/$SIEVER_NAME"
+    echo "==> No AVX-512; will use generic siever"
 fi
 
 if [ -x "./$SIEVER_NAME" ]; then
-    echo "==> $SIEVER_NAME already present, skipping download"
+    echo "==> $SIEVER_NAME already present, skipping install"
+elif [ -f "$SIEVER_DIST_PATH" ]; then
+    echo "==> Installing $SIEVER_DIST_PATH"
+    cp "$SIEVER_DIST_PATH" "$SIEVER_NAME"
+    chmod +x "$SIEVER_NAME"
 else
     echo "==> Downloading $SIEVER_URL"
     wget -q --show-progress -O "$SIEVER_NAME" "$SIEVER_URL"
@@ -118,7 +125,7 @@ prompt_tty WORKERS   "workers"          "$(nproc 2>/dev/null || echo 4)"
 prompt_tty SERVER    "server URL"       "$DEFAULT_SERVER"
 prompt_tty TOKEN     "auth token"       "$DEFAULT_TOKEN"
 
-# 5. Write run-client.sh — exec replaces this shell so Ctrl-C lands on the
+# 5. Write run-client.sh -- exec replaces this shell so Ctrl-C lands on the
 # client and its drain/release paths run.
 ABS_DIR=$(pwd)
 RUN_SCRIPT="$ABS_DIR/run-client.sh"
