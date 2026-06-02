@@ -16,3 +16,5 @@ rels/
 /.codex
 /.agents
 *.job
+C191-ggnfs-client.sh
+ggnfs-client.sh

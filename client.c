@@ -167,6 +167,7 @@ static int parse_int64_arg(const char *s, int64_t *out)
     char *end = NULL;
     errno = 0;
     long long v = strtoll(s, &end, 10);
+    while (end && isspace((unsigned char)*end)) end++;
     if (errno != 0 || end == s || *end != '\0') return -1;
     *out = (int64_t)v;
     return 0;
