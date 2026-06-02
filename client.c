@@ -72,6 +72,7 @@ static volatile sig_atomic_t g_shutdown = SHUTDOWN_RUNNING;
 
 typedef struct {
     int  has_lease;
+    int  release_in_progress;
     char workunit_id[64];
     char client_id[64];
 } active_lease_t;
@@ -670,6 +671,7 @@ static void active_lease_set(int idx, const char *workunit_id, const char *clien
 {
     if (idx < 0 || idx >= g_active_count || !g_active) return;
     pthread_mutex_lock(&g_active_mu);
+    memset(&g_active[idx], 0, sizeof(g_active[idx]));
     g_active[idx].has_lease = 1;
     snprintf(g_active[idx].workunit_id, sizeof(g_active[idx].workunit_id),
              "%s", workunit_id ? workunit_id : "");
@@ -683,6 +685,38 @@ static void active_lease_clear(int idx)
     if (idx < 0 || idx >= g_active_count || !g_active) return;
     pthread_mutex_lock(&g_active_mu);
     memset(&g_active[idx], 0, sizeof(g_active[idx]));
+    pthread_mutex_unlock(&g_active_mu);
+}
+
+static int active_lease_claim_release(int idx, active_lease_t *out)
+{
+    int claimed = 0;
+    if (idx < 0 || idx >= g_active_count || !g_active || !out) return 0;
+
+    pthread_mutex_lock(&g_active_mu);
+    if (g_active[idx].has_lease && !g_active[idx].release_in_progress) {
+        *out = g_active[idx];
+        g_active[idx].release_in_progress = 1;
+        claimed = 1;
+    }
+    pthread_mutex_unlock(&g_active_mu);
+    return claimed;
+}
+
+static void active_lease_finish_release(int idx, const active_lease_t *lease,
+                                        int release_rc)
+{
+    if (idx < 0 || idx >= g_active_count || !g_active || !lease) return;
+
+    pthread_mutex_lock(&g_active_mu);
+    if (g_active[idx].has_lease &&
+        strcmp(g_active[idx].workunit_id, lease->workunit_id) == 0 &&
+        strcmp(g_active[idx].client_id, lease->client_id) == 0) {
+        if (release_rc == 0)
+            memset(&g_active[idx], 0, sizeof(g_active[idx]));
+        else
+            g_active[idx].release_in_progress = 0;
+    }
     pthread_mutex_unlock(&g_active_mu);
 }
 
@@ -978,25 +1012,33 @@ static int do_release(struct mg_mgr *mgr, const client_cfg_t *cfg,
     return -1;
 }
 
+static int release_active_lease(struct mg_mgr *mgr, const client_cfg_t *base_cfg,
+                                int worker_idx)
+{
+    active_lease_t lease;
+    if (!active_lease_claim_release(worker_idx, &lease))
+        return 0;
+
+    client_cfg_t cfg = *base_cfg;
+    snprintf(cfg.client_id, sizeof(cfg.client_id), "%s", lease.client_id);
+    int rc = do_release(mgr, &cfg, lease.workunit_id);
+    active_lease_finish_release(worker_idx, &lease, rc);
+    return rc;
+}
+
 static void release_active_leases(const client_cfg_t *base_cfg)
 {
-    active_lease_t snapshot[CLIENT_MAX_WORKERS];
     int n = 0;
 
     pthread_mutex_lock(&g_active_mu);
     n = g_active_count;
     if (n > CLIENT_MAX_WORKERS) n = CLIENT_MAX_WORKERS;
-    for (int i = 0; i < n; i++) snapshot[i] = g_active[i];
     pthread_mutex_unlock(&g_active_mu);
 
     struct mg_mgr mgr;
     mg_mgr_init(&mgr);
     for (int i = 0; i < n; i++) {
-        if (!snapshot[i].has_lease || snapshot[i].workunit_id[0] == '\0')
-            continue;
-        client_cfg_t cfg = *base_cfg;
-        snprintf(cfg.client_id, sizeof(cfg.client_id), "%s", snapshot[i].client_id);
-        do_release(&mgr, &cfg, snapshot[i].workunit_id);
+        release_active_lease(&mgr, base_cfg, i);
     }
     mg_mgr_free(&mgr);
 }
@@ -1031,9 +1073,8 @@ static int run_one_iteration(struct mg_mgr *mgr, const client_cfg_t *cfg, int wo
     /* Fetch input file (the .job) into the local cache. */
     char job_local[256];
     if (ensure_file_cached(mgr, cfg, &lease, job_local, sizeof(job_local)) != 0) {
-        if (shutdown_phase() >= SHUTDOWN_DRAINING &&
-            do_release(mgr, cfg, lease.workunit_id) == 0)
-            active_lease_clear(worker_idx);
+        if (shutdown_phase() >= SHUTDOWN_DRAINING)
+            release_active_lease(mgr, cfg, worker_idx);
         return -2;
     }
 
@@ -1044,9 +1085,8 @@ static int run_one_iteration(struct mg_mgr *mgr, const client_cfg_t *cfg, int wo
     snprintf(output_name, sizeof(output_name), "%s.dat", lease.workunit_id);
     char *outfile = path_join(cfg->workdir, output_name);
     if (!outfile) {
-        if (shutdown_phase() >= SHUTDOWN_DRAINING &&
-            do_release(mgr, cfg, lease.workunit_id) == 0)
-            active_lease_clear(worker_idx);
+        if (shutdown_phase() >= SHUTDOWN_DRAINING)
+            release_active_lease(mgr, cfg, worker_idx);
         return -2;
     }
 
@@ -1074,26 +1114,23 @@ static int run_one_iteration(struct mg_mgr *mgr, const client_cfg_t *cfg, int wo
 
     if (sieve_rc != 0) {
         fprintf(stderr, "client: siever returned %d (skipping submit)\n", sieve_rc);
-        if (shutdown_phase() >= SHUTDOWN_DRAINING &&
-            do_release(mgr, cfg, lease.workunit_id) == 0)
-            active_lease_clear(worker_idx);
+        if (shutdown_phase() >= SHUTDOWN_DRAINING)
+            release_active_lease(mgr, cfg, worker_idx);
         free(outfile);
         return -2;
     }
     off_t outfile_size = 0;
     if (regular_file_size(outfile, &outfile_size) != 0) {
         fprintf(stderr, "client: siever did not produce %s (skipping submit)\n", outfile);
-        if (shutdown_phase() >= SHUTDOWN_DRAINING &&
-            do_release(mgr, cfg, lease.workunit_id) == 0)
-            active_lease_clear(worker_idx);
+        if (shutdown_phase() >= SHUTDOWN_DRAINING)
+            release_active_lease(mgr, cfg, worker_idx);
         free(outfile);
         return -2;
     }
     if (outfile_size == 0) {
         fprintf(stderr, "client: siever produced empty %s (skipping submit)\n", outfile);
-        if (shutdown_phase() >= SHUTDOWN_DRAINING &&
-            do_release(mgr, cfg, lease.workunit_id) == 0)
-            active_lease_clear(worker_idx);
+        if (shutdown_phase() >= SHUTDOWN_DRAINING)
+            release_active_lease(mgr, cfg, worker_idx);
         unlink(outfile);
         free(outfile);
         return -2;
