@@ -155,6 +155,28 @@ int verify_spotcheck(const verify_poly_gmp_t *p,
                      const verify_relation_t *rels, int n,
                      char *out_first_reason, size_t reason_buflen);
 
+/* Streaming verifier with full per-relation norm check. Mirrors
+ * verify_parse_file_check, but additionally runs the same GMP norm math as
+ * verify_spotcheck on every accepted relation rather than a K-sized sample.
+ *
+ *   check    optional q-range check (NULL or side=0 disables).
+ *   poly     optional polynomial; if NULL, no norm check is performed.
+ *   out_norm_failures   number of accepted relations whose rational or
+ *                       algebraic norm failed residue-prime + small-prime
+ *                       trial division. May be NULL.
+ *
+ * `out_first_reason` reports the FIRST failure of any kind (parse, q-range,
+ * or norm) in file order. */
+int verify_parse_file_full(const char *path,
+                           const verify_check_t *check,
+                           const verify_poly_gmp_t *poly,
+                           int64_t *out_parsed,
+                           int64_t *out_failed,
+                           int64_t *out_q_violations,
+                           int64_t *out_norm_failures,
+                           char    *out_first_reason,
+                           size_t   reason_buflen);
+
 /* ---- verifier thread ------------------------------------------------- */
 
 /* Opaque handle. The thread owns its own ggnfs_db_t (a second connection

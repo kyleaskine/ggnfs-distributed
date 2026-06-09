@@ -40,27 +40,37 @@ SERVER_VENDOR_OBJS := vendor/mongoose.o vendor/cJSON.o vendor/sqlite3.o
 CLIENT_OBJS := client.o protocol.o sieve_executor.o
 CLIENT_VENDOR_OBJS := vendor/mongoose.o vendor/cJSON.o
 
-ALL_OWN_OBJS    := server.o db.o protocol.o verify.o client.o sieve_executor.o
+# Offline verifier: reuses verify + db (+ sqlite for the per-workunit q-range
+# lookup); no mongoose, no cJSON.
+VERIFY_OBJS := verify_cli.o verify.o db.o
+VERIFY_VENDOR_OBJS := vendor/sqlite3.o
+
+ALL_OWN_OBJS    := server.o db.o protocol.o verify.o client.o sieve_executor.o verify_cli.o
 ALL_VENDOR_OBJS := vendor/mongoose.o vendor/cJSON.o vendor/sqlite3.o
 
 SERVER_BIN := ggnfs-sieve-server
 CLIENT_BIN := ggnfs-sieve-client
+VERIFY_BIN := ggnfs-verify
 
-.PHONY: all server client clean update-mongoose update-cjson update-sqlite
+.PHONY: all server client verify clean update-mongoose update-cjson update-sqlite
 
 # dashboard.html is embedded into the server binary so deploys stay
 # single-file. Regenerated via xxd whenever the .html changes.
 DASHBOARD_HEADER := dashboard_html.h
 
-all: $(SERVER_BIN) $(CLIENT_BIN)
+all: $(SERVER_BIN) $(CLIENT_BIN) $(VERIFY_BIN)
 
 server: $(SERVER_BIN)
 client: $(CLIENT_BIN)
+verify: $(VERIFY_BIN)
 
 $(SERVER_BIN): $(SERVER_OBJS) $(SERVER_VENDOR_OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
 
 $(CLIENT_BIN): $(CLIENT_OBJS) $(CLIENT_VENDOR_OBJS)
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
+
+$(VERIFY_BIN): $(VERIFY_OBJS) $(VERIFY_VENDOR_OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
 
 %.o: %.c
@@ -76,7 +86,7 @@ vendor/%.o: vendor/%.c
 	$(CC) $(VENDOR_CFLAGS) $(INC) -c -o $@ $<
 
 clean:
-	rm -f $(ALL_OWN_OBJS) $(ALL_VENDOR_OBJS) $(SERVER_BIN) $(CLIENT_BIN) $(DASHBOARD_HEADER)
+	rm -f $(ALL_OWN_OBJS) $(ALL_VENDOR_OBJS) $(SERVER_BIN) $(CLIENT_BIN) $(VERIFY_BIN) $(DASHBOARD_HEADER)
 
 # ---------- vendor refresh helpers (manually invoked) ----------
 

@@ -413,6 +413,122 @@ int verify_parse_file(const char *path, int64_t *out_parsed, int64_t *out_failed
                                    out_parsed, out_failed, NULL, NULL, 0);
 }
 
+/* Forward decls — defined further down with the GMP norm code. */
+static void compute_rational_norm(mpz_t out, int64_t a, uint64_t b,
+                                  const verify_poly_gmp_t *p);
+static void compute_algebraic_norm(mpz_t out, int64_t a, uint64_t b,
+                                   const verify_poly_gmp_t *p);
+static int  residue_ok(mpz_t norm, const uint64_t *primes, int n);
+
+int verify_parse_file_full(const char *path,
+                           const verify_check_t *check,
+                           const verify_poly_gmp_t *poly,
+                           int64_t *out_parsed,
+                           int64_t *out_failed,
+                           int64_t *out_q_violations,
+                           int64_t *out_norm_failures,
+                           char    *out_first_reason,
+                           size_t   reason_buflen)
+{
+    rel_reader_t reader;
+    if (rel_reader_open(&reader, path) != 0) {
+        fprintf(stderr, "verify_parse_file_full: open %s: %s\n",
+                path, strerror(errno));
+        return -1;
+    }
+    if (out_first_reason && reason_buflen > 0) out_first_reason[0] = '\0';
+
+    char   *line      = NULL;
+    size_t  cap       = 0;
+    int64_t parsed    = 0, failed = 0, qviol = 0, normfails = 0;
+    int64_t lineno    = 0;
+    int     check_q   = (check && (check->side == 'a' || check->side == 'r'));
+    int     do_norm   = (poly != NULL);
+    ssize_t n;
+
+    /* One scratch mpz reused across all relations — verify_spotcheck has its
+     * own; we keep ours local so init/clear cost is paid once per file, not
+     * once per relation. */
+    mpz_t norm;
+    if (do_norm) mpz_init(norm);
+
+    while ((n = rel_reader_getline(&reader, &line, &cap)) > 0) {
+        lineno++;
+        size_t len = rstrip_eol(line, (size_t)n);
+        if (len == 0) continue;
+
+        verify_relation_t rel;
+        if (verify_parse_line(line, len, &rel) != 0) {
+            failed++;
+            if (out_first_reason && reason_buflen > 0 && out_first_reason[0] == '\0') {
+                snprintf(out_first_reason, reason_buflen,
+                         "parse error on line %lld", (long long)lineno);
+            }
+            continue;
+        }
+        if (check_q && !relation_has_q_in_range(&rel, check->side,
+                                                check->q_start, check->q_range)) {
+            qviol++;
+            if (out_first_reason && reason_buflen > 0 && out_first_reason[0] == '\0') {
+                snprintf(out_first_reason, reason_buflen,
+                         "line %lld: no prime on side '%c' in [%lld,%lld)",
+                         (long long)lineno, check->side,
+                         (long long)check->q_start,
+                         (long long)(check->q_start + check->q_range));
+            }
+            continue;
+        }
+        parsed++;
+
+        if (do_norm) {
+            int relfail = 0;
+            compute_rational_norm(norm, rel.a, rel.b, poly);
+            if (!residue_ok(norm, rel.rprimes, rel.n_rprimes)) {
+                relfail = 1;
+                if (out_first_reason && reason_buflen > 0 && out_first_reason[0] == '\0') {
+                    char *rs = mpz_get_str(NULL, 10, norm);
+                    snprintf(out_first_reason, reason_buflen,
+                             "line %lld (%lld,%llu): rational residue %s is composite",
+                             (long long)lineno, (long long)rel.a,
+                             (unsigned long long)rel.b, rs ? rs : "?");
+                    free(rs);
+                }
+            } else {
+                compute_algebraic_norm(norm, rel.a, rel.b, poly);
+                if (!residue_ok(norm, rel.aprimes, rel.n_aprimes)) {
+                    relfail = 1;
+                    if (out_first_reason && reason_buflen > 0 && out_first_reason[0] == '\0') {
+                        char *rs = mpz_get_str(NULL, 10, norm);
+                        snprintf(out_first_reason, reason_buflen,
+                                 "line %lld (%lld,%llu): algebraic residue %s is composite",
+                                 (long long)lineno, (long long)rel.a,
+                                 (unsigned long long)rel.b, rs ? rs : "?");
+                        free(rs);
+                    }
+                }
+            }
+            if (relfail) normfails++;
+        }
+    }
+
+    if (do_norm) mpz_clear(norm);
+
+    int read_error = rel_reader_error(&reader);
+    free(line);
+    rel_reader_close(&reader);
+    if (read_error) {
+        fprintf(stderr, "verify_parse_file_full: read %s: %s\n",
+                path, strerror(errno));
+        return -1;
+    }
+
+    if (out_parsed)        *out_parsed         = parsed;
+    if (out_failed)        *out_failed         = failed;
+    if (out_q_violations)  *out_q_violations   = qviol;
+    if (out_norm_failures) *out_norm_failures  = normfails;
+    return 0;
+}
+
 /* ===================== polynomial / .job parser ======================== */
 
 void verify_poly_init(verify_poly_t *p)

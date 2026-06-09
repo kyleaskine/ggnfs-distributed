@@ -2,6 +2,7 @@
 *.o
 ggnfs-sieve-server
 ggnfs-sieve-client
+ggnfs-verify
 dashboard_html.h
 
 # Operator state from running `init` / `serve` / a client out of this directory.
@@ -18,3 +19,5 @@ rels/
 *.job
 C191-ggnfs-client.sh
 ggnfs-client.sh
+archive/
+.locks/

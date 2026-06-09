@@ -77,6 +77,12 @@ int db_lease(ggnfs_db_t *db, const char *client_id,
              int lease_desc,
              db_lease_result_t *out);
 
+/* Look up a workunit by id. On found (return 0), fills *out with id /
+ * q_start / q_range / side. Returns 1 if no such workunit, -1 on error.
+ * Used by ggnfs-verify to map a relation file (named after its workunit id)
+ * back to its sieved q-range. Read-only — no state transition. */
+int db_workunit_get(ggnfs_db_t *db, const char *id, db_lease_result_t *out);
+
 /* Record a relation file submission and mark the workunit submitted.
  * New submissions land with verify_status='pending' for the verifier to pick
  * up. Returns 0 on success, 1 if the workunit is not currently leased

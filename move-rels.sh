@@ -4,6 +4,11 @@
 # Usage:
 #   ./move-rels.sh --jobdir=AS276 --dest=AS276-relsBackup
 #   ./move-rels.sh --jobdir=/tmp/myjob --dest=/tmp/myjob-relsBackup --dry-run
+#   ./move-rels.sh --jobdir=AS276 --dest=AS276-relsBackup --verified-only
+#
+# --verified-only consults <jobdir>/job.db and only moves files for
+# workunits currently in state 'verified', so we never race the verifier
+# on files for submissions that are still 'pending' or 'failed'.
 
 set -euo pipefail
 
@@ -11,18 +16,20 @@ jobdir=""
 dest=""
 dry_run=0
 overwrite=0
+verified_only=0
 
 usage() {
-    sed -n '2,7p' "$0"
+    sed -n '2,12p' "$0"
 }
 
 for arg in "$@"; do
     case "$arg" in
-        --jobdir=*)    jobdir="${arg#*=}" ;;
-        --dest=*)      dest="${arg#*=}" ;;
-        --dry-run)     dry_run=1 ;;
-        --overwrite)   overwrite=1 ;;
-        -h|--help)     usage; exit 0 ;;
+        --jobdir=*)        jobdir="${arg#*=}" ;;
+        --dest=*)          dest="${arg#*=}" ;;
+        --dry-run)         dry_run=1 ;;
+        --overwrite)       overwrite=1 ;;
+        --verified-only)   verified_only=1 ;;
+        -h|--help)         usage; exit 0 ;;
         *)
             echo "unknown arg: $arg" >&2
             usage >&2
@@ -56,6 +63,39 @@ fi
 
 shopt -s dotglob nullglob
 items=( "$src"/* )
+
+if [ "$verified_only" -eq 1 ]; then
+    db="$jobdir/job.db"
+    [ -f "$db" ] || { echo "--verified-only: $db does not exist" >&2; exit 1; }
+    command -v sqlite3 >/dev/null 2>&1 \
+        || { echo "--verified-only: sqlite3 not on PATH" >&2; exit 1; }
+
+    # Read verified workunit ids into an associative set. -readonly keeps us
+    # safe even if a writer is active; the dot-command is the cheapest way
+    # to dump a single column.
+    declare -A verified
+    while IFS= read -r id; do
+        [ -n "$id" ] && verified["$id"]=1
+    done < <(sqlite3 -readonly -batch "$db" \
+        "SELECT id FROM workunits WHERE state = 'verified';")
+
+    if [ "${#verified[@]}" -eq 0 ]; then
+        echo "no verified workunits found in $db"
+        exit 0
+    fi
+
+    filtered=()
+    for item in "${items[@]}"; do
+        base="${item##*/}"
+        # Strip .dat.zst / .dat to recover the workunit id.
+        wid="${base%.zst}"
+        wid="${wid%.dat}"
+        if [ -n "${verified[$wid]:-}" ]; then
+            filtered+=( "$item" )
+        fi
+    done
+    items=( "${filtered[@]}" )
+fi
 
 if [ "${#items[@]}" -eq 0 ]; then
     echo "no files to move under $src"

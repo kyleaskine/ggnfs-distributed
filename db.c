@@ -241,6 +241,37 @@ int db_workunit_extent(ggnfs_db_t *db, int64_t *out_count, int64_t *out_q_end)
     return -1;
 }
 
+int db_workunit_get(ggnfs_db_t *db, const char *id, db_lease_result_t *out)
+{
+    if (!id || !out) return -1;
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db->conn,
+            "SELECT id, q_start, q_range, side FROM workunits WHERE id = ?1;",
+            -1, &st, NULL) != SQLITE_OK) {
+        fprintf(stderr, "db_workunit_get: %s\n", sqlite3_errmsg(db->conn));
+        return -1;
+    }
+    sqlite3_bind_text(st, 1, id, -1, SQLITE_STATIC);
+    int rc = sqlite3_step(st);
+    int result;
+    if (rc == SQLITE_ROW) {
+        const unsigned char *rid  = sqlite3_column_text(st, 0);
+        const unsigned char *side = sqlite3_column_text(st, 3);
+        snprintf(out->id, sizeof(out->id), "%s", rid ? (const char *)rid : "");
+        out->q_start = sqlite3_column_int64(st, 1);
+        out->q_range = sqlite3_column_int64(st, 2);
+        out->side    = side ? (char)side[0] : '?';
+        result = 0;
+    } else if (rc == SQLITE_DONE) {
+        result = 1;
+    } else {
+        fprintf(stderr, "db_workunit_get: %s\n", sqlite3_errmsg(db->conn));
+        result = -1;
+    }
+    sqlite3_finalize(st);
+    return result;
+}
+
 /* [a,b) and [c,d) overlap iff a < d AND c < b. Here [qmin,qmax) is the new
  * range and [q_start, q_start+q_range) is the existing workunit row. */
 int db_workunit_overlap(ggnfs_db_t *db, int64_t qmin, int64_t qmax,
