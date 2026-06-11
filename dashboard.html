@@ -53,7 +53,7 @@
     <div class="stat"><div class="num" id="wu-active">&mdash;</div><div class="lbl">in flight</div></div>
     <div class="stat"><div class="num" id="rels-total">&mdash;</div><div class="lbl">relations submitted</div></div>
     <div class="stat"><div class="num" id="rate-1h">&mdash;</div><div class="lbl">workunits / hr (last 1h)</div></div>
-    <div class="stat"><div class="num" id="avg-sec">&mdash;</div><div class="lbl">avg sec / workunit</div></div>
+    <div class="stat"><div class="num" id="eta">&mdash;</div><div class="lbl">ETA (last 1h rate)</div></div>
     <div class="stat"><div class="num" id="uptime">&mdash;</div><div class="lbl">server uptime</div></div>
   </div>
 
@@ -68,6 +68,7 @@
       <th>last seen</th>
       <th class="num">workunits</th>
       <th class="num">relations</th>
+      <th class="num">rel/wu</th>
       <th class="num">avg sec</th>
       <th class="num">fail</th>
       <th>current</th>
@@ -95,6 +96,41 @@
     if (s < 3600)  return (s/60).toFixed(1) + 'm';
     if (s < 86400) return (s/3600).toFixed(1) + 'h';
     return (s/86400).toFixed(1) + 'd';
+  }
+  function fmtEta(seconds) {
+    if (!isFinite(seconds) || seconds < 0) return 'unknown';
+    if (seconds === 0) return 'complete';
+
+    var minutes = Math.max(1, Math.ceil(seconds / 60));
+    var hour = 60;
+    var day = 24 * hour;
+    var month = 30 * day;
+    var year = 365 * day;
+
+    if (minutes < hour) return minutes + 'm';
+    if (minutes < day) {
+      var hours = Math.floor(minutes / hour);
+      var mins = minutes % hour;
+      return hours + 'h' + (mins ? ' ' + mins + 'm' : '');
+    }
+    if (minutes < month) {
+      var days = Math.floor(minutes / day);
+      var remainingHours = Math.floor((minutes % day) / hour);
+      return days + 'd' + (remainingHours ? ' ' + remainingHours + 'h' : '');
+    }
+    if (minutes < year) {
+      var months = Math.floor(minutes / month);
+      var remainingDays = Math.floor((minutes % month) / day);
+      return months + 'mo' + (remainingDays ? ' ' + remainingDays + 'd' : '');
+    }
+
+    var years = Math.floor(minutes / year);
+    var afterYears = minutes % year;
+    var remainingMonths = Math.floor(afterYears / month);
+    var remainingDays = Math.floor((afterYears % month) / day);
+    return years + 'y' +
+      (remainingMonths ? ' ' + remainingMonths + 'mo' : '') +
+      (remainingDays ? ' ' + remainingDays + 'd' : '');
   }
   function ageText(unix) {
     if (!unix) return 'never';
@@ -127,6 +163,14 @@
 
   function weightedAvg(totalSeconds, count) {
     return count > 0 ? totalSeconds / count : 0;
+  }
+
+  function relationsPerWorkunit(relations, workunits) {
+    if (!workunits) return '&mdash;';
+    return (relations / workunits).toLocaleString(undefined, {
+      minimumFractionDigits: 1,
+      maximumFractionDigits: 1
+    });
   }
 
   function groupClients(clients) {
@@ -193,8 +237,22 @@
     document.getElementById('wu-active').textContent  = fmt(w.leased);
     document.getElementById('rels-total').textContent = fmt(s.submissions.total_relations);
     document.getElementById('rate-1h').textContent    = fmt(s.submissions.last_1h);
-    document.getElementById('avg-sec').textContent    = (s.submissions.avg_sieve_seconds || 0).toFixed(1);
     document.getElementById('uptime').textContent     = fmtSec(s.uptime_seconds);
+
+    var remaining = (w.leased || 0) + (w.available || 0);
+    var hourlyRate = s.submissions.last_1h || 0;
+    var eta = document.getElementById('eta');
+    eta.removeAttribute('title');
+    if (remaining === 0) {
+      eta.textContent = 'complete';
+    } else if (hourlyRate <= 0) {
+      eta.textContent = 'unknown';
+    } else {
+      var etaSeconds = remaining * 3600 / hourlyRate;
+      eta.textContent = fmtEta(etaSeconds);
+      eta.title = 'Estimated finish: ' +
+        new Date(Date.now() + etaSeconds * 1000).toLocaleString();
+    }
 
     var bar  = document.getElementById('bar');
     bar.innerHTML = '';
@@ -241,7 +299,7 @@
     var clients = s.clients || [];
     if (clients.length === 0) {
       var tr = document.createElement('tr');
-      tr.innerHTML = '<td colspan="8" class="warn">no clients have connected yet</td>';
+      tr.innerHTML = '<td colspan="9" class="warn">no clients have connected yet</td>';
       tbody.appendChild(tr);
     } else {
       var groups = groupClients(clients);
@@ -259,6 +317,7 @@
           '<td>' + ageText(c.last_seen) + '</td>' +
           '<td class="num">' + fmt(c.submissions) + '</td>' +
           '<td class="num">' + fmt(c.relations) + '</td>' +
+          '<td class="num">' + relationsPerWorkunit(c.relations, c.submissions) + '</td>' +
           '<td class="num">' + (c.avg_sieve_seconds || 0).toFixed(1) + '</td>' +
           '<td class="num">' + (c.total_failures ? c.total_failures : '') + '</td>' +
           '<td>' + escapeHtml(current) + '</td>';
@@ -274,6 +333,7 @@
               '<td>' + ageText(wkr.last_seen) + '</td>' +
               '<td class="num">' + fmt(wkr.submissions) + '</td>' +
               '<td class="num">' + fmt(wkr.relations) + '</td>' +
+              '<td class="num">' + relationsPerWorkunit(wkr.relations, wkr.submissions) + '</td>' +
               '<td class="num">' + (wkr.avg_sieve_seconds || 0).toFixed(1) + '</td>' +
               '<td class="num">' + (wkr.total_failures ? wkr.total_failures : '') + '</td>' +
               '<td>' + escapeHtml(wkr.current_workunit || '') + '</td>';
