@@ -19,5 +19,6 @@ rels/
 *.job
 C191-ggnfs-client.sh
 ggnfs-client.sh
+run-client.sh
 archive/
 .locks/

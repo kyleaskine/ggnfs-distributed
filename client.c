@@ -60,7 +60,7 @@
 #define CLIENT_MAX_WORKERS 256
 #define SUBMIT_ZSTD_LEVEL 1
 
-#define CLIENT_VERSION "0.1.0"
+#define CLIENT_VERSION "0.2.0"
 
 enum {
     SHUTDOWN_RUNNING = 0,
@@ -795,6 +795,170 @@ static int ensure_file_cached(struct mg_mgr *mgr, const client_cfg_t *cfg,
     return 0;
 }
 
+/* A structurally complete .afb cache is 8 + 8*FBsize bytes (u32 entry
+ * count, FBsize primes, FBsize roots, trailing u32), optionally followed
+ * by the siever's 16-byte provenance trailer (magic, bound, poly
+ * fingerprint, checksum). This catches files truncated by a crashed
+ * generation; content-level validation is done by the siever itself
+ * when it loads the file. */
+static int afb_size_ok(const char *path)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+    uint32_t fbsize = 0;
+    if (fread(&fbsize, sizeof(fbsize), 1, f) != 1) { fclose(f); return 0; }
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return 0; }
+    int64_t sz = ftell(f);
+    fclose(f);
+    int64_t base = 8 + 8 * (int64_t)fbsize;
+    return sz == base || sz == base + 20;
+}
+
+/* The cache is only safe with sievers that trim and audit it on load:
+ * older sievers blindly use the file as-is, which for workunits with
+ * q < alim means sieving with factor-base primes >= q. Operators update
+ * the client (git pull && make) and the siever binary independently, so
+ * sniff the binary for the audit code's message text and treat its
+ * absence as "old siever". */
+static int siever_supports_afb_audit(const char *siever_path)
+{
+    static const char marker[] = "Trimmed cached aFB";
+    size_t len = 0;
+    unsigned char *buf = read_file(siever_path, &len);
+    int found = buf && len >= sizeof(marker) - 1 &&
+                memmem(buf, len, marker, sizeof(marker) - 1) != NULL;
+    free(buf);
+    return found;
+}
+
+/* Pre-generate the algebraic factor-base cache (<job>.afb.0) beside the
+ * hash-named job file. The siever auto-loads the cache and skips its
+ * 30-45s factor-base rebuild on every workunit; -c 0 makes it build and
+ * write the full factor base without sieving anything (and without the
+ * FB_bound lowering that applies when q < alim). Generation runs against
+ * a temp copy of the job and the result is renamed into place, so workers
+ * (serialized on g_afb_mu) never see a partial file. Because the job file
+ * is named by its content hash, a new job can never pick up a stale cache.
+ * Failure is non-fatal: without the cache the siever rebuilds the factor
+ * base per workunit, exactly as before. */
+static pthread_mutex_t g_afb_mu = PTHREAD_MUTEX_INITIALIZER;
+static int g_afb_gen_failed = 0;
+static int g_afb_siever_ok = -1;   /* -1 unknown, 0 old siever, 1 supported */
+static char g_afb_validated_path[300]; /* cache that passed the content probe */
+
+static void ensure_afb_cached(const client_cfg_t *cfg,
+                              const proto_lease_response_t *lease,
+                              const char *job_local)
+{
+    char afb[300], genjob[300], genafb[300], genout[300];
+
+    /* Staging names carry the pid: concurrent client processes sharing a
+     * workdir (a supported configuration) must not truncate or rename each
+     * other's in-progress generation files. Both would generate identical
+     * bytes, so whichever rename lands last is still correct. */
+    snprintf(afb,    sizeof(afb),    "%s.afb.0",            job_local);
+    snprintf(genjob, sizeof(genjob), "%s.fbgen.%d",         job_local, (int)getpid());
+    snprintf(genafb, sizeof(genafb), "%s.fbgen.%d.afb.0",   job_local, (int)getpid());
+    snprintf(genout, sizeof(genout), "%s.fbgen.%d.out",     job_local, (int)getpid());
+
+    pthread_mutex_lock(&g_afb_mu);
+
+    if (g_afb_siever_ok == -1) {
+        g_afb_siever_ok = siever_supports_afb_audit(cfg->siever_path);
+        if (!g_afb_siever_ok)
+            fprintf(stderr,
+                    "client: %s predates factor-base cache support; "
+                    "not generating %s (update the siever to enable it)\n",
+                    cfg->siever_path, afb);
+    }
+    if (!g_afb_siever_ok) {
+        /* An old siever would still auto-load a leftover cache file (e.g.
+         * generated before the operator switched sievers), so make sure
+         * none exists for it to find. */
+        if (file_exists(afb)) {
+            fprintf(stderr, "client: removing %s (current siever cannot "
+                    "validate it)\n", afb);
+            unlink(afb);
+        }
+        pthread_mutex_unlock(&g_afb_mu);
+        return;
+    }
+
+    if (g_afb_gen_failed) {
+        pthread_mutex_unlock(&g_afb_mu);
+        return;
+    }
+    if (file_exists(afb)) {
+        if (strcmp(g_afb_validated_path, afb) == 0) {
+            pthread_mutex_unlock(&g_afb_mu);
+            return;
+        }
+        if (afb_size_ok(afb)) {
+            /* The size check only proves the file is structurally whole. A
+             * cache that is complete but wrong for this job (hand-seeded
+             * from another job, built with a smaller alim, bit rot) would
+             * make the siever's audit reject it on every workunit with
+             * nothing ever deleting the file. Probe once per process: a
+             * "-c 0" run loads and audits the cache against the full bound,
+             * sieves nothing, and exits nonzero if the siever refuses it. */
+            int prc = sieve_run_local(cfg->siever_path, job_local, genout,
+                                      1000, 0, lease->side, "",
+                                      should_cancel_siever, NULL);
+            unlink(genout);
+            if (prc == 0) {
+                snprintf(g_afb_validated_path, sizeof(g_afb_validated_path),
+                         "%s", afb);
+                printf("client: validated existing factor base cache %s\n", afb);
+                pthread_mutex_unlock(&g_afb_mu);
+                return;
+            }
+            if (should_cancel_siever(NULL)) {
+                /* Probe was killed by shutdown, not by the audit; keep the
+                 * cache for the next run. */
+                pthread_mutex_unlock(&g_afb_mu);
+                return;
+            }
+            fprintf(stderr, "client: %s failed the siever audit (rc=%d); "
+                    "regenerating\n", afb, prc);
+        } else {
+            fprintf(stderr, "client: %s is truncated; regenerating\n", afb);
+        }
+        unlink(afb);
+    }
+
+    size_t job_len = 0;
+    unsigned char *job_buf = read_file(job_local, &job_len);
+    int staged = job_buf && write_file_atomic(genjob, job_buf, job_len) == 0;
+    free(job_buf);
+    if (!staged) {
+        fprintf(stderr, "client: cannot stage %s; factor base cache disabled\n",
+                genjob);
+        g_afb_gen_failed = 1;
+        pthread_mutex_unlock(&g_afb_mu);
+        return;
+    }
+
+    unlink(genafb);
+    printf("client: generating factor base cache %s (one-time per job)\n", afb);
+
+    int rc = sieve_run_local(cfg->siever_path, genjob, genout,
+                             1000, 0, lease->side, "-k -F",
+                             should_cancel_siever, NULL);
+    if (rc == 0 && afb_size_ok(genafb) && rename(genafb, afb) == 0) {
+        snprintf(g_afb_validated_path, sizeof(g_afb_validated_path), "%s", afb);
+        printf("client: factor base cache ready: %s\n", afb);
+    } else {
+        fprintf(stderr,
+                "client: factor base cache generation failed (rc=%d); "
+                "sievers will rebuild the factor base per workunit\n", rc);
+        g_afb_gen_failed = 1;
+        unlink(genafb);
+    }
+    unlink(genjob);
+    unlink(genout);
+    pthread_mutex_unlock(&g_afb_mu);
+}
+
 /* Returns:
  *    1  - got a workunit, *out filled
  *    0  - 204 No Content (job still running, just no work right now)
@@ -1078,6 +1242,10 @@ static int run_one_iteration(struct mg_mgr *mgr, const client_cfg_t *cfg, int wo
             release_active_lease(mgr, cfg, worker_idx);
         return -2;
     }
+
+    /* One-time per job: pre-generate the factor base cache the siever
+     * auto-loads, saving its 30-45s factor base rebuild per workunit. */
+    ensure_afb_cached(cfg, &lease, job_local);
 
     /* Local outfile path for the siever to write into. Use the workunit id
      * rather than the server's generic output name so concurrent client

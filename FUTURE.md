@@ -35,11 +35,20 @@ without re-litigating.
 
 ## Performance / efficiency
 
-- **`.afb` pre-generation.** Server runs `gnfs-lasieve4* -F` once to
-  generate the algebraic factor base, ships the resulting `.afb.0`
-  alongside the `.job`. Saves factor-base setup time on every workunit
-  the client takes. Modest win; only worth it if startup overhead shows
-  up in profiling.
+- **`.afb` pre-generation.** Run `gnfs-lasieve4* -k` once (that's the
+  write flag; `-F` forces a *recompute*) to generate the algebraic
+  factor base, ship the resulting `.afb.0` alongside the `.job`; the
+  siever auto-reads it whenever it exists. Measured on the C208: startup
+  24s -> 2s with byte-identical relations, i.e. 30-45s saved on every
+  workunit. Two requirements: (1) generate with `-f` *above* alim,
+  because the siever lowers the FB bound to first_spq-1 when q < alim
+  and would write a partial cache; (2) the siever needs the trim-on-read
+  patch in yafu's `factor/lasieve5_64/gnfs-lasieve4e.c` (June 2026),
+  since the stock read path uses the cached FB unmodified — unsafe for
+  q < alim workunits. Don't pass `-k` to fleet clients (concurrent
+  first-workunit writers race on the same file); generate server-side
+  or once per client at install. Regenerate if the poly or alim ever
+  changes — the file carries no consistency check.
 
 - **Client capability advertising.** Clients send the list of
   `gnfs-lasieve4I*` binaries they have installed; server matches each
