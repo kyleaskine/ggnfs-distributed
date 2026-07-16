@@ -27,6 +27,10 @@
  * inherits that affinity. Useful on heterogeneous CPUs (Zen 5, Intel
  * P+E-cores) where the OS migrating threads between CCDs/cache domains
  * tanks performance.
+ *
+ * `ggnfs-sieve-client benchmark ...` is a separate subcommand: a fixed-work
+ * speed test against the server's real job that screens a rented box (good vs.
+ * oversubscribed/contended) in a couple of minutes. See run_benchmark().
  */
 #define _GNU_SOURCE             /* sched_setaffinity, cpu_set_t */
 #define _POSIX_C_SOURCE 200809L
@@ -519,7 +523,11 @@ static void usage(void)
         "    [--http-interval-ms=50]        minimum spacing between coordinator HTTP starts\n"
         "    [--cpu-pin=0,2,4,6]            (Linux) pin worker K to the K'th CPU in the list;\n"
         "                                   list length must equal --workers\n"
-        "    [--once]                       single-shot: each worker does one workunit and exits\n");
+        "    [--once]                       single-shot: each worker does one workunit and exits\n"
+        "\n"
+        "  ggnfs-sieve-client benchmark --server-url=... --token=... --siever=...\n"
+        "    ~1-minute-per-phase speed test against the real job (single-core vs all-core\n"
+        "    throughput, scaling, CPU steal) to screen a rented box. See `benchmark --help`.\n");
 }
 
 static int parse_config(int argc, char **argv, client_cfg_t *cfg)
@@ -1402,20 +1410,589 @@ static void *worker_main(void *arg)
     return NULL;
 }
 
+/* ===================== benchmark ======================================== */
+/*
+ * `ggnfs-sieve-client benchmark ...` runs a fixed-work speed test against the
+ * server's *real* job so you can tell a good rented box from a contended one
+ * in a couple of minutes instead of hours of sieving.
+ *
+ * It takes NO lease. It reads the job sha, sieved side, siever args, and the
+ * campaign q_min/q_max from /stats (read-only), fetches the .job via
+ * /file/<sha>, and sieves a FIXED q-interval WIDTH (--qrange, the siever's -c,
+ * exactly like a real workunit's q_range) from a FIXED anchor q (q_min, or --q)
+ * so the work is identical run-to-run and box-to-box and never disturbs real
+ * work. The window holds ~width/ln(q) prime special-q. After building the
+ * factor-base cache (phase 0):
+ *   phase 1 — one siever on a single core: time to sieve the q-range
+ *   phase 2 — every worker (default: all online cores) sieves the SAME q-range
+ *             at once; time each and sum their rel/s
+ * We measure fixed WORK (not fixed time), so every special-q runs to completion
+ * — no partial-q quantization, and the relation count is ~identical across
+ * identical boxes. Reported metrics: single-core rel/s, aggregate rel/s,
+ * multicore scaling %, slowest-worker time, CPU steal %, load average. Steal and
+ * a scaling collapse are the fingerprints of an oversubscribed / memory-starved
+ * VM; compare rel/s against a known-good box.
+ */
+
+static long online_cpus(void)
+{
+    long n = sysconf(_SC_NPROCESSORS_ONLN);
+    return n > 0 ? n : 1;
+}
+
+static long configured_cpus(void)
+{
+    long n = sysconf(_SC_NPROCESSORS_CONF);
+    return n > 0 ? n : 1;
+}
+
+/* First "model name" line from /proc/cpuinfo; "unknown" if unavailable. */
+static void cpu_model(char *out, size_t n)
+{
+    if (n == 0) return;
+    out[0] = '\0';
+    FILE *f = fopen("/proc/cpuinfo", "r");
+    if (f) {
+        char line[256];
+        while (fgets(line, sizeof(line), f)) {
+            if (strncmp(line, "model name", 10) == 0) {
+                char *c = strchr(line, ':');
+                if (c) {
+                    c++;
+                    while (*c == ' ' || *c == '\t') c++;
+                    size_t l = strlen(c);
+                    while (l > 0 && (c[l - 1] == '\n' || c[l - 1] == '\r')) c[--l] = '\0';
+                    snprintf(out, n, "%s", c);
+                }
+                break;
+            }
+        }
+        fclose(f);
+    }
+    if (!out[0]) snprintf(out, n, "unknown");
+}
+
+/* Count '\n' bytes — the relation count, same convention the server uses. */
+static long long count_newlines(const char *path)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+    unsigned char buf[64 * 1024];
+    size_t n;
+    long long lines = 0;
+    while ((n = fread(buf, 1, sizeof(buf), f)) > 0) {
+        for (size_t i = 0; i < n; i++) if (buf[i] == '\n') lines++;
+    }
+    fclose(f);
+    return lines;
+}
+
+/* Cumulative CPU jiffies + steal from /proc/stat's aggregate "cpu" line.
+ * Returns 0 on success. steal/total let us compute the steal fraction over
+ * a window — the clean signature of a hypervisor handing your vCPU away. */
+static int read_cpu_steal(unsigned long long *steal, unsigned long long *total)
+{
+    FILE *f = fopen("/proc/stat", "r");
+    if (!f) return -1;
+    char lbl[16];
+    unsigned long long v[8] = {0};
+    int got = fscanf(f, "%15s %llu %llu %llu %llu %llu %llu %llu %llu",
+                     lbl, &v[0], &v[1], &v[2], &v[3], &v[4], &v[5], &v[6], &v[7]);
+    fclose(f);
+    if (got < 9 || strcmp(lbl, "cpu") != 0) return -1;  /* user nice sys idle iowait irq softirq steal */
+    unsigned long long t = 0;
+    for (int i = 0; i < 8; i++) t += v[i];
+    *steal = v[7];
+    *total = t;
+    return 0;
+}
+
+#ifdef __linux__
+static void pin_current_thread(int cpu)
+{
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    CPU_SET(cpu, &set);
+    if (pthread_setaffinity_np(pthread_self(), sizeof(set), &set) != 0) {
+        fprintf(stderr, "benchmark: pin to cpu %d failed: %s\n", cpu, strerror(errno));
+    }
+}
+#endif
+
+/* Cancel the siever once the wall-clock deadline passes (or shutdown starts). */
+typedef struct {
+    int64_t deadline_ms;
+} bench_cancel_t;
+
+static int bench_should_cancel(void *ctx)
+{
+    bench_cancel_t *b = (bench_cancel_t *)ctx;
+    if (shutdown_phase() >= SHUTDOWN_DRAINING) return 1;
+    return monotonic_ms() >= b->deadline_ms;
+}
+
+typedef struct {
+    const client_cfg_t *cfg;
+    const char *job_local;
+    const char *siever_args;
+    char        side;
+    uint32_t    q_start;
+    uint32_t    q_count;     /* siever -c: the fixed q-interval width to sieve */
+    int64_t     deadline_ms;
+    int         cpu;         /* -1 = no pin */
+    char        outfile[300];
+    /* outputs */
+    long long   relations;
+    int         rc;
+    double      seconds;
+} bench_task_t;
+
+/* One timed siever run. Usable inline (phase 1) or as a pthread (phase 2). */
+static void *bench_worker_run(void *arg)
+{
+    bench_task_t *t = (bench_task_t *)arg;
+#ifdef __linux__
+    if (t->cpu >= 0) pin_current_thread(t->cpu);
+#endif
+    bench_cancel_t cc = { .deadline_ms = t->deadline_ms };
+    struct timeval a, b;
+    gettimeofday(&a, NULL);
+    t->rc = sieve_run_local(t->cfg->siever_path, t->job_local, t->outfile,
+                            t->q_start, t->q_count, t->side, t->siever_args,
+                            bench_should_cancel, &cc);
+    gettimeofday(&b, NULL);
+    t->seconds = elapsed_seconds(a, b);
+    t->relations = count_newlines(t->outfile);
+    unlink(t->outfile);
+    return NULL;
+}
+
+static void bench_usage(void)
+{
+    fprintf(stderr,
+        "usage: ggnfs-sieve-client benchmark \\\n"
+        "    --server-url=http://host:port  (required)\n"
+        "    --token=<bearer token>         (required)\n"
+        "    --siever=<path>                (required) gnfs-lasieve4* binary\n"
+        "    [--workers=N]                  sievers in the all-core phase (default: all online CPUs)\n"
+        "    [--cpu-pin=0,2,4,...]          (Linux) pin each worker; length must equal --workers\n"
+        "    [--qrange=65]                  q-interval WIDTH to sieve (siever -c; like a workunit's q_range);\n"
+        "                                   holds ~width/ln(q) special-q; widen for ~1min single-core\n"
+        "    [--q=N]                        fixed q anchor (default: campaign q_min from /stats)\n"
+        "    [--max-seconds=300]            per-phase safety cap so a stuck box can't hang (0 = no cap)\n"
+        "    [--min-rels-per-sec=X]         exit 3 if aggregate throughput is below X (for scripting)\n"
+        "    [--workdir=/tmp/ggnfs-client]\n"
+        "\n"
+        "  Sieves a fixed q-range from a fixed q and times it. Reads job params\n"
+        "  from /stats and fetches the .job by sha; never takes a lease.\n");
+}
+
+/* Read the job's sha, side, siever_args, and campaign q_min/q_max from the
+ * server's /stats (read-only, no lease taken). Fills a synthetic lease struct
+ * with just the fields ensure_file_cached / ensure_afb_cached need.
+ * Returns 0 on success, -1 on connection/parse error, -2 if the server is too
+ * old to expose job_sha256 (operator must rebuild + restart it). */
+static int bench_fetch_params(struct mg_mgr *mgr, const client_cfg_t *cfg,
+                              proto_lease_response_t *out,
+                              int64_t *out_qmin, int64_t *out_qmax)
+{
+    char url[512];
+    if (join_url(url, sizeof(url), cfg->server_url, "/stats") != 0) return -1;
+
+    char headers[256];
+    build_auth_headers(headers, sizeof(headers), cfg->token, "application/json", NULL);
+    http_io_t io = {
+        .url = url, .method = "GET",
+        .extra_headers = headers,
+        .body = NULL, .body_len = 0,
+    };
+    int rc = http_request(mgr, &io, 30000, 1);
+    if (rc != 0) {
+        fprintf(stderr, "benchmark: /stats connection failure\n");
+        http_io_free(&io);
+        return -1;
+    }
+    if (io.status == 401) {
+        fprintf(stderr, "benchmark: 401 unauthorized — token wrong?\n");
+        http_io_free(&io);
+        return -1;
+    }
+    if (io.status != 200) {
+        fprintf(stderr, "benchmark: /stats returned HTTP %d\n", io.status);
+        http_io_free(&io);
+        return -1;
+    }
+
+    cJSON *root = cJSON_ParseWithLength((const char *)io.resp_body, io.resp_body_len);
+    http_io_free(&io);
+    if (!root) {
+        fprintf(stderr, "benchmark: could not parse /stats JSON\n");
+        return -1;
+    }
+
+    memset(out, 0, sizeof(*out));
+    cJSON *j_sha  = cJSON_GetObjectItemCaseSensitive(root, "job_sha256");
+    cJSON *j_args = cJSON_GetObjectItemCaseSensitive(root, "siever_args");
+    cJSON *j_side = cJSON_GetObjectItemCaseSensitive(root, "side");
+    cJSON *j_siev = cJSON_GetObjectItemCaseSensitive(root, "siever");
+    cJSON *j_wu   = cJSON_GetObjectItemCaseSensitive(root, "workunits");
+
+    if (!(j_sha && cJSON_IsString(j_sha) && j_sha->valuestring &&
+          strlen(j_sha->valuestring) == 64)) {
+        fprintf(stderr, "benchmark: /stats has no job_sha256 — this server predates "
+                "benchmark support.\n           Rebuild and restart the server "
+                "(it now publishes job_sha256 + siever_args in /stats).\n");
+        cJSON_Delete(root);
+        return -2;
+    }
+    snprintf(out->file_sha256_hex, sizeof(out->file_sha256_hex), "%s", j_sha->valuestring);
+    snprintf(out->file_url, sizeof(out->file_url), "/file/%s", out->file_sha256_hex);
+    snprintf(out->siever_args, sizeof(out->siever_args), "%s",
+             (j_args && cJSON_IsString(j_args) && j_args->valuestring) ? j_args->valuestring : "");
+    out->side = (j_side && cJSON_IsString(j_side) && j_side->valuestring &&
+                 j_side->valuestring[0]) ? j_side->valuestring[0] : 'a';
+    if (j_siev && cJSON_IsString(j_siev) && j_siev->valuestring)
+        snprintf(out->siever, sizeof(out->siever), "%s", j_siev->valuestring);
+
+    int64_t qmin = 0, qmax = 0;
+    if (j_wu && cJSON_IsObject(j_wu)) {
+        cJSON *jq = cJSON_GetObjectItemCaseSensitive(j_wu, "q_min");
+        cJSON *jx = cJSON_GetObjectItemCaseSensitive(j_wu, "q_max");
+        if (jq && cJSON_IsNumber(jq)) qmin = (int64_t)jq->valuedouble;
+        if (jx && cJSON_IsNumber(jx)) qmax = (int64_t)jx->valuedouble;
+    }
+    *out_qmin = qmin;
+    *out_qmax = qmax;
+    cJSON_Delete(root);
+    return 0;
+}
+
+/* Returns 0 (good / no threshold), 1 (setup error), 2 (bad args),
+ * 3 (ran, but aggregate throughput below --min-rels-per-sec). */
+static int run_benchmark(int argc, char **argv, client_cfg_t *cfg)
+{
+    /* Fixed WORK, not fixed time: sieve a fixed q-interval WIDTH (the siever's
+     * -c, exactly like a real workunit's q_range) from a fixed anchor q, and
+     * measure how long it takes. The window holds ~width/ln(q) prime special-q;
+     * each runs to completion, so the work — and the relation count — is
+     * identical on every box, making the time a pure hardware signal. Widen it
+     * for jobs with small per-special-q cost; aim for ~1 min single-core.
+     * (A width too small to contain a prime sieves nothing and yields zero.) */
+    int64_t qrange = 65;
+    const char *qr = flag(argc, argv, "--qrange");
+    if (qr && *qr && (parse_int64_arg(qr, &qrange) != 0 || qrange < 1 || qrange > 10000000)) {
+        fprintf(stderr, "benchmark: --qrange must be an integer in 1..10000000\n");
+        bench_usage();
+        return 2;
+    }
+
+    /* Safety cap so a broken/stuck box can't hang forever; a healthy box
+     * finishes the --qrange window well within it. 0 disables the cap. */
+    int64_t max_seconds = 300;
+    const char *ms = flag(argc, argv, "--max-seconds");
+    if (ms && *ms && (parse_int64_arg(ms, &max_seconds) != 0 || max_seconds < 0 || max_seconds > 86400)) {
+        fprintf(stderr, "benchmark: --max-seconds must be an integer in 0..86400 (0 = no cap)\n");
+        return 2;
+    }
+
+    double min_rels = 0.0;
+    const char *mr = flag(argc, argv, "--min-rels-per-sec");
+    if (mr && *mr) {
+        char *end = NULL;
+        errno = 0;
+        min_rels = strtod(mr, &end);
+        if (errno != 0 || end == mr || *end != '\0' || min_rels < 0) {
+            fprintf(stderr, "benchmark: --min-rels-per-sec must be a non-negative number\n");
+            return 2;
+        }
+    }
+
+    /* Fixed special-q anchor. Default: the campaign's q_min from /stats (same
+     * on every box, a real production q). --q pins a constant that survives an
+     * `extend`. 0 here means "use q_min once we've fetched /stats". */
+    int64_t q_override = 0;
+    const char *qflag = flag(argc, argv, "--q");
+    if (qflag && *qflag &&
+        (parse_int64_arg(qflag, &q_override) != 0 || q_override < 1 || q_override > 0xFFFFFFFF)) {
+        fprintf(stderr, "benchmark: --q must be an integer in 1..4294967295\n");
+        return 2;
+    }
+
+    char model[160];
+    cpu_model(model, sizeof(model));
+    printf("=== ggnfs box benchmark ===\n");
+    printf("cpu        : %s\n", model);
+    printf("threads    : %ld online / %ld configured\n", online_cpus(), configured_cpus());
+    printf("workers    : %d\n", cfg->workers);
+    printf("siever     : %s\n", cfg->siever_path);
+    printf("q-range    : %lld wide (fixed work, same as a workunit's q_range)\n",
+           (long long)qrange);
+    fflush(stdout);
+
+    if (mkdir_p(cfg->workdir) != 0) return 1;
+    http_limiter_init(cfg->http_concurrency, cfg->http_interval_ms);
+
+    struct mg_mgr mgr;
+    mg_mgr_init(&mgr);
+
+    /* Read the job sha + side + args + q_min/q_max from /stats. No lease is
+     * taken, so the work pool is untouched and the anchor q is deterministic. */
+    proto_lease_response_t lease;
+    int64_t qmin = 0, qmax = 0;
+    int pr = bench_fetch_params(&mgr, cfg, &lease, &qmin, &qmax);
+    if (pr != 0) {
+        /* bench_fetch_params already explained the failure. */
+        mg_mgr_free(&mgr);
+        return 1;
+    }
+
+    char side = lease.side;
+    char siever_args[128];
+    snprintf(siever_args, sizeof(siever_args), "%s", lease.siever_args);
+
+    /* Fixed anchor: --q if given, else the campaign's q_min. */
+    int64_t anchor = q_override ? q_override : qmin;
+    if (anchor < 1) {
+        fprintf(stderr, "benchmark: server reports no q range (q_min=%lld); "
+                "pass --q=<special-q> to benchmark this job.\n", (long long)qmin);
+        mg_mgr_free(&mgr);
+        return 1;
+    }
+    uint32_t base_q = (uint32_t)anchor;
+    (void)qmax;
+    /* Every phase-2 worker sieves the SAME special-q as the single-core run.
+     * The factor base is shared read-only across workers in production too, so
+     * identical work stresses memory bandwidth the same way while keeping
+     * scaling a clean signal (no per-q-region cost differences to confound it).
+     * Each worker is an independent process with its own private sieve arrays. */
+
+    const char *siever_basename = strrchr(cfg->siever_path, '/');
+    siever_basename = siever_basename ? siever_basename + 1 : cfg->siever_path;
+    if (lease.siever[0] && strcmp(siever_basename, lease.siever) != 0) {
+        fprintf(stderr, "benchmark: WARNING — server expects siever '%s' but --siever is '%s'; "
+                "results reflect the binary you gave.\n", lease.siever, siever_basename);
+    }
+    printf("anchor q   : %u%s  side=%c  args=\"%s\"\n",
+           base_q, q_override ? " (--q)" : " (q_min)", side, siever_args);
+    fflush(stdout);
+
+    char job_local[256];
+    if (ensure_file_cached(&mgr, cfg, &lease, job_local, sizeof(job_local)) != 0) {
+        fprintf(stderr, "benchmark: could not fetch the job file.\n");
+        mg_mgr_free(&mgr);
+        return 1;
+    }
+
+    /* Phase 0: build the factor-base cache once so phases 1-2 measure sieving,
+     * not the 30-45s per-siever FB rebuild. ensure_afb_cached() only aborts on
+     * a *second* Ctrl-C (SHUTDOWN_CANCELLING), unlike the sieve phases which
+     * bail on the first — intentional: the FB cache is expensive and persists,
+     * so a single Ctrl-C lets it finish (and be reused) before the drain check
+     * below aborts the run, rather than throwing the work away half-built. */
+    printf("\nfactor base: building/validating cache ...\n");
+    fflush(stdout);
+    struct timeval f0, f1;
+    gettimeofday(&f0, NULL);
+    ensure_afb_cached(cfg, &lease, job_local);
+    gettimeofday(&f1, NULL);
+    double fb_seconds = elapsed_seconds(f0, f1);
+
+    mg_mgr_free(&mgr);  /* done talking to the server */
+
+    char afb[300];
+    snprintf(afb, sizeof(afb), "%s.afb.0", job_local);
+    int have_afb = file_exists(afb);
+    printf("factor base: %.1fs (%s)\n", fb_seconds,
+           have_afb ? "cache ready" : "no cache");
+    if (!have_afb) {
+        fprintf(stderr, "benchmark: WARNING — no factor-base cache (siever may predate cache "
+                "support); each siever will rebuild the FB, understating sieving throughput.\n");
+    }
+    if (shutdown_phase() >= SHUTDOWN_DRAINING) return 1;
+
+    uint32_t qwidth = (uint32_t)qrange;
+    /* Deadline is only a safety cap (a healthy box finishes the q-range well
+     * within it); 0 means no cap. */
+    int64_t cap_ms = max_seconds > 0 ? (int64_t)max_seconds * 1000 : (int64_t)1 << 62;
+
+    /* Phase 1: single core. */
+    printf("\nphase 1 (1 core ): sieving q-range [%u, %u) ...\n", base_q, base_q + qwidth);
+    fflush(stdout);
+    bench_task_t one;
+    memset(&one, 0, sizeof(one));
+    one.cfg = cfg;
+    one.job_local = job_local;
+    one.siever_args = siever_args;
+    one.side = side;
+    one.q_start = base_q;
+    one.q_count = qwidth;
+    one.cpu = cfg->cpu_pin_count > 0 ? cfg->cpu_pin_list[0] : -1;
+    snprintf(one.outfile, sizeof(one.outfile), "%s/bench_single.dat", cfg->workdir);
+    one.deadline_ms = monotonic_ms() + cap_ms;
+    bench_worker_run(&one);
+    double T1 = one.seconds;
+    int one_capped = (max_seconds > 0 && T1 >= (double)max_seconds - 0.5);
+    double single_rps = T1 > 0 ? (double)one.relations / T1 : 0.0;
+    printf("phase 1 (1 core ): q-range %u in %.1fs -> %.1f rel/s (%lld relations)\n",
+           qwidth, T1, single_rps, one.relations);
+    fflush(stdout);
+    if (one.relations == 0 || one_capped) {
+        if (one_capped)
+            fprintf(stderr, "benchmark: single-core phase hit the %llds cap before finishing "
+                    "the q-range — this box is extremely slow or stuck.\n",
+                    (long long)max_seconds);
+        else
+            fprintf(stderr, "benchmark: single-core phase produced no relations. The q-range "
+                    "[%u,%u) may be too narrow to contain a prime special-q, or q is outside "
+                    "this job's yield range — try a larger --qrange or a different --q.\n",
+                    base_q, base_q + qwidth);
+        return 1;
+    }
+    if (shutdown_phase() >= SHUTDOWN_DRAINING) return 1;
+
+    /* Phase 2: every worker sieves the same q-range, all at once. */
+    int W = cfg->workers;
+    printf("\nphase 2 (%d cores): each worker sieves q-range [%u, %u) ...\n",
+           W, base_q, base_q + qwidth);
+    fflush(stdout);
+    bench_task_t *tasks = calloc((size_t)W, sizeof(*tasks));
+    pthread_t *tids = calloc((size_t)W, sizeof(*tids));
+    if (!tasks || !tids) {
+        fprintf(stderr, "benchmark: alloc failed\n");
+        free(tasks); free(tids);
+        return 1;
+    }
+
+    unsigned long long steal0 = 0, total0 = 0, steal1 = 0, total1 = 0;
+    int have_steal = (read_cpu_steal(&steal0, &total0) == 0);
+
+    int64_t phase2_deadline = monotonic_ms() + cap_ms;
+    int spawned = 0;
+    for (int k = 0; k < W; k++) {
+        tasks[k].cfg = cfg;
+        tasks[k].job_local = job_local;
+        tasks[k].siever_args = siever_args;
+        tasks[k].side = side;
+        tasks[k].q_start = base_q;   /* identical work per worker */
+        tasks[k].q_count = qwidth;
+        tasks[k].deadline_ms = phase2_deadline;
+        tasks[k].cpu = cfg->cpu_pin_count > 0 ? cfg->cpu_pin_list[k] : -1;
+        snprintf(tasks[k].outfile, sizeof(tasks[k].outfile), "%s/bench_w%d.dat",
+                 cfg->workdir, k);
+        if (pthread_create(&tids[k], NULL, bench_worker_run, &tasks[k]) != 0) {
+            fprintf(stderr, "benchmark: pthread_create failed for worker %d: %s\n",
+                    k, strerror(errno));
+            break;
+        }
+        spawned++;
+    }
+    for (int k = 0; k < spawned; k++) pthread_join(tids[k], NULL);
+    if (have_steal) have_steal = (read_cpu_steal(&steal1, &total1) == 0);
+
+    /* Fixed work per worker: sum each worker's own rel/s so a worker finishing
+     * early (or late, under contention) is accounted at its true rate. */
+    long long agg_rels = 0;
+    double agg_rps = 0.0;
+    double tw_min = 0.0, tw_max = 0.0;
+    int any_capped = 0;
+    for (int k = 0; k < spawned; k++) {
+        double tw = tasks[k].seconds;
+        agg_rels += tasks[k].relations;
+        agg_rps  += tw > 0 ? (double)tasks[k].relations / tw : 0.0;
+        if (k == 0 || tw < tw_min) tw_min = tw;
+        if (k == 0 || tw > tw_max) tw_max = tw;
+        if (max_seconds > 0 && tw >= (double)max_seconds - 0.5) any_capped = 1;
+    }
+    double scaling = (single_rps > 0 && spawned > 0)
+                     ? agg_rps / (single_rps * spawned) : 0.0;
+    double steal_pct = (have_steal && total1 > total0)
+                       ? 100.0 * (double)(steal1 - steal0) / (double)(total1 - total0)
+                       : 0.0;
+    double load[3] = {0, 0, 0};
+    (void)getloadavg(load, 3);
+
+    printf("phase 2 (%d cores): %lld relations, worker time %.1f-%.1fs -> %.1f rel/s aggregate\n",
+           W, agg_rels, tw_min, tw_max, agg_rps);
+    if (any_capped)
+        fprintf(stderr, "benchmark: WARNING — at least one worker hit the %llds cap; "
+                "aggregate is understated (box is very slow/contended).\n",
+                (long long)max_seconds);
+
+    free(tasks);
+    free(tids);
+
+    /* ---- report ---- */
+    printf("\n--- results ---\n");
+    printf("single-core throughput : %.1f rel/s  (q-range %u in %.1fs)\n", single_rps, qwidth, T1);
+    printf("aggregate throughput   : %.1f rel/s  (%d workers)\n", agg_rps, spawned);
+    printf("multicore scaling      : %.0f%%  (aggregate / (single x %d))\n",
+           scaling * 100.0, spawned);
+    printf("slowest worker         : %.1fs  (fastest %.1fs)\n", tw_max, tw_min);
+    if (have_steal)
+        printf("cpu steal              : %.1f%%%s\n", steal_pct,
+               steal_pct >= 5.0 ? "   <-- RED FLAG: hypervisor is contended" : "");
+    else
+        printf("cpu steal              : (unavailable)\n");
+    printf("load average           : %.1f / %.1f / %.1f\n", load[0], load[1], load[2]);
+    printf("\nCompare rel/s against a known-good box. Low scaling with low steal usually\n"
+           "means memory-bandwidth contention from a noisy neighbor.\n");
+
+    if (min_rels > 0.0 && agg_rps < min_rels) {
+        printf("\nVERDICT: BELOW THRESHOLD (%.1f < %.1f rel/s) — consider re-rolling this box.\n",
+               agg_rps, min_rels);
+        return 3;
+    }
+    if (min_rels > 0.0)
+        printf("\nVERDICT: OK (%.1f >= %.1f rel/s).\n", agg_rps, min_rels);
+    return 0;
+}
+
 /* ===================== main ============================================= */
 
 int main(int argc, char **argv)
 {
+    int is_bench = (argc > 1 && strcmp(argv[1], "benchmark") == 0);
+
+    if (is_bench && flag(argc, argv, "--help") != NULL) {
+        bench_usage();
+        return 0;
+    }
+
+    /* Show the benchmark usage (not the generic client usage parse_config would
+     * print) when a benchmark invocation is missing a required flag. */
+    if (is_bench) {
+        const char *u = flag(argc, argv, "--server-url");
+        const char *t = flag(argc, argv, "--token");
+        const char *s = flag(argc, argv, "--siever");
+        if (!u || !*u || !t || !*t || !s || !*s) {
+            bench_usage();
+            return 2;
+        }
+    }
+
     client_cfg_t cfg;
     if (parse_config(argc, argv, &cfg) != 0) return 2;
-
-    if (mkdir_p(cfg.workdir) != 0) return 1;
 
     signal(SIGINT,  on_signal);
     signal(SIGTERM, on_signal);
     signal(SIGPIPE, SIG_IGN);
 
     mg_log_set(MG_LL_ERROR);  /* quiet by default; raise to debug */
+
+    if (is_bench) {
+        /* Default the all-core phase to every online CPU when the operator
+         * didn't set --workers. (--cpu-pin requires a matching --workers, so a
+         * pinned run already has an explicit worker count; the cpu_pin_count
+         * guard is just defensive.) */
+        if (!flag(argc, argv, "--workers") && cfg.cpu_pin_count == 0) {
+            long n = online_cpus();
+            if (n > CLIENT_MAX_WORKERS) n = CLIENT_MAX_WORKERS;
+            cfg.workers = (int)n;
+        }
+        return run_benchmark(argc, argv, &cfg);
+    }
+
+    if (mkdir_p(cfg.workdir) != 0) return 1;
 
     fprintf(stderr,
         "ggnfs-sieve-client: %s\n"

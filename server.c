@@ -923,6 +923,8 @@ static char *format_stats_json(server_ctx_t *ctx, const db_stats_t *s,
 
     cJSON_AddStringToObject (root, "job_id",         ctx->job_id);
     cJSON_AddStringToObject (root, "siever",         ctx->siever);
+    cJSON_AddStringToObject (root, "job_sha256",     ctx->job_sha256);
+    cJSON_AddStringToObject (root, "siever_args",    ctx->siever_args);
     { char sb[2] = { ctx->side, 0 };
       cJSON_AddStringToObject(root, "side",          sb); }
     cJSON_AddNumberToObject (root, "now_unix",       (double)now);

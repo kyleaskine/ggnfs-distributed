@@ -58,6 +58,23 @@ Vendored sources are compiled with `-w` and a pile of `-DSQLITE_*` / `-DMG_*` fl
 
 The dashboard is at `http://host:8080/?token=<token>` — the HTML itself is unauthenticated, but its JS uses the token to poll `/stats`. `serve` defaults to `--bind=127.0.0.1`; use `--bind=0.0.0.0` only when the coordinator should be reachable from other machines.
 
+## Screening a worker with `benchmark`
+
+Rented boxes (VastAI etc.) that look identical can differ 50%+ in real sieving speed because of hypervisor CPU steal or a noisy neighbor saturating memory bandwidth. `ggnfs-sieve-client benchmark` screens a box in a couple of minutes instead of hours of sieving:
+
+```
+./ggnfs-sieve-client benchmark \
+    --server-url=http://host:8080 --token=<token> \
+    --siever=/path/to/gnfs-lasieve4I16e \
+    [--workers=N] [--qrange=65] [--q=N] [--min-rels-per-sec=X]
+```
+
+It reads job params from **`GET /stats`** (`job_sha256`, `siever_args`, `side`, `q_min`) and fetches the `.job` via `GET /file/<sha>` — **it never calls `/lease` or `/submit`, so it is safe against a live coordinator and takes no work out of the pool.** Then it builds the factor-base cache once, sieves a fixed q-range single-core (Phase 1), then has every worker (default: all online CPUs) sieve the *same* q-range at once (Phase 2), and reports single-core rel/s, aggregate rel/s, **multicore scaling %**, slowest-worker time, **CPU steal %**, and load average. `--min-rels-per-sec=X` sets exit code 3 when aggregate throughput is below X, for scripted auto-reject.
+
+The measurement is **fixed work, not fixed time**: it sieves a fixed q-interval width (`--qrange`, the siever's `-c`) from a fixed anchor (`q_min`, or `--q`), so every special-q runs to completion and the relation count comes out identical on every box — time is then a pure hardware signal. Steal >~5% or a scaling collapse are the fingerprints of an oversubscribed / memory-starved VM; rel/s only means something relative to a known-good box, so run it once on a box you trust to set the yardstick. `ggnfs-client.sh` writes a `benchmark.sh` wrapper and offers to run it at bootstrap.
+
+**Requires a server built from this revision** (the `/stats` fields were added here); against an older `serve` it prints "server predates benchmark support" and exits. Just rebuild + restart `serve` — no `re-init` needed, since `job_sha256`/`siever_args` are already in `meta`.
+
 ## Architecture — the parts that span multiple files
 
 ### Threading model (server)
@@ -105,3 +122,4 @@ All JSON encode/decode lives here so `server.c` and `client.c` don't both link c
 - `OUTPUT_MAX_BYTES = 500 MiB`. The server's `MG_MAX_RECV_SIZE` is set to allow that for compressed request bodies; the zstd submit path also rejects decoded relation streams above `OUTPUT_MAX_BYTES`. These limits need to stay in sync if either is bumped.
 - `sqlite3_busy_timeout=5s` in `db_open` is what lets the verifier and event-loop threads share a DB file without explicit locking. Dropping it would surface `SQLITE_BUSY` on the main thread under submit load.
 - The server has no graceful shutdown today (`for (;;) mg_mgr_poll(...)`); the cleanup code below the loop — including `verify_thread_stop` — is unreachable. SIGINT just kills it. The DB is in WAL mode so this is fine. (Tracked in `FUTURE.md`.)
+- The siever's `-c` (in `sieve_run_local`, and `benchmark --qrange`) is a special-q interval **width**, not a count of special-q — the same unit as a workunit's `q_range`. The window `[f, f+c)` holds ~`c/ln(q)` prime special-q. A `-c` narrower than ~`ln(q)` contains no prime, so the siever does zero work and yields **0 relations in ~2s** (all `sieve:` counters 0) — a failure that mimics a broken job/siever/cache. This is why `benchmark --qrange` defaults to 65 (~3 special-q at q≈80M, ~1 min single-core), not a small number.
