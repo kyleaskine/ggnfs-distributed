@@ -22,3 +22,4 @@ ggnfs-client.sh
 run-client.sh
 archive/
 .locks/
+benchmark.sh
