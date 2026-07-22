@@ -9,10 +9,13 @@
 #      staging dir.
 #   4. rsync the staging dir down to <local-dir>/incoming/<ts>/.
 #   5. Run ggnfs-verify against the downloaded files (parse + q-range +
-#      full GMP norm on every relation). Validation failures print to
-#      stderr but never fail the run — corrupted files stay in incoming/
-#      for inspection.
-#   6. Move successfully-landed files from incoming/ to archive/.
+#      full GMP norm on every relation), batched through xargs so a large
+#      file count can't overflow the exec argument limit. Validation is a
+#      hard gate: if any file fails, or fewer files were checked than we
+#      downloaded, we stop here — the files stay in incoming/ for inspection
+#      and the remote staging dir is left untouched. (--no-validate opts out
+#      of the gate.)
+#   6. Only if validation passed: move files from incoming/ to archive/.
 #   7. Only after step 6 succeeds, ssh in and rm -rf the remote staging dir.
 #      Any failure earlier leaves the staging dir on the server untouched.
 #
@@ -234,22 +237,54 @@ if [ "$local_count" -ne "$remote_count" ]; then
 fi
 
 # --- Step 4: local validation ------------------------------------------
+# validate_passed gates archiving + remote GC below. It stays 1 when
+# --no-validate is given (the caller explicitly opted out of the check).
+validate_passed=1
 if [ "$no_validate" -eq 0 ]; then
     echo "[chk ] running ggnfs-verify on $local_count file(s) ..."
-    verify_args=( --jobdb="$local_incoming/job.db" )
+    verify_args=( --jobdb="$local_incoming/job.db" --quiet )
     [ "$validate_no_norm" -eq 1 ] && verify_args+=( --no-norm )
-    # Glob the .dat[.zst] files; the validator never exits nonzero on
-    # validation failures, only on I/O. Let its stderr/stdout flow through.
-    # We don't capture exit code as a hard error per design.
-    shopt -s nullglob
-    files=( "$local_incoming"/*.dat* )
-    shopt -u nullglob
-    if [ "${#files[@]}" -gt 0 ]; then
-        "$verify_bin" "${verify_args[@]}" "${files[@]}" || \
-            echo "[chk ] (ggnfs-verify exit nonzero — see messages above; continuing)" >&2
+    verify_log="$local_incoming/verify.log"
+
+    # Batch through xargs. Passing tens of thousands of paths as a single
+    # argv overflows the kernel exec limit (E2BIG / "Argument list too
+    # long") before ggnfs-verify even starts — that is exactly the failure
+    # that silently skipped validation on a 40k-file pull. find -print0 |
+    # xargs -0 splits the work into as many invocations as needed; each
+    # prints its own "summary:" line, which we aggregate below.
+    #
+    # ggnfs-verify exits 0 even when files fail validation (failures show up
+    # only in the summary line), so the log — not the exit code — is what
+    # tells us whether the pull is good.
+    set +e +o pipefail
+    find "$local_incoming" -maxdepth 1 -name '*.dat*' -type f -print0 \
+        | xargs -0 -r "$verify_bin" "${verify_args[@]}" >"$verify_log" 2>&1
+    verify_rc=${PIPESTATUS[1]}
+    set -e -o pipefail
+
+    # Echo any per-file FAIL / I-O lines and each batch summary to the console.
+    grep -E ': FAIL |: I/O error|^summary:' "$verify_log" >&2 || true
+
+    # Sum "N file(s)" and "M with failures" across every batch summary.
+    files_checked=$(awk '/^summary:/{for(i=1;i<=NF;i++) if($i=="file(s),") s+=$(i-1)} END{print s+0}' "$verify_log")
+    files_failed=$(awk  '/^summary:/{for(i=1;i<=NF;i++) if($i=="with")      s+=$(i-1)} END{print s+0}' "$verify_log")
+
+    echo "[chk ] verify: checked=$files_checked/$local_count with_failures=$files_failed (rc=$verify_rc, log: $verify_log)"
+    if [ "$verify_rc" -ne 0 ] || [ "$files_checked" -ne "$local_count" ] || [ "$files_failed" -ne 0 ]; then
+        validate_passed=0
     fi
 else
     echo "[chk ] --no-validate: skipping ggnfs-verify"
+fi
+
+# Hard gate: nothing destructive happens unless validation passed. On
+# failure the downloaded files stay in incoming/ AND the remote staging dir
+# is left in place, so nothing is lost and the pull can be inspected/re-run.
+if [ "$validate_passed" -ne 1 ]; then
+    echo "[FAIL] validation did not pass — NOT archiving, NOT deleting remote." >&2
+    echo "       downloaded files remain in $local_incoming" >&2
+    echo "       remote staging preserved at  $remote_staging" >&2
+    exit 1
 fi
 
 # --- Step 5: move files from incoming/<ts>/ to archive/ -----------------
