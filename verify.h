@@ -120,7 +120,10 @@ void verify_poly_free(verify_poly_t *p);
 
 /* Parse a ggnfs .job file. Recognized keys: c0..c<N>, Y0, Y1. All other
  * lines (n, skew, rlim, alim, *lim, *lpb, *mfb, *lambda, blank, '#...')
- * are ignored. Returns 0 on success, -1 on I/O or parse error. */
+ * are ignored. Degree is the highest c<k> present; coefficients below it
+ * that the file omits are taken as 0, so a sparse poly (c6/c3/c0) parses
+ * the same way the sievers read it. Returns 0 on success, -1 on I/O or
+ * parse error. */
 int verify_parse_job_file(const char *path, verify_poly_t *out);
 
 /* Persist a parsed polynomial into the `meta` table:

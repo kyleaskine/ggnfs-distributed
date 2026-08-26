@@ -558,6 +558,87 @@ static char *dup_range(const char *s, size_t n)
     return r;
 }
 
+/* Validate the parsed strings as decimal integers, drop a zero leading
+ * coefficient (it would inflate the degree and put a spurious factor of b in
+ * every algebraic norm), and -- when the .job carries an `n:` line -- check the
+ * standard NFS invariant that f and g share a root mod n:
+ *
+ *     sum_k c_k * (-Y0)^k * Y1^(d-k) === 0 (mod n)
+ *
+ * That congruence is what makes omitting zero coefficients safe. Presence
+ * alone cannot tell a coefficient the operator legitimately left out (0) from
+ * one a truncated or mangled line dropped; the congruence accepts the first
+ * and rejects the second with overwhelming probability. Failing here costs the
+ * operator one `init`; failing to check costs a whole sieve job, since a wrong
+ * polynomial poisons every workunit one norm spot-check at a time.
+ * Returns 0 on success, -1 with a message on stderr otherwise. */
+static int poly_finalize_and_check(const char *path, verify_poly_t *p,
+                                   const char *n_str)
+{
+    int rc = -1;
+    mpz_t c[VERIFY_MAX_POLY_DEGREE + 1], Y0, Y1, n, acc, term, xp, zp;
+
+    for (int k = 0; k <= VERIFY_MAX_POLY_DEGREE; k++) mpz_init(c[k]);
+    mpz_inits(Y0, Y1, n, acc, term, xp, zp, NULL);
+
+    for (int k = 0; k <= p->degree; k++) {
+        if (mpz_set_str(c[k], p->c[k], 10) != 0) {
+            fprintf(stderr, "verify_parse_job_file: %s: c%d is not a decimal "
+                    "integer: \"%s\"\n", path, k, p->c[k]);
+            goto done;
+        }
+    }
+    if (mpz_set_str(Y0, p->Y0, 10) != 0 || mpz_set_str(Y1, p->Y1, 10) != 0) {
+        fprintf(stderr, "verify_parse_job_file: %s: Y0/Y1 is not a decimal "
+                "integer\n", path);
+        goto done;
+    }
+    if (mpz_sgn(Y1) == 0) {
+        fprintf(stderr, "verify_parse_job_file: %s: Y1 is zero\n", path);
+        goto done;
+    }
+
+    while (p->degree >= 1 && mpz_sgn(c[p->degree]) == 0) p->degree--;
+    if (p->degree < 1) {
+        fprintf(stderr, "verify_parse_job_file: %s: all coefficients above c0 "
+                "are zero\n", path);
+        goto done;
+    }
+
+    if (!n_str) {                      /* pre-existing jobs may omit `n:` */
+        rc = 0;
+        goto done;
+    }
+    if (mpz_set_str(n, n_str, 10) != 0 || mpz_cmp_ui(n, 1) <= 0) {
+        fprintf(stderr, "verify_parse_job_file: %s: n is not an integer > 1\n",
+                path);
+        goto done;
+    }
+
+    mpz_neg(term, Y0);                 /* term = -Y0, the shared root */
+    mpz_set_ui(xp, 1);                 /* xp walks (-Y0)^k             */
+    mpz_set_ui(acc, 0);
+    for (int k = 0; k <= p->degree; k++) {
+        mpz_pow_ui(zp, Y1, (unsigned long)(p->degree - k));
+        mpz_mul(zp, zp, xp);
+        mpz_addmul(acc, c[k], zp);
+        mpz_mul(xp, xp, term);
+    }
+    mpz_mod(acc, acc, n);
+    if (mpz_sgn(acc) != 0) {
+        fprintf(stderr, "verify_parse_job_file: %s: polynomial does not have a "
+                "root mod n (f and g disagree) -- wrong .job for this number, "
+                "or a coefficient line is missing or mangled\n", path);
+        goto done;
+    }
+    rc = 0;
+
+done:
+    for (int k = 0; k <= VERIFY_MAX_POLY_DEGREE; k++) mpz_clear(c[k]);
+    mpz_clears(Y0, Y1, n, acc, term, xp, zp, NULL);
+    return rc;
+}
+
 int verify_parse_job_file(const char *path, verify_poly_t *out)
 {
     verify_poly_init(out);
@@ -573,6 +654,7 @@ int verify_parse_job_file(const char *path, verify_poly_t *out)
     ssize_t n;
     int     max_c = -1;
     int     ok    = 1;
+    char   *n_str = NULL;
 
     while ((n = getline(&line, &cap, f)) > 0) {
         size_t len = rstrip_eol(line, (size_t)n);
@@ -621,31 +703,53 @@ int verify_parse_job_file(const char *path, verify_poly_t *out)
             *slot = dup_range(line + v_start, v_len);
             if (!*slot) { ok = 0; break; }
         }
-        /* all other keys (n, skew, rlim, alim, *lpb*, *mfb*, *lambda, lss) ignored */
+        else if (key_len == 1 && key[0] == 'n') {
+            free(n_str);
+            n_str = dup_range(line + v_start, v_len);
+            if (!n_str) { ok = 0; break; }
+        }
+        /* all other keys (skew, rlim, alim, *lpb*, *mfb*, *lambda, lss) ignored */
     }
     free(line);
+    if (ok && ferror(f)) {
+        fprintf(stderr, "verify_parse_job_file: read %s: %s\n",
+                path, strerror(errno));
+        ok = 0;
+    }
     fclose(f);
 
-    if (!ok) { verify_poly_free(out); return -1; }
+    if (!ok) { free(n_str); verify_poly_free(out); return -1; }
 
     if (max_c < 1) {
-        fprintf(stderr, "verify_parse_job_file: %s: no c0/c1 coefficients found\n", path);
-        verify_poly_free(out);
+        fprintf(stderr, "verify_parse_job_file: %s: no c1 or higher coefficient "
+                "found\n", path);
+        free(n_str); verify_poly_free(out);
         return -1;
     }
+    /* Sparse polynomials are conventionally written with the zero coefficients
+     * omitted -- an SNFS sextic given as just c6/c3/c0, say. Every siever and
+     * filtering tool reads that shape, so fill the gaps with 0 rather than
+     * rejecting the job. */
     for (int k = 0; k <= max_c; k++) {
         if (!out->c[k]) {
-            fprintf(stderr, "verify_parse_job_file: %s: missing c%d\n", path, k);
-            verify_poly_free(out);
-            return -1;
+            out->c[k] = strdup("0");
+            if (!out->c[k]) { free(n_str); verify_poly_free(out); return -1; }
         }
     }
     if (!out->Y0 || !out->Y1) {
         fprintf(stderr, "verify_parse_job_file: %s: missing Y0/Y1\n", path);
-        verify_poly_free(out);
+        free(n_str); verify_poly_free(out);
         return -1;
     }
     out->degree = max_c;
+
+    /* Everything above is presence-only. This is what checks the values --
+     * and, with `n:`, that they are the right values for this number. */
+    if (poly_finalize_and_check(path, out, n_str) != 0) {
+        free(n_str); verify_poly_free(out);
+        return -1;
+    }
+    free(n_str);
     return 0;
 }
 
@@ -803,6 +907,11 @@ static void compute_algebraic_norm(mpz_t out, int64_t a, uint64_t b,
  * prime (the relation is acceptable); 0 if it's composite > 1 (broken). */
 static int residue_ok(mpz_t norm, const uint64_t *primes, int n)
 {
+    /* A zero norm is never legitimate -- an irreducible f has no rational
+     * root, so it means the relation or the polynomial is broken. Bail before
+     * the division loops: GMP reports 0 divisible by every p and divexact
+     * leaves it 0, so they would spin forever. */
+    if (mpz_sgn(norm) == 0) return 0;
     mpz_abs(norm, norm);
     for (int i = 0; i < n; i++) {
         unsigned long p = (unsigned long)primes[i];
