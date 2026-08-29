@@ -65,26 +65,14 @@ static int wait_child_cancelable(pid_t pid, sieve_cancel_fn should_cancel,
     }
 }
 
-int sieve_run_local(const char *siever_path,
-                    const char *job_infile,
-                    const char *outfile,
-                    uint32_t startq,
-                    uint32_t qrange,
-                    char side,
-                    const char *extra_args,
-                    sieve_cancel_fn should_cancel,
-                    void *cancel_ctx)
+/* Run `syscmd` through /bin/sh in its own process group, polling
+ * `should_cancel` while it runs. Shared by both engines: the process-group
+ * isolation and the SIGTERM-then-SIGKILL cancel are engine-independent, and
+ * only the command line differs. */
+static int run_child_cancelable(const char *syscmd,
+                                sieve_cancel_fn should_cancel,
+                                void *cancel_ctx)
 {
-    /* Discard any prior relation file at this path; the siever appends. */
-    remove(outfile);
-
-    char syscmd[1280];
-    snprintf(syscmd, sizeof(syscmd),
-        "%s -f %u -c %u -o %s -n 0 %s -%c %s",
-        siever_path, startq, qrange, outfile,
-        extra_args ? extra_args : "",
-        side, job_infile);
-
     sigset_t block;
     sigset_t oldmask;
     sigemptyset(&block);
@@ -131,4 +119,87 @@ int sieve_run_local(const char *siever_path,
     pthread_sigmask(SIG_SETMASK, &oldmask, NULL);
 
     return wait_child_cancelable(pid, should_cancel, cancel_ctx);
+}
+
+int sieve_run_local(const char *siever_path,
+                    const char *job_infile,
+                    const char *outfile,
+                    uint32_t startq,
+                    uint32_t qrange,
+                    char side,
+                    const char *extra_args,
+                    sieve_cancel_fn should_cancel,
+                    void *cancel_ctx)
+{
+    /* Discard any prior relation file at this path; the siever appends. */
+    remove(outfile);
+
+    char syscmd[1280];
+    snprintf(syscmd, sizeof(syscmd),
+        "%s -f %u -c %u -o %s -n 0 %s -%c %s",
+        siever_path, startq, qrange, outfile,
+        extra_args ? extra_args : "",
+        side, job_infile);
+
+    return run_child_cancelable(syscmd, should_cancel, cancel_ctx);
+}
+
+int sieve_run_cuda(const char *bench_path,
+                   const char *job_infile,
+                   const char *outfile,
+                   uint32_t startq,
+                   uint32_t qrange,
+                   char side,
+                   const char *extra_args,
+                   const char *fb1_path,
+                   int device,
+                   sieve_cancel_fn should_cancel,
+                   void *cancel_ctx)
+{
+    if (qrange == 0) return -1;
+
+    /* Clear the finished-band marker and both staging artifacts. --restart
+     * tells bench to discard them too, but doing it here as well means a
+     * failed run can never leave a stale `outfile` that the caller would read
+     * as "band completed". */
+    remove(outfile);
+    {
+        char part[1152];
+        snprintf(part, sizeof(part), "%s.part", outfile);
+        remove(part);
+        snprintf(part, sizeof(part), "%s.part.ckpt", outfile);
+        remove(part);
+    }
+
+    /* THE off-by-one. A workunit is the half-open [startq, startq+qrange);
+     * cuda-sieve's --qrange MIN:MAX is INCLUSIVE of MAX (sqgen_create in
+     * bench/fbgen.c, pinned by the inclusive_single_prime case in
+     * bench/sqgentest.c). Passing startq+qrange would sieve one q past the
+     * band whenever that value is prime, and the server's verifier rejects
+     * the whole file for it (verify.c relation_has_q_in_range) — which
+     * requeues the workunit and eventually poisons it. qrange == 0 is
+     * rejected above so this cannot underflow. */
+    unsigned long qmax_inclusive = (unsigned long)startq + qrange - 1;
+
+    /* cuda-sieve numbers sides: 1 = algebraic, 0 = rational. */
+    int sq_side = (side == 'a') ? 1 : 0;
+
+    char fb1[600] = "";
+    if (fb1_path && *fb1_path)
+        snprintf(fb1, sizeof(fb1), " --fb1 %s", fb1_path);
+
+    char dev[32] = "";
+    if (device >= 0)
+        snprintf(dev, sizeof(dev), " --device %d", device);
+
+    char syscmd[2048];
+    snprintf(syscmd, sizeof(syscmd),
+        "%s --pipeline --cofactor --poly %s --sq-side %d "
+        "--qrange %lu:%lu --relations %s --restart%s%s %s",
+        bench_path, job_infile, sq_side,
+        (unsigned long)startq, qmax_inclusive, outfile,
+        fb1, dev,
+        extra_args ? extra_args : "");
+
+    return run_child_cancelable(syscmd, should_cancel, cancel_ctx);
 }

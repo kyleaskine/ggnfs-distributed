@@ -178,6 +178,16 @@ static int parse_int64_arg(const char *s, int64_t *out)
 
 /* Pull "--key=value" from argv; returns the value or NULL.
  * If key matches but no '=', returns "" so caller can detect bare flag. */
+/* True if `key` appears with no '=' at all (e.g. `--gpu-args` instead of
+ * `--gpu-args="..."`). flag() reports that as an empty value, which for a
+ * job-wide setting means "clear it" — almost never what was meant. */
+static int flag_is_bare(int argc, char **argv, const char *key)
+{
+    for (int i = 1; i < argc; i++)
+        if (strcmp(argv[i], key) == 0) return 1;
+    return 0;
+}
+
 static const char *flag(int argc, char **argv, const char *key)
 {
     size_t klen = strlen(key);
@@ -192,6 +202,19 @@ static const char *flag(int argc, char **argv, const char *key)
 
 /* ===================== init subcommand ================================== */
 
+/* Workunit classes. "cpu" is a gnfs-lasieve4-sized q_range; "gpu" is the much
+ * wider band a card can chew through (see GPU-CLIENT.md for the sizing).
+ * Validated at init/extend so a typo produces an empty pool at lease time
+ * rather than a silently unclaimable band. */
+static const char *const WU_CLASSES[] = { "cpu", "gpu", NULL };
+
+static int class_is_valid(const char *c)
+{
+    for (int i = 0; WU_CLASSES[i]; i++)
+        if (strcmp(c, WU_CLASSES[i]) == 0) return 1;
+    return 0;
+}
+
 static void usage_init(void)
 {
     fprintf(stderr,
@@ -202,7 +225,11 @@ static void usage_init(void)
         "    --qmax=<int>            (required) end (exclusive)\n"
         "    --qrange=<int>          (required) per-workunit range size\n"
         "    [--side=a|r]            default a\n"
+        "    [--class=cpu|gpu]       default cpu; sizes this band for CPU or GPU clients\n"
         "    [--siever-args=<flags>] extra args appended to the siever command, e.g. \"-J 16\"\n"
+        "    [--gpu-args=<flags>]    geometry/tuning flags for cuda-sieve clients, e.g.\n"
+        "                            \"--logI 17 --J 16384\". Not a translation of\n"
+        "                            --siever-args; the two describe different sieve areas\n"
         "    [--lease-order=asc|desc] default asc; 'desc' hands out highest-q workunits\n"
         "                            first (useful when another sieve is working upward\n"
         "                            from a higher q and you want to close the gap from\n"
@@ -218,7 +245,15 @@ static int cmd_init(int argc, char **argv)
     const char *qmax_s      = flag(argc, argv, "--qmax");
     const char *qrange_s    = flag(argc, argv, "--qrange");
     const char *side_s      = flag(argc, argv, "--side");
+    const char *class_s     = flag(argc, argv, "--class");
     const char *siever_args = flag(argc, argv, "--siever-args");
+    const char *gpu_args    = flag(argc, argv, "--gpu-args");
+    if (flag_is_bare(argc, argv, "--gpu-args")) {
+        fprintf(stderr, "init: --gpu-args needs a value, e.g. "
+                        "--gpu-args=\"--logI 17 --J 16384\"\n"
+                        "  (to deliberately clear it, pass --gpu-args=)\n");
+        return 2;
+    }
     const char *lease_order = flag(argc, argv, "--lease-order");
     const char *jobdir      = flag(argc, argv, "--jobdir");
 
@@ -246,6 +281,11 @@ static int cmd_init(int argc, char **argv)
             return 2;
         }
         side = side_s[0];
+    }
+    const char *class_norm = (class_s && *class_s) ? class_s : "cpu";
+    if (!class_is_valid(class_norm)) {
+        fprintf(stderr, "init: --class must be 'cpu' or 'gpu'\n");
+        return 2;
     }
     const char *lease_order_norm = "asc";
     if (lease_order && *lease_order) {
@@ -337,7 +377,7 @@ static int cmd_init(int argc, char **argv)
         int64_t this_range = (q + qrange <= qmax) ? qrange : (qmax - q);
         char id[64];
         snprintf(id, sizeof(id), "wu-%s-%06lld", job_id, (long long)seq);
-        if (db_workunit_insert(db, id, q, this_range, side, now) != 0) {
+        if (db_workunit_insert(db, id, q, this_range, side, class_norm, now) != 0) {
             fprintf(stderr, "init: db_workunit_insert failed at seq=%lld\n", (long long)seq);
             db_close(db);
             free(files_dir); free(rels_dir); free(dst_path); free(db_path);
@@ -387,7 +427,17 @@ static int cmd_init(int argc, char **argv)
     }
     db_meta_set(db, "job_sha256",  job_sha);
     db_meta_set(db, "siever_args", siever_args ? siever_args : "");
+    db_meta_set(db, "gpu_args",    gpu_args    ? gpu_args    : "");
     db_meta_set(db, "lease_order", lease_order_norm);
+    {
+        /* The CPU-sized q_range this job was laid out with. The verifier
+         * scales its norm spot-check sample size against it, so a 100x GPU
+         * workunit gets proportionally more samples rather than the same 50
+         * spread over 100x the relations. */
+        char buf[32];
+        snprintf(buf, sizeof(buf), "%lld", (long long)qrange);
+        db_meta_set(db, "base_q_range", buf);
+    }
 
     db_close(db);
 
@@ -395,8 +445,8 @@ static int cmd_init(int argc, char **argv)
     printf("  jobdir   : %s\n", jobdir);
     printf("  job.db   : %s\n", db_path);
     printf("  job file : %s  (sha=%s, %lld bytes)\n", dst_path, job_sha, (long long)dst_bytes);
-    printf("  workunits: %lld   (q_range=%lld, side=%c, siever=%s, lease_order=%s)\n",
-           (long long)seq, (long long)qrange, side, siever, lease_order_norm);
+    printf("  workunits: %lld   (q_range=%lld, class=%s, side=%c, siever=%s, lease_order=%s)\n",
+           (long long)seq, (long long)qrange, class_norm, side, siever, lease_order_norm);
     printf("  token    : written to %s (chmod 600)\n", token_path);
     printf("\nNext: ggnfs-sieve-server serve --jobdir=%s\n", jobdir);
 
@@ -415,6 +465,11 @@ static void usage_extend(void)
         "    --qmax=<int>            (required) end (exclusive); [qmin, qmax) must not\n"
         "                            overlap any existing workunit\n"
         "    --qrange=<int>          (required) per-workunit range size\n"
+        "    [--class=cpu|gpu]       default cpu; 'gpu' carves a band sized for GPU\n"
+        "                            clients, which only they will be handed\n"
+        "    [--gpu-args=<flags>]    set/replace the job-wide cuda-sieve flags, e.g.\n"
+        "                            \"--logI 17 --J 16384\"; usually given alongside\n"
+        "                            the first --class=gpu extend. Omit to leave as-is\n"
         "\nAdds workunits to an existing job. The new range can sit above, below, or\n"
         "in a gap between existing workunits — any non-overlapping placement is OK.\n"
         "Token, .job file, siever, and side are inherited from init. Sequence\n"
@@ -428,9 +483,22 @@ static int cmd_extend(int argc, char **argv)
     const char *qmin_s   = flag(argc, argv, "--qmin");
     const char *qmax_s   = flag(argc, argv, "--qmax");
     const char *qrange_s = flag(argc, argv, "--qrange");
+    const char *class_s  = flag(argc, argv, "--class");
+    const char *gpu_args = flag(argc, argv, "--gpu-args");
+    if (flag_is_bare(argc, argv, "--gpu-args")) {
+        fprintf(stderr, "extend: --gpu-args needs a value, e.g. "
+                        "--gpu-args=\"--logI 17 --J 16384\"\n"
+                        "  (to deliberately clear it, pass --gpu-args=)\n");
+        return 2;
+    }
 
     if (!jobdir || !qmin_s || !qmax_s || !qrange_s) {
         usage_extend();
+        return 2;
+    }
+    const char *class_norm = (class_s && *class_s) ? class_s : "cpu";
+    if (!class_is_valid(class_norm)) {
+        fprintf(stderr, "extend: --class must be 'cpu' or 'gpu'\n");
         return 2;
     }
 
@@ -511,7 +579,7 @@ static int cmd_extend(int argc, char **argv)
         int64_t this_range = (q + qrange <= qmax) ? qrange : (qmax - q);
         char id[64];
         snprintf(id, sizeof(id), "wu-%s-%06lld", job_id, (long long)seq);
-        if (db_workunit_insert(db, id, q, this_range, side, now) != 0) {
+        if (db_workunit_insert(db, id, q, this_range, side, class_norm, now) != 0) {
             fprintf(stderr, "extend: db_workunit_insert failed at seq=%lld\n",
                     (long long)seq);
             db_close(db); free(db_path); return 1;
@@ -520,11 +588,26 @@ static int cmd_extend(int argc, char **argv)
         added++;
     }
 
+    /* Job-wide, like siever_args — not per-band. Setting it here is the
+     * ergonomic path: you learn the right geometry when you add the GPU band,
+     * not at init time. Must happen before db_close. */
+    if (gpu_args) db_meta_set(db, "gpu_args", gpu_args);
+
     db_close(db);
 
     printf("ggnfs-sieve-server: extended job %s\n", job_id);
-    printf("  new workunits : %lld   (q_range=%lld, side=%c)\n",
-           (long long)added, (long long)qrange, side);
+    if (gpu_args) {
+        printf("  gpu_args      : %s\n", *gpu_args ? gpu_args : "(cleared)");
+        /* serve reads meta once at startup, so a running coordinator keeps
+         * handing out the OLD gpu_args while happily leasing the new band —
+         * every cuda client would then sieve it with the wrong geometry.
+         * New workunits go live immediately; this value does not. */
+        printf("\n  NOTE: restart `serve` for the new gpu_args to reach clients.\n"
+               "        Until then the new workunits are leasable but carry the\n"
+               "        previously loaded gpu_args.\n");
+    }
+    printf("  new workunits : %lld   (q_range=%lld, class=%s, side=%c)\n",
+           (long long)added, (long long)qrange, class_norm, side);
     printf("  q range added : [%lld, %lld)\n",
            (long long)qmin, (long long)(qmin + added * qrange));
     printf("  total workunits now: %lld\n", (long long)(existing_count + added));
@@ -540,6 +623,7 @@ typedef struct {
     char        job_id[16];
     char        siever[64];         /* required siever binary name */
     char        siever_args[128];   /* extra flags shipped to clients (may be "") */
+    char        gpu_args[192];      /* cuda-sieve flags shipped to clients (may be "") */
     char        side;
     char        job_sha256[65];
     char       *jobdir;
@@ -623,11 +707,19 @@ static void handle_lease(struct mg_connection *c, struct mg_http_message *hm,
 
     char client_id[64] = {0};
     char client_ver[32] = {0};
+    char class_want[16] = {0};
     proto_decode_lease_request(hm->body.buf, hm->body.len,
                                client_id, sizeof(client_id),
-                               client_ver, sizeof(client_ver));
+                               client_ver, sizeof(client_ver),
+                               class_want, sizeof(class_want));
     if (client_id[0] == '\0') {
         send_text(c, 400, "missing client_id\n");
+        return;
+    }
+    /* Pre-class clients send no "class" at all, and they are all CPU. */
+    if (class_want[0] == '\0') snprintf(class_want, sizeof(class_want), "cpu");
+    if (!class_is_valid(class_want)) {
+        send_text(c, 400, "unknown class\n");
         return;
     }
 
@@ -635,7 +727,7 @@ static void handle_lease(struct mg_connection *c, struct mg_http_message *hm,
 
     db_lease_result_t r;
     int rc = db_lease(ctx->db, client_id, ctx->lease_seconds, now_unix(),
-                      ctx->lease_desc, &r);
+                      ctx->lease_desc, class_want, &r);
     if (rc == 1) {
         /* No work right now. Job is still running. */
         mg_http_reply(c, 204, "", "");
@@ -657,6 +749,7 @@ static void handle_lease(struct mg_connection *c, struct mg_http_message *hm,
         .siever           = ctx->siever,
         .command_template = COMMAND_TEMPLATE_DEFAULT,
         .siever_args      = ctx->siever_args,
+        .gpu_args         = ctx->gpu_args,
         .file_name        = "job.txt",
         .file_sha256_hex  = ctx->job_sha256,
         .file_url         = file_url,
@@ -882,6 +975,49 @@ static void handle_submit(struct mg_connection *c, struct mg_http_message *hm,
     send_json_take(c, 200, proto_encode_submit_response(1, "pending", num_relations));
 }
 
+/* ---- /renew ---- */
+/*
+ * Lease heartbeat. A client sieving a wide GPU-class band would otherwise
+ * have to be covered by a --lease-seconds long enough for the slowest
+ * workunit on the slowest box, which is also how long a *dead* client's work
+ * sits unreclaimed. Heartbeating decouples the two: hold the band as long as
+ * you keep talking, lose it within lease_seconds if you stop.
+ *
+ * Shares the {workunit_id, client_id} request shape with /release.
+ */
+static void handle_renew(struct mg_connection *c, struct mg_http_message *hm,
+                         server_ctx_t *ctx)
+{
+    if (!check_auth(c, hm, ctx->token)) return;
+
+    char workunit_id[64], client_id[64];
+    if (proto_decode_release_request(hm->body.buf, hm->body.len,
+                                     workunit_id, sizeof(workunit_id),
+                                     client_id,   sizeof(client_id)) != 0 ||
+        workunit_id[0] == '\0' || client_id[0] == '\0') {
+        send_text(c, 400, "missing workunit_id / client_id\n");
+        return;
+    }
+    if (!workunit_id_is_safe_for_job(workunit_id, ctx->job_id)) {
+        send_text(c, 400, "invalid workunit_id\n");
+        return;
+    }
+
+    db_clients_seen(ctx->db, client_id, now_unix());
+    int rc = db_renew_lease(ctx->db, workunit_id, client_id,
+                            ctx->lease_seconds, now_unix());
+    if (rc == 0) {
+        send_json_take(c, 200,
+                       proto_encode_renew_response(1, ctx->lease_seconds));
+    } else if (rc == 1) {
+        /* Either never leased to this client, or the lease already lapsed and
+         * the sweep took it back. Both mean: stop working on it. */
+        send_text(c, 409, "no live lease for client\n");
+    } else {
+        send_text(c, 500, "internal error\n");
+    }
+}
+
 /* ---- /release ---- */
 
 static void handle_release(struct mg_connection *c, struct mg_http_message *hm,
@@ -925,6 +1061,7 @@ static char *format_stats_json(server_ctx_t *ctx, const db_stats_t *s,
     cJSON_AddStringToObject (root, "siever",         ctx->siever);
     cJSON_AddStringToObject (root, "job_sha256",     ctx->job_sha256);
     cJSON_AddStringToObject (root, "siever_args",    ctx->siever_args);
+    cJSON_AddStringToObject (root, "gpu_args",       ctx->gpu_args);
     { char sb[2] = { ctx->side, 0 };
       cJSON_AddStringToObject(root, "side",          sb); }
     cJSON_AddNumberToObject (root, "now_unix",       (double)now);
@@ -944,6 +1081,26 @@ static char *format_stats_json(server_ctx_t *ctx, const db_stats_t *s,
     cJSON_AddNumberToObject(wu, "poisoned",  (double)s->wu.poisoned);
     cJSON_AddNumberToObject(wu, "q_min",     (double)s->q_min);
     cJSON_AddNumberToObject(wu, "q_max",     (double)s->q_max);
+    /* Size-weighted progress. With a GPU band ~100x wider than a CPU one,
+     * "workunits done / total" is not progress; these are. */
+    cJSON_AddNumberToObject(wu, "q_total",       (double)s->q_total);
+    cJSON_AddNumberToObject(wu, "q_verified",    (double)s->q_verified);
+    cJSON_AddNumberToObject(wu, "q_verified_1h", (double)s->q_verified_1h);
+
+    cJSON *cls = cJSON_AddArrayToObject(root, "classes");
+    for (int i = 0; i < s->class_count; i++) {
+        const db_stats_class_t *cc = &s->classes[i];
+        cJSON *o = cJSON_CreateObject();
+        if (!o) continue;
+        cJSON_AddStringToObject(o, "name",       cc->name);
+        cJSON_AddNumberToObject(o, "total",      (double)cc->total);
+        cJSON_AddNumberToObject(o, "available",  (double)cc->available);
+        cJSON_AddNumberToObject(o, "leased",     (double)cc->leased);
+        cJSON_AddNumberToObject(o, "verified",   (double)cc->verified);
+        cJSON_AddNumberToObject(o, "q_total",    (double)cc->q_total);
+        cJSON_AddNumberToObject(o, "q_verified", (double)cc->q_verified);
+        cJSON_AddItemToArray(cls, o);
+    }
 
     cJSON *sub = cJSON_AddObjectToObject(root, "submissions");
     cJSON_AddNumberToObject(sub, "total",              (double)s->sub_total);
@@ -1067,6 +1224,8 @@ static void ev_handler(struct mg_connection *c, int ev, void *ev_data)
         handle_file(c, hm, ctx);
     } else if (uri_eq(hm, "/submit") && method_is(hm, "POST")) {
         handle_submit(c, hm, ctx);
+    } else if (uri_eq(hm, "/renew") && method_is(hm, "POST")) {
+        handle_renew(c, hm, ctx);
     } else if (uri_eq(hm, "/release") && method_is(hm, "POST")) {
         handle_release(c, hm, ctx);
     } else if (uri_eq(hm, "/health") && method_is(hm, "GET")) {
@@ -1213,6 +1372,14 @@ static int cmd_serve(int argc, char **argv)
                  m_args ? m_args : "");
         free(m_args);
     }
+    /* gpu_args likewise — absent on any jobdir initialized before the cuda
+     * engine, where "" is the right answer since it has no GPU band either. */
+    {
+        char *m_gargs = db_meta_get(ctx.db, "gpu_args");
+        snprintf(ctx.gpu_args, sizeof(ctx.gpu_args), "%s",
+                 m_gargs ? m_gargs : "");
+        free(m_gargs);
+    }
 
     /* lease_order is optional; absence (or unrecognized value) means ascending,
      * which preserves the historical behavior for jobs initialized before this
@@ -1280,6 +1447,7 @@ static int cmd_serve(int argc, char **argv)
         "  jobdir       : %s\n"
         "  siever       : %s   side=%c   lease=%llds\n"
         "  siever_args  : %s\n"
+        "  gpu_args     : %s\n"
         "  lease_order  : %s\n"
         "  sweep        : every %llds   max_attempts=%lld\n"
         "  job .job sha : %s\n"
@@ -1288,6 +1456,7 @@ static int cmd_serve(int argc, char **argv)
         ctx.job_id, listen_url, ctx.jobdir, ctx.siever, ctx.side,
         (long long)ctx.lease_seconds,
         ctx.siever_args[0] ? ctx.siever_args : "(none)",
+        ctx.gpu_args[0]    ? ctx.gpu_args    : "(none)",
         ctx.lease_desc ? "desc (highest q first)" : "asc (lowest q first)",
         (long long)sweep_seconds, (long long)ctx.max_attempts,
         ctx.job_sha256, ctx.token,

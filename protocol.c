@@ -31,6 +31,7 @@ char *proto_encode_lease_response(const proto_lease_response_args *a)
     cJSON_AddStringToObject(root, "siever",           a->siever);
     cJSON_AddStringToObject(root, "command_template", a->command_template);
     cJSON_AddStringToObject(root, "siever_args",      a->siever_args ? a->siever_args : "");
+    cJSON_AddStringToObject(root, "gpu_args",         a->gpu_args    ? a->gpu_args    : "");
 
     cJSON_AddStringToObject(file0, "name",   a->file_name);
     cJSON_AddStringToObject(file0, "sha256", a->file_sha256_hex);
@@ -67,22 +68,28 @@ static void copy_str_field(cJSON *root, const char *name,
 
 int proto_decode_lease_request(const char *body, size_t body_len,
                                char *client_id_buf,      size_t client_id_buf_n,
-                               char *client_version_buf, size_t client_version_buf_n)
+                               char *client_version_buf, size_t client_version_buf_n,
+                               char *class_buf,          size_t class_buf_n)
 {
     cJSON *root = cJSON_ParseWithLength(body, body_len);
     if (!root) return -1;
     copy_str_field(root, "client_id",      client_id_buf,      client_id_buf_n);
     copy_str_field(root, "client_version", client_version_buf, client_version_buf_n);
+    /* Absent on clients built before workunit classes existed; the caller
+     * treats an empty class as "cpu", which is what those clients are. */
+    copy_str_field(root, "class",          class_buf,          class_buf_n);
     cJSON_Delete(root);
     return 0;
 }
 
-char *proto_encode_lease_request(const char *client_id, const char *client_version)
+char *proto_encode_lease_request(const char *client_id, const char *client_version,
+                                 const char *class)
 {
     cJSON *root = cJSON_CreateObject();
     if (!root) return NULL;
     cJSON_AddStringToObject(root, "client_id",      client_id      ? client_id      : "");
     cJSON_AddStringToObject(root, "client_version", client_version ? client_version : "");
+    cJSON_AddStringToObject(root, "class",          class          ? class          : "cpu");
     char *s = json_to_alloced(root);
     cJSON_Delete(root);
     return s;
@@ -119,6 +126,10 @@ int proto_decode_lease_response(const char *body, size_t body_len,
     copy_str_field_into(root, "siever",           out->siever,           sizeof(out->siever));
     copy_str_field_into(root, "command_template", out->command_template, sizeof(out->command_template));
     copy_str_field_into(root, "siever_args",      out->siever_args,      sizeof(out->siever_args));
+    /* Absent from servers predating the cuda engine; stays "" there, which is
+     * exactly what a lasieve4 client wants anyway. Not a required field, so
+     * its absence must not fail the decode. */
+    copy_str_field_into(root, "gpu_args",         out->gpu_args,         sizeof(out->gpu_args));
 
     out->q_start       = copy_int_field(root, "q_start",       0);
     out->q_range       = copy_int_field(root, "q_range",       0);
@@ -168,6 +179,21 @@ char *proto_encode_submit_response(int accepted,
     cJSON_AddBoolToObject  (root, "accepted",      accepted ? 1 : 0);
     cJSON_AddStringToObject(root, "verified",      verified_status ? verified_status : "skipped");
     cJSON_AddNumberToObject(root, "num_relations", (double)num_relations);
+    char *s = json_to_alloced(root);
+    cJSON_Delete(root);
+    return s;
+}
+
+/* /renew has its own encoder rather than borrowing the submit one: the value
+ * a client needs back is the lease window, and calling that "num_relations"
+ * in the wire format would be actively misleading. */
+char *proto_encode_renew_response(int accepted, int64_t lease_seconds)
+{
+    cJSON *root = cJSON_CreateObject();
+    if (!root) return NULL;
+    cJSON_AddBoolToObject  (root, "accepted",      accepted ? 1 : 0);
+    cJSON_AddStringToObject(root, "status",        accepted ? "renewed" : "declined");
+    cJSON_AddNumberToObject(root, "lease_seconds", (double)lease_seconds);
     char *s = json_to_alloced(root);
     cJSON_Delete(root);
     return s;

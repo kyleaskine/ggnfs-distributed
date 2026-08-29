@@ -20,6 +20,7 @@ typedef struct {
     const char *siever;           /* required gnfs-lasieve4* binary name */
     const char *command_template; /* "{siever} -f {q_start} -c ..." */
     const char *siever_args;      /* extra flags appended to the siever command (may be "") */
+    const char *gpu_args;         /* cuda-sieve geometry/tuning flags (may be "") */
     /* Single-file MVP: one .job file shipped per workunit. */
     const char *file_name;
     const char *file_sha256_hex;
@@ -30,12 +31,21 @@ typedef struct {
 
 char *proto_encode_lease_response(const proto_lease_response_args *a);
 
-/* Decode {"client_id": "...", "client_version": "..."}.
- * Each output buffer may be NULL to ignore that field.
+/* The lease response carries BOTH engines' argument strings; the client picks
+ * by its own --engine rather than the server deciding what it can run.
+ * siever_args is gnfs-lasieve4 vocabulary ("-J 16") and gpu_args is
+ * cuda-sieve's ("--logI 17 --J 16384"); they are not translations of each
+ * other and describe different sieve areas. Either may be "".
+ */
+
+/* Decode {"client_id": "...", "client_version": "...", "class": "..."}.
+ * Each output buffer may be NULL to ignore that field. "class" is absent on
+ * pre-class clients and comes back empty, which callers read as "cpu".
  * Returns 0 on success, -1 on parse error. */
 int proto_decode_lease_request(const char *body, size_t body_len,
                                char *client_id_buf,      size_t client_id_buf_n,
-                               char *client_version_buf, size_t client_version_buf_n);
+                               char *client_version_buf, size_t client_version_buf_n,
+                               char *class_buf,          size_t class_buf_n);
 
 /* Client-side: decode a /lease success response (the JSON the server's
  * encoder above produces). MVP supports exactly one entry in `files`. */
@@ -48,6 +58,7 @@ typedef struct {
     char    siever[64];
     char    command_template[256];
     char    siever_args[128];
+    char    gpu_args[192];
     char    file_name[64];
     char    file_sha256_hex[65];
     char    file_url[160];
@@ -58,14 +69,22 @@ typedef struct {
 int proto_decode_lease_response(const char *body, size_t body_len,
                                 proto_lease_response_t *out);
 
-/* Build the JSON request body for POST /lease. Caller free()s. */
-char *proto_encode_lease_request(const char *client_id, const char *client_version);
+/* Build the JSON request body for POST /lease. Caller free()s.
+ * `class` is the workunit class this client wants ("cpu" / "gpu"); NULL
+ * means "cpu". */
+char *proto_encode_lease_request(const char *client_id, const char *client_version,
+                                 const char *class);
 
 /* ---- /submit ---- */
 
 char *proto_encode_submit_response(int accepted,
                                    const char *verified_status,
                                    int64_t num_relations);
+
+/* ---- /renew ---- */
+/* Request body is the same {workunit_id, client_id} shape as /release, so the
+ * release encoder/decoder below is reused for it. */
+char *proto_encode_renew_response(int accepted, int64_t lease_seconds);
 
 /* ---- /release ---- */
 

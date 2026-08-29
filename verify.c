@@ -988,7 +988,24 @@ struct verify_thread_s {
     char           *db_path;       /* malloc'd */
     int64_t         max_attempts;
     int             spotcheck_k;   /* 0 disables norm spot-check */
+    int64_t         base_q_range;  /* meta.base_q_range; 0 = unknown, no scaling */
 };
+
+/* A GPU-class workunit covers ~100x the q-width of a CPU-class one and yields
+ * proportionally more relations, so a fixed K would sample it ~100x more
+ * thinly. Scale K by q_range / base_q_range so sample *density* is what stays
+ * constant, and cap the multiplier so a pathological q_range can't ask for an
+ * unbounded reservoir. */
+#define SPOTCHECK_MAX_SCALE 32
+
+static int spotcheck_k_for(int base_k, int64_t base_q_range, int64_t q_range)
+{
+    if (base_k <= 0) return 0;
+    if (base_q_range <= 0 || q_range <= base_q_range) return base_k;
+    int64_t scale = q_range / base_q_range;
+    if (scale > SPOTCHECK_MAX_SCALE) scale = SPOTCHECK_MAX_SCALE;
+    return (int)(base_k * scale);
+}
 
 /* Drain every pending submission; returns when the queue is empty (or on
  * a DB error after logging it). `poly` may be NULL — in that case the norm
@@ -996,17 +1013,13 @@ struct verify_thread_s {
 static void drain_pending(verify_thread_t *vt, ggnfs_db_t *db,
                           const verify_poly_gmp_t *poly)
 {
-    /* Reservoir buffer reused across submissions; allocated lazily so K=0
-     * users pay nothing. */
-    verify_relation_t *resbuf = NULL;
-    int                rescap = (poly && vt->spotcheck_k > 0) ? vt->spotcheck_k : 0;
-    if (rescap > 0) {
-        resbuf = malloc((size_t)rescap * sizeof(*resbuf));
-        if (!resbuf) {
-            fprintf(stderr, "verify: reservoir malloc failed; spot-check disabled\n");
-            rescap = 0;
-        }
-    }
+    /* Reservoir buffer reused across submissions, grown on demand: a job with
+     * only CPU-class workunits never allocates more than K entries, while a
+     * GPU-class one grows once and then reuses. `resalloc` is what is
+     * allocated; `rescap` is what this submission actually wants. */
+    verify_relation_t *resbuf   = NULL;
+    int                resalloc = 0;
+    const int          spot_on  = (poly && vt->spotcheck_k > 0);
 
     for (;;) {
         db_pending_t p;
@@ -1030,6 +1043,24 @@ static void drain_pending(verify_thread_t *vt, ggnfs_db_t *db,
             .q_range = p.q_range,
             .side    = p.side,
         };
+        int rescap = spot_on ? spotcheck_k_for(vt->spotcheck_k,
+                                               vt->base_q_range, p.q_range)
+                             : 0;
+        if (rescap > resalloc) {
+            verify_relation_t *nb = realloc(resbuf,
+                                            (size_t)rescap * sizeof(*resbuf));
+            if (!nb) {
+                /* Keep whatever we already have and sample at that size
+                 * rather than dropping the spot-check entirely. */
+                fprintf(stderr, "verify: reservoir realloc to %d failed; "
+                                "sampling %d\n", rescap, resalloc);
+                rescap = resalloc;
+            } else {
+                resbuf   = nb;
+                resalloc = rescap;
+            }
+        }
+
         verify_reservoir_t reservoir = {
             .buf  = resbuf,
             .cap  = rescap,
@@ -1126,8 +1157,21 @@ static void *verify_thread_run(void *arg)
             if (!poly) {
                 fprintf(stderr, "verify: poly_load failed — spot-check disabled\n");
             } else {
-                fprintf(stderr, "verify: spot-check enabled (k=%d, poly degree %d)\n",
-                        vt->spotcheck_k, poly->degree);
+                char *m_base = db_meta_get(db, "base_q_range");
+                vt->base_q_range = m_base ? strtoll(m_base, NULL, 10) : 0;
+                free(m_base);
+                if (vt->base_q_range > 0) {
+                    fprintf(stderr, "verify: spot-check enabled (k=%d at "
+                            "q_range=%lld, scaling to %dx, poly degree %d)\n",
+                            vt->spotcheck_k, (long long)vt->base_q_range,
+                            SPOTCHECK_MAX_SCALE, poly->degree);
+                } else {
+                    /* Pre-base_q_range jobdir: every workunit gets the flat K,
+                     * which is exactly the old behaviour. */
+                    fprintf(stderr, "verify: spot-check enabled (k=%d flat — "
+                            "meta has no base_q_range, poly degree %d)\n",
+                            vt->spotcheck_k, poly->degree);
+                }
             }
         } else {
             fprintf(stderr, "verify: meta has no poly — spot-check disabled\n");

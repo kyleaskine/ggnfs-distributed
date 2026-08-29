@@ -62,6 +62,13 @@
 #endif
 
 #define CLIENT_MAX_WORKERS 256
+
+enum { ENGINE_LASIEVE4 = 0, ENGINE_CUDA = 1 };
+
+static const char *engine_name(int e)
+{
+    return e == ENGINE_CUDA ? "cuda" : "lasieve4";
+}
 #define SUBMIT_ZSTD_LEVEL 1
 
 #define CLIENT_VERSION "0.2.0"
@@ -120,10 +127,63 @@ static void on_signal(int sig)
     }
 }
 
+typedef struct client_cfg_s client_cfg_t;
+static int64_t monotonic_ms(void);
+static int do_renew(struct mg_mgr *mgr, const client_cfg_t *cfg,
+                    const char *workunit_id);
+
+/* Passed to sieve_run_local as the cancellation context. wait_child_cancelable
+ * polls that callback about every 100 ms while the siever runs, which is also
+ * the only place a worker is awake during a long sieve — so it is where the
+ * lease heartbeat belongs. */
+typedef struct {
+    struct mg_mgr      *mgr;
+    const client_cfg_t *cfg;
+    const char         *workunit_id;
+    int64_t             next_renew_ms;   /* 0 = heartbeat disabled */
+    int64_t             interval_ms;     /* cadence, from the lease window */
+    int                 lease_lost;      /* set if the server 409'd us */
+} sieve_ctx_t;
+
 static int should_cancel_siever(void *ctx)
 {
-    (void)ctx;
-    return shutdown_phase() >= SHUTDOWN_CANCELLING;
+    if (shutdown_phase() >= SHUTDOWN_CANCELLING) return 1;
+
+    sieve_ctx_t *sc = (sieve_ctx_t *)ctx;
+    if (!sc || sc->next_renew_ms == 0) return 0;
+    if (sc->lease_lost) return 1;         /* decided below; abort promptly */
+
+    /* Don't start an HTTP round trip we are about to abandon: during drain the
+     * next Ctrl-C should reach the siever in ~100 ms, not after a renew. */
+    if (shutdown_phase() >= SHUTDOWN_DRAINING) return 0;
+
+    int64_t now = monotonic_ms();
+    if (now < sc->next_renew_ms) return 0;
+
+    int r = do_renew(sc->mgr, sc->cfg, sc->workunit_id);
+    if (r == 1) {
+        /* Positive knowledge that the workunit was reclaimed and reissued.
+         * Every further second of sieving is waste and the submit is
+         * guaranteed to 409, so stop now — on a gpu-class band that can save
+         * hours. The caller checks lease_lost to skip the submit. */
+        fprintf(stderr, "client: %s was reclaimed by the server (lease "
+                        "expired); abandoning it\n", sc->workunit_id);
+        sc->lease_lost = 1;
+        sc->next_renew_ms = 0;
+        return 1;
+    }
+    if (r == 2) {
+        /* Server predates /renew. The lease is fine — we just cannot extend
+         * it, exactly as before this feature existed. Keep sieving. */
+        fprintf(stderr, "client: server has no /renew; lease heartbeat "
+                        "disabled (workunit %s)\n", sc->workunit_id);
+        sc->next_renew_ms = 0;
+        return 0;
+    }
+    /* On a transient failure retry at the normal cadence rather than
+     * hammering a server that is already unhappy. */
+    sc->next_renew_ms = now + sc->interval_ms;
+    return 0;
 }
 
 /* ===================== misc helpers ===================================== */
@@ -490,7 +550,7 @@ static void http_io_free(http_io_t *io)
 
 /* ===================== top-level config ================================= */
 
-typedef struct {
+typedef struct client_cfg_s {
     char        server_url[256];
     char        token[80];
     char        client_id[64];
@@ -502,6 +562,17 @@ typedef struct {
     int         workers;
     int         http_concurrency;
     int         once;
+    /* Workunit class to request from /lease. "cpu" (default) takes
+     * lasieve4-sized bands; "gpu" prefers the wide bands carved by
+     * `extend --class=gpu` and falls back to cpu ones when they run out. */
+    char        lease_class[16];
+    /* Which siever binary this client drives. The workunit's class sizes the
+     * band; the engine decides what runs it. They are independent: a cuda
+     * client that falls back to a cpu-class workunit still runs cuda. */
+    int         engine;                 /* ENGINE_LASIEVE4 | ENGINE_CUDA */
+    char        cuda_bench[256];        /* cuda-sieve `bench` binary */
+    char        fb1_path[256];          /* optional --fb1 cache; "" = none */
+    int         cuda_device;            /* -1 = let bench choose */
 
     /* --cpu-pin parsed list. cpu_pin_count == 0 disables pinning. */
     int         cpu_pin_count;
@@ -514,10 +585,19 @@ static void usage(void)
         "usage: ggnfs-sieve-client \\\n"
         "    --server-url=http://host:port  (required)\n"
         "    --token=<bearer token>         (required)\n"
-        "    --siever=<path>                (required) gnfs-lasieve4* binary\n"
+        "    --siever=<path>                gnfs-lasieve4* binary (required unless\n"
+        "                                   --engine=cuda)\n"
         "    [--client-id=<name>]           label this worker on the dashboard; defaults to hostname\n"
         "    [--workdir=/tmp/ggnfs-client]\n"
         "    [--idle-backoff=30]\n"
+        "    [--lease-class=cpu|gpu]        workunit class to request (default: cpu,\n"
+        "                                   or gpu under --engine=cuda)\n"
+        "    [--engine=lasieve4|cuda]       which siever to drive (default lasieve4).\n"
+        "                                   'cuda' runs cuda-sieve's bench on a GPU\n"
+        "    [--cuda-bench=<path>]          (required for --engine=cuda) bench binary\n"
+        "    [--fb1=<path>]                 pre-generated cuda-sieve factor-base cache;\n"
+        "                                   without it bench rebuilds it every workunit\n"
+        "    [--device=N]                   CUDA device index (default: bench chooses)\n"
         "    [--workers=1]                  pthread workers (each runs an independent siever)\n"
         "    [--http-concurrency=16]        max simultaneous coordinator HTTP requests\n"
         "    [--http-interval-ms=50]        minimum spacing between coordinator HTTP starts\n"
@@ -537,6 +617,9 @@ static int parse_config(int argc, char **argv, client_cfg_t *cfg)
     cfg->http_interval_ms = 50;
     cfg->workers = 1;
     cfg->http_concurrency = 16;
+    snprintf(cfg->lease_class, sizeof(cfg->lease_class), "cpu");
+    cfg->engine      = ENGINE_LASIEVE4;
+    cfg->cuda_device = -1;
     snprintf(cfg->workdir, sizeof(cfg->workdir), "%s", "/tmp/ggnfs-client");
 
     const char *url     = flag(argc, argv, "--server-url");
@@ -545,18 +628,71 @@ static int parse_config(int argc, char **argv, client_cfg_t *cfg)
     const char *cid     = flag(argc, argv, "--client-id");
     const char *wdir    = flag(argc, argv, "--workdir");
     const char *ib      = flag(argc, argv, "--idle-backoff");
+    const char *engine_s = flag(argc, argv, "--engine");
+    if (engine_s && *engine_s) {
+        if      (strcmp(engine_s, "lasieve4") == 0) cfg->engine = ENGINE_LASIEVE4;
+        else if (strcmp(engine_s, "cuda")     == 0) cfg->engine = ENGINE_CUDA;
+        else {
+            fprintf(stderr, "client: --engine must be 'lasieve4' or 'cuda'\n");
+            return -1;
+        }
+    }
+    /* A cuda client asks for gpu-class bands by default — that is the whole
+     * point of having them — but --lease-class still overrides, which is how
+     * you point a card at a CPU band to drain a tail. */
+    if (cfg->engine == ENGINE_CUDA)
+        snprintf(cfg->lease_class, sizeof(cfg->lease_class), "gpu");
+
+    const char *lease_class = flag(argc, argv, "--lease-class");
+    if (lease_class && *lease_class) {
+        if (strcmp(lease_class, "cpu") != 0 && strcmp(lease_class, "gpu") != 0) {
+            fprintf(stderr, "client: --lease-class must be 'cpu' or 'gpu'\n");
+            return -1;
+        }
+        snprintf(cfg->lease_class, sizeof(cfg->lease_class), "%s", lease_class);
+    }
+
+    const char *cuda_bench = flag(argc, argv, "--cuda-bench");
+    if (cuda_bench && *cuda_bench)
+        snprintf(cfg->cuda_bench, sizeof(cfg->cuda_bench), "%s", cuda_bench);
+
+    const char *fb1 = flag(argc, argv, "--fb1");
+    if (fb1 && *fb1)
+        snprintf(cfg->fb1_path, sizeof(cfg->fb1_path), "%s", fb1);
+
+    const char *device_s = flag(argc, argv, "--device");
+    if (device_s && *device_s) {
+        int64_t d;
+        if (parse_int64_arg(device_s, &d) != 0 || d < 0 || d > 255) {
+            fprintf(stderr, "client: --device must be an integer 0..255\n");
+            return -1;
+        }
+        cfg->cuda_device = (int)d;
+    }
+
     const char *workers = flag(argc, argv, "--workers");
     const char *httpc   = flag(argc, argv, "--http-concurrency");
     const char *httpi   = flag(argc, argv, "--http-interval-ms");
     const char *once    = flag(argc, argv, "--once");
 
-    if (!url || !*url || !token || !*token || !siever || !*siever) {
+    if (!url || !*url || !token || !*token) {
+        usage();
+        return -1;
+    }
+    /* Each engine requires its own binary and ignores the other's. */
+    if (cfg->engine == ENGINE_CUDA) {
+        if (cfg->cuda_bench[0] == '\0') {
+            fprintf(stderr, "client: --engine=cuda requires --cuda-bench=<path to "
+                            "cuda-sieve bench>\n");
+            return -1;
+        }
+    } else if (!siever || !*siever) {
         usage();
         return -1;
     }
     snprintf(cfg->server_url,  sizeof(cfg->server_url),  "%s", url);
     snprintf(cfg->token,       sizeof(cfg->token),       "%s", token);
-    snprintf(cfg->siever_path, sizeof(cfg->siever_path), "%s", siever);
+    snprintf(cfg->siever_path, sizeof(cfg->siever_path), "%s", siever ? siever : "");
 
     if (cid && *cid) {
         snprintf(cfg->client_id, sizeof(cfg->client_id), "%s", cid);
@@ -979,7 +1115,8 @@ static int do_lease(struct mg_mgr *mgr, const client_cfg_t *cfg,
     char url[512];
     if (join_url(url, sizeof(url), cfg->server_url, "/lease") != 0) return -2;
 
-    char *body = proto_encode_lease_request(cfg->client_id, CLIENT_VERSION);
+    char *body = proto_encode_lease_request(cfg->client_id, CLIENT_VERSION,
+                                            cfg->lease_class);
     if (!body) return -2;
     size_t body_len = strlen(body);
 
@@ -1144,6 +1281,51 @@ static int submit_with_retries(struct mg_mgr *mgr, const client_cfg_t *cfg,
 /* Returns 0 if the server released the lease or no longer has that lease for us;
  * -1 on connection/server errors. Treat 409 as non-fatal during shutdown because
  * the lease may already have expired or been submitted. */
+/* Push our lease out. Returns:
+ *    0  renewed
+ *    1  the server says we no longer hold this workunit (409) — it was
+ *       reclaimed and reissued, so anything we produce for it is waste
+ *    2  the server has no /renew (404) — an older build; the lease is fine,
+ *       we simply cannot heartbeat it
+ *   -1  transient failure (connection, 5xx) — worth retrying
+ */
+static int do_renew(struct mg_mgr *mgr, const client_cfg_t *cfg,
+                    const char *workunit_id)
+{
+    char url[512];
+    if (join_url(url, sizeof(url), cfg->server_url, "/renew") != 0) return -1;
+
+    /* Same {workunit_id, client_id} body as /release. */
+    char *body = proto_encode_release_request(workunit_id, cfg->client_id);
+    if (!body) return -1;
+    size_t body_len = strlen(body);
+
+    char headers[256];
+    build_auth_headers(headers, sizeof(headers), cfg->token,
+                       "application/json", NULL);
+
+    http_io_t io = {
+        .url = url, .method = "POST",
+        .extra_headers = headers,
+        .body = body, .body_len = body_len,
+    };
+    /* Short budget and abort_on_cancel=1: this runs inside the siever's
+     * ~100 ms cancellation poll, so a slow or wedged server must not keep the
+     * loop out of waitpid() and shutdown_phase() for long. */
+    int rc = http_request(mgr, &io, 5000, 1);
+    free(body);
+    if (rc != 0) {
+        http_io_free(&io);
+        return -1;
+    }
+    int status = io.status;
+    http_io_free(&io);
+    if (status == 200) return 0;
+    if (status == 409) return 1;
+    if (status == 404) return 2;
+    return -1;
+}
+
 static int do_release(struct mg_mgr *mgr, const client_cfg_t *cfg,
                       const char *workunit_id)
 {
@@ -1236,11 +1418,15 @@ static int run_one_iteration(struct mg_mgr *mgr, const client_cfg_t *cfg, int wo
         return -1;
     }
 
-    printf("client: leased %s  q=[%lld,%lld)  side=%c  siever=%s\n",
+    printf("client: leased %s  q=[%lld,%lld)  width=%lld  side=%c  engine=%s  args=%s\n",
            lease.workunit_id,
            (long long)lease.q_start,
            (long long)(lease.q_start + lease.q_range),
-           lease.side, lease.siever);
+           (long long)lease.q_range,
+           lease.side, engine_name(cfg->engine),
+           (cfg->engine == ENGINE_CUDA)
+               ? (lease.gpu_args[0]    ? lease.gpu_args    : "(none)")
+               : (lease.siever_args[0] ? lease.siever_args : "(none)"));
     active_lease_set(worker_idx, lease.workunit_id, cfg->client_id);
 
     /* Fetch input file (the .job) into the local cache. */
@@ -1252,8 +1438,10 @@ static int run_one_iteration(struct mg_mgr *mgr, const client_cfg_t *cfg, int wo
     }
 
     /* One-time per job: pre-generate the factor base cache the siever
-     * auto-loads, saving its 30-45s factor base rebuild per workunit. */
-    ensure_afb_cached(cfg, &lease, job_local);
+     * auto-loads, saving its 30-45s factor base rebuild per workunit.
+     * lasieve4-only — cuda-sieve's equivalent is the --fb1 file. */
+    if (cfg->engine != ENGINE_CUDA)
+        ensure_afb_cached(cfg, &lease, job_local);
 
     /* Local outfile path for the siever to write into. Use the workunit id
      * rather than the server's generic output name so concurrent client
@@ -1269,26 +1457,76 @@ static int run_one_iteration(struct mg_mgr *mgr, const client_cfg_t *cfg, int wo
 
     /* The server tells us which siever name to use; we trust the operator
      * to have given --siever pointing at the right binary on disk. We can
-     * surface the mismatch as a warning. */
-    const char *siever_basename = strrchr(cfg->siever_path, '/');
-    siever_basename = siever_basename ? siever_basename + 1 : cfg->siever_path;
-    if (strcmp(siever_basename, lease.siever) != 0) {
-        fprintf(stderr, "client: WARNING — server requested '%s' but --siever is '%s'\n",
-                lease.siever, siever_basename);
+     * surface the mismatch as a warning. Meaningless under --engine=cuda:
+     * the server names a gnfs-lasieve4 binary because that is what the CPU
+     * fleet runs, and the geometry the card should use comes from gpu_args
+     * instead. */
+    if (cfg->engine != ENGINE_CUDA) {
+        const char *siever_basename = strrchr(cfg->siever_path, '/');
+        siever_basename = siever_basename ? siever_basename + 1 : cfg->siever_path;
+        if (strcmp(siever_basename, lease.siever) != 0) {
+            fprintf(stderr, "client: WARNING — server requested '%s' but --siever is '%s'\n",
+                    lease.siever, siever_basename);
+        }
+    }
+
+    /* Heartbeat at a third of the lease window: two consecutive failures
+     * still leave a full interval of slack before the server reclaims the
+     * workunit. A server that reports no lease_seconds gets no heartbeat. */
+    sieve_ctx_t sc = {
+        .mgr           = mgr,
+        .cfg           = cfg,
+        .workunit_id   = lease.workunit_id,
+        .next_renew_ms = 0,
+        .interval_ms   = 0,
+        .lease_lost    = 0,
+    };
+    if (lease.lease_seconds > 0) {
+        sc.interval_ms = (lease.lease_seconds * 1000) / 3;
+        if (sc.interval_ms < 5000) sc.interval_ms = 5000;
+        sc.next_renew_ms = monotonic_ms() + sc.interval_ms;
     }
 
     struct timeval t0, t1;
     gettimeofday(&t0, NULL);
-    int sieve_rc = sieve_run_local(cfg->siever_path, job_local, outfile,
+    /* Each engine gets its own vocabulary from the lease: siever_args is
+     * lasieve4's, gpu_args is cuda-sieve's. They describe different sieve
+     * areas and must never be crossed over. */
+    int sieve_rc;
+    if (cfg->engine == ENGINE_CUDA) {
+        sieve_rc = sieve_run_cuda(cfg->cuda_bench, job_local, outfile,
+                                  (uint32_t)lease.q_start,
+                                  (uint32_t)lease.q_range,
+                                  lease.side,
+                                  lease.gpu_args,
+                                  cfg->fb1_path,
+                                  cfg->cuda_device,
+                                  should_cancel_siever,
+                                  &sc);
+    } else {
+        sieve_rc = sieve_run_local(cfg->siever_path, job_local, outfile,
                                    (uint32_t)lease.q_start,
                                    (uint32_t)lease.q_range,
                                    lease.side,
                                    lease.siever_args,
                                    should_cancel_siever,
-                                   NULL);
+                                   &sc);
+    }
     gettimeofday(&t1, NULL);
     double sieve_seconds = elapsed_seconds(t0, t1);
 
+    if (sc.lease_lost) {
+        /* The server took this workunit back mid-sieve and has reissued it.
+         * Whatever we produced belongs to somebody else's lease now, so drop
+         * it rather than uploading into a certain 409. Nothing to release —
+         * we no longer hold the lease. */
+        fprintf(stderr, "client: discarding %s — lease was reclaimed\n",
+                lease.workunit_id);
+        active_lease_clear(worker_idx);
+        unlink(outfile);
+        free(outfile);
+        return -2;
+    }
     if (sieve_rc != 0) {
         fprintf(stderr, "client: siever returned %d (skipping submit)\n", sieve_rc);
         if (shutdown_phase() >= SHUTDOWN_DRAINING)
@@ -1311,6 +1549,21 @@ static int run_one_iteration(struct mg_mgr *mgr, const client_cfg_t *cfg, int wo
         unlink(outfile);
         free(outfile);
         return -2;
+    }
+
+    /* Reading, zstd-compressing and uploading a gpu-class band's relations is
+     * minutes of work over a throttled link, and it happens after the last
+     * heartbeat. Renew once here so the upload starts with a full lease window
+     * ahead of it, instead of racing whatever was left over from the sieve. */
+    if (sc.interval_ms > 0) {
+        if (do_renew(mgr, cfg, lease.workunit_id) == 1) {
+            fprintf(stderr, "client: discarding %s — lease was reclaimed "
+                            "before submit\n", lease.workunit_id);
+            active_lease_clear(worker_idx);
+            unlink(outfile);
+            free(outfile);
+            return -2;
+        }
     }
 
     int sr = submit_with_retries(mgr, cfg, &lease, outfile, sieve_seconds);
@@ -1573,7 +1826,8 @@ static void bench_usage(void)
         "usage: ggnfs-sieve-client benchmark \\\n"
         "    --server-url=http://host:port  (required)\n"
         "    --token=<bearer token>         (required)\n"
-        "    --siever=<path>                (required) gnfs-lasieve4* binary\n"
+        "    --siever=<path>                (required) gnfs-lasieve4* binary. benchmark\n"
+        "                                   has no cuda engine yet; --engine is ignored\n"
         "    [--workers=N]                  sievers in the all-core phase (default: all online CPUs)\n"
         "    [--cpu-pin=0,2,4,...]          (Linux) pin each worker; length must equal --workers\n"
         "    [--qrange=65]                  q-interval WIDTH to sieve (siever -c; like a workunit's q_range);\n"
