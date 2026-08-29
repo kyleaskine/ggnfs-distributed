@@ -571,8 +571,12 @@ typedef struct client_cfg_s {
      * client that falls back to a cpu-class workunit still runs cuda. */
     int         engine;                 /* ENGINE_LASIEVE4 | ENGINE_CUDA */
     char        cuda_bench[256];        /* cuda-sieve `bench` binary */
-    char        fb1_path[256];          /* optional --fb1 cache; "" = none */
+    char        fb1_path[256];          /* explicit --fb1 cache; "" = none */
+    char        fbgen_gpu[256];         /* fbgen_gpu binary to build one with */
     int         cuda_device;            /* -1 = let bench choose */
+    /* Lease slots per worker. >1 runs the pipelined worker, which keeps the
+     * card sieving across lease round trips and uploads. */
+    int         prefetch;
 
     /* --cpu-pin parsed list. cpu_pin_count == 0 disables pinning. */
     int         cpu_pin_count;
@@ -595,9 +599,14 @@ static void usage(void)
         "    [--engine=lasieve4|cuda]       which siever to drive (default lasieve4).\n"
         "                                   'cuda' runs cuda-sieve's bench on a GPU\n"
         "    [--cuda-bench=<path>]          (required for --engine=cuda) bench binary\n"
-        "    [--fb1=<path>]                 pre-generated cuda-sieve factor-base cache;\n"
-        "                                   without it bench rebuilds it every workunit\n"
+        "    [--fb1=<path>]                 pre-generated cuda-sieve factor-base cache\n"
+        "    [--fbgen-gpu=<path>]           cuda-sieve fbgen_gpu binary; builds the --fb1\n"
+        "                                   cache once per job. Without either, bench\n"
+        "                                   rebuilds the factor base every workunit\n"
         "    [--device=N]                   CUDA device index (default: bench chooses)\n"
+        "    [--prefetch=N]                 lease slots per worker (default: 2 under\n"
+        "                                   --engine=cuda, else 1). >1 overlaps leasing\n"
+        "                                   and uploading with sieving\n"
         "    [--workers=1]                  pthread workers (each runs an independent siever)\n"
         "    [--http-concurrency=16]        max simultaneous coordinator HTTP requests\n"
         "    [--http-interval-ms=50]        minimum spacing between coordinator HTTP starts\n"
@@ -620,6 +629,7 @@ static int parse_config(int argc, char **argv, client_cfg_t *cfg)
     snprintf(cfg->lease_class, sizeof(cfg->lease_class), "cpu");
     cfg->engine      = ENGINE_LASIEVE4;
     cfg->cuda_device = -1;
+    cfg->prefetch    = 0;      /* resolved per engine once --engine is known */
     snprintf(cfg->workdir, sizeof(cfg->workdir), "%s", "/tmp/ggnfs-client");
 
     const char *url     = flag(argc, argv, "--server-url");
@@ -659,6 +669,25 @@ static int parse_config(int argc, char **argv, client_cfg_t *cfg)
     const char *fb1 = flag(argc, argv, "--fb1");
     if (fb1 && *fb1)
         snprintf(cfg->fb1_path, sizeof(cfg->fb1_path), "%s", fb1);
+
+    const char *fbgen = flag(argc, argv, "--fbgen-gpu");
+    if (fbgen && *fbgen)
+        snprintf(cfg->fbgen_gpu, sizeof(cfg->fbgen_gpu), "%s", fbgen);
+
+    const char *prefetch_s = flag(argc, argv, "--prefetch");
+    if (prefetch_s && *prefetch_s) {
+        int64_t n;
+        if (parse_int64_arg(prefetch_s, &n) != 0 || n < 1 || n > 8) {
+            fprintf(stderr, "client: --prefetch must be an integer 1..8\n");
+            return -1;
+        }
+        cfg->prefetch = (int)n;
+    }
+    /* A CPU worker stalling through a lease costs one core out of many, so it
+     * stays serial by default. A GPU is the whole box: prefetch 2 keeps the
+     * card fed across the lease round trip and the upload. */
+    if (cfg->prefetch == 0)
+        cfg->prefetch = (cfg->engine == ENGINE_CUDA) ? 2 : 1;
 
     const char *device_s = flag(argc, argv, "--device");
     if (device_s && *device_s) {
@@ -1109,6 +1138,139 @@ static void ensure_afb_cached(const client_cfg_t *cfg,
  *   -1  - 410 Gone (job complete, caller should exit)
  *   -2  - other error (caller should backoff)
  */
+/* ---- cuda-sieve factor-base cache (--fb1) ------------------------------
+ *
+ * The direct analogue of ensure_afb_cached above. Without a --fb1 file, bench
+ * regenerates the complete algebraic factor base on the GPU at every single
+ * workunit; with one it loads a prepared file instead. On a job like the C208
+ * that file is ~230 MB, so this is the difference between paying a large
+ * fixed cost per band and paying it once per client.
+ *
+ * The cache is keyed on (job sha, logI) in its filename, which is what makes
+ * a content probe unnecessary: a file built for a different polynomial or a
+ * different sieve width simply cannot be found under this name. Generation
+ * stages through a pid-unique path and renames, so concurrent client
+ * processes sharing a workdir can never observe a partial file — and neither
+ * can a client that was killed mid-generation.
+ */
+#define GPU_FB_LOGI_DEFAULT 15   /* cuda-sieve bench_main.cu: cfg.logI = 15 */
+
+static pthread_mutex_t g_fb1_mu = PTHREAD_MUTEX_INITIALIZER;
+static int  g_fb1_failed = 0;
+static char g_fb1_ready[320];    /* "" until this process has a usable cache */
+
+/* Pull "--logI N" out of the server-supplied cuda-sieve arg string. --maxbits
+ * must match the width actually sieved at, so guessing wrong here would build
+ * a cache bench cannot use. */
+static int gpu_args_logI(const char *args)
+{
+    if (!args) return GPU_FB_LOGI_DEFAULT;
+    const char *p = strstr(args, "--logI");
+    if (!p) return GPU_FB_LOGI_DEFAULT;
+    p += strlen("--logI");
+    while (*p == ' ' || *p == '\t' || *p == '=') p++;
+    int v = atoi(p);
+    return (v >= 8 && v <= 24) ? v : GPU_FB_LOGI_DEFAULT;
+}
+
+/* Read "alim: N" from a ggnfs .job. 0 if absent or unparsable. The algebraic
+ * bound is the right one even for a rational-side special-q: cuda-sieve's
+ * factor base is always the algebraic one. */
+static int64_t job_alim(const char *job_path)
+{
+    FILE *f = fopen(job_path, "r");
+    if (!f) return 0;
+    char line[512];
+    int64_t alim = 0;
+    while (fgets(line, sizeof(line), f)) {
+        const char *p = line;
+        while (*p == ' ' || *p == '\t') p++;
+        if (strncmp(p, "alim:", 5) != 0) continue;
+        p += 5;
+        while (*p == ' ' || *p == '\t') p++;
+        alim = strtoll(p, NULL, 10);
+        break;
+    }
+    fclose(f);
+    return alim > 0 ? alim : 0;
+}
+
+/* Returns the path to pass as --fb1, or NULL to let bench build the base
+ * in-process. Never fails the workunit: a cache we cannot build just means
+ * slower sieving, not wrong sieving. */
+static const char *ensure_gpu_fb_cached(const client_cfg_t *cfg,
+                                        const proto_lease_response_t *lease,
+                                        const char *job_local)
+{
+    /* An explicit --fb1 is the operator's call and is used as given. */
+    if (cfg->fb1_path[0]) return cfg->fb1_path;
+    if (cfg->fbgen_gpu[0] == '\0') return NULL;
+
+    pthread_mutex_lock(&g_fb1_mu);
+    if (g_fb1_failed)    { pthread_mutex_unlock(&g_fb1_mu); return NULL; }
+    if (g_fb1_ready[0])  { pthread_mutex_unlock(&g_fb1_mu); return g_fb1_ready; }
+
+    int logI = gpu_args_logI(lease->gpu_args);
+
+    char cache[320];
+    snprintf(cache, sizeof(cache), "%s/%.16s.roots1.m%d",
+             cfg->file_cache_dir, lease->file_sha256_hex, logI);
+
+    if (file_exists(cache)) {
+        snprintf(g_fb1_ready, sizeof(g_fb1_ready), "%s", cache);
+        printf("client: using factor base cache %s\n", cache);
+        pthread_mutex_unlock(&g_fb1_mu);
+        return g_fb1_ready;
+    }
+
+    int64_t alim = job_alim(job_local);
+    if (alim == 0) {
+        fprintf(stderr, "client: no alim: in the .job; cannot pre-build the "
+                        "factor base (bench will build it per workunit)\n");
+        g_fb1_failed = 1;
+        pthread_mutex_unlock(&g_fb1_mu);
+        return NULL;
+    }
+
+    char staged[352];
+    snprintf(staged, sizeof(staged), "%s.%d.part", cache, (int)getpid());
+    unlink(staged);
+
+    printf("client: building factor base cache %s "
+           "(one-time per job; lim=%lld maxbits=%d)\n",
+           cache, (long long)alim, logI);
+
+    char syscmd[1280];
+    snprintf(syscmd, sizeof(syscmd),
+             "%s --poly %s --lim %lld --maxbits %d --out %s",
+             cfg->fbgen_gpu, job_local, (long long)alim, logI, staged);
+
+    int rc = sieve_run_command(syscmd, should_cancel_siever, NULL);
+
+    off_t sz = 0;
+    if (rc == 0 && regular_file_size(staged, &sz) == 0 && sz > 0 &&
+        rename(staged, cache) == 0) {
+        snprintf(g_fb1_ready, sizeof(g_fb1_ready), "%s", cache);
+        printf("client: factor base cache ready: %s (%lld bytes)\n",
+               cache, (long long)sz);
+        pthread_mutex_unlock(&g_fb1_mu);
+        return g_fb1_ready;
+    }
+
+    unlink(staged);
+    if (shutdown_phase() >= SHUTDOWN_CANCELLING) {
+        /* Killed by shutdown, not by a real failure — don't poison the next
+         * run's attempt. */
+        pthread_mutex_unlock(&g_fb1_mu);
+        return NULL;
+    }
+    fprintf(stderr, "client: factor base cache generation failed (rc=%d); "
+                    "bench will rebuild it per workunit\n", rc);
+    g_fb1_failed = 1;
+    pthread_mutex_unlock(&g_fb1_mu);
+    return NULL;
+}
+
 static int do_lease(struct mg_mgr *mgr, const client_cfg_t *cfg,
                     proto_lease_response_t *out)
 {
@@ -1404,54 +1566,93 @@ static void release_active_leases(const client_cfg_t *base_cfg)
  *  -1  - job is done (caller should exit cleanly)
  *  -2  - transient failure (caller should backoff)
  */
-static int run_one_iteration(struct mg_mgr *mgr, const client_cfg_t *cfg, int worker_idx)
+/* ---- pipeline stages ---------------------------------------------------
+ *
+ * The lease -> sieve -> submit cycle is split into three stages so the serial
+ * worker and the pipelined GPU worker share one implementation of each. The
+ * serial worker just calls them back to back; the pipelined one runs them on
+ * separate threads against a ring of lease slots, so the card keeps sieving
+ * while one slot uploads and another is being leased.
+ *
+ * `active_idx` is the slot's row in the global active-lease table, which the
+ * cancellation path walks to release leases. Every slot needs its own row,
+ * and its own client_id — the server's "one live lease per client_id" guard
+ * would otherwise hand a prefetching client the workunit it already holds
+ * instead of a new one.
+ */
+typedef struct {
+    client_cfg_t            cfg;         /* copy, with this slot's client_id */
+    proto_lease_response_t  lease;
+    char                    job_local[256];
+    const char             *fb1;         /* cuda only; owned by the FB cache */
+    char                   *outfile;     /* malloc'd */
+    double                  sieve_seconds;
+    int                     active_idx;
+} pipe_slot_t;
+
+static void slot_reset(pipe_slot_t *slot)
 {
+    free(slot->outfile);
+    slot->outfile = NULL;
+    slot->fb1 = NULL;
+    slot->sieve_seconds = 0.0;
+    memset(&slot->lease, 0, sizeof(slot->lease));
+}
+
+/* Stage 1: lease a workunit and fetch everything needed to sieve it.
+ *   1  acquired    0  no work right now    -1  job complete / draining
+ *  -2  transient failure */
+static int stage_acquire(struct mg_mgr *mgr, pipe_slot_t *slot)
+{
+    const client_cfg_t *cfg = &slot->cfg;
+
     if (shutdown_phase() >= SHUTDOWN_DRAINING) return -1;
 
-    proto_lease_response_t lease;
-    int lr = do_lease(mgr, cfg, &lease);
+    int lr = do_lease(mgr, cfg, &slot->lease);
     if (lr == 0)  return 0;
     if (lr == -1) return -1;
     if (lr <  0)  return -2;
     if (shutdown_phase() >= SHUTDOWN_DRAINING) {
-        do_release(mgr, cfg, lease.workunit_id);
+        do_release(mgr, cfg, slot->lease.workunit_id);
         return -1;
     }
 
     printf("client: leased %s  q=[%lld,%lld)  width=%lld  side=%c  engine=%s  args=%s\n",
-           lease.workunit_id,
-           (long long)lease.q_start,
-           (long long)(lease.q_start + lease.q_range),
-           (long long)lease.q_range,
-           lease.side, engine_name(cfg->engine),
+           slot->lease.workunit_id,
+           (long long)slot->lease.q_start,
+           (long long)(slot->lease.q_start + slot->lease.q_range),
+           (long long)slot->lease.q_range,
+           slot->lease.side, engine_name(cfg->engine),
            (cfg->engine == ENGINE_CUDA)
-               ? (lease.gpu_args[0]    ? lease.gpu_args    : "(none)")
-               : (lease.siever_args[0] ? lease.siever_args : "(none)"));
-    active_lease_set(worker_idx, lease.workunit_id, cfg->client_id);
+               ? (slot->lease.gpu_args[0]    ? slot->lease.gpu_args    : "(none)")
+               : (slot->lease.siever_args[0] ? slot->lease.siever_args : "(none)"));
+    active_lease_set(slot->active_idx, slot->lease.workunit_id, cfg->client_id);
 
     /* Fetch input file (the .job) into the local cache. */
-    char job_local[256];
-    if (ensure_file_cached(mgr, cfg, &lease, job_local, sizeof(job_local)) != 0) {
+    if (ensure_file_cached(mgr, cfg, &slot->lease,
+                           slot->job_local, sizeof(slot->job_local)) != 0) {
         if (shutdown_phase() >= SHUTDOWN_DRAINING)
-            release_active_lease(mgr, cfg, worker_idx);
+            release_active_lease(mgr, cfg, slot->active_idx);
         return -2;
     }
 
-    /* One-time per job: pre-generate the factor base cache the siever
-     * auto-loads, saving its 30-45s factor base rebuild per workunit.
-     * lasieve4-only — cuda-sieve's equivalent is the --fb1 file. */
-    if (cfg->engine != ENGINE_CUDA)
-        ensure_afb_cached(cfg, &lease, job_local);
+    /* One-time per job: pre-generate the factor base so the siever does not
+     * rebuild it on every workunit. lasieve4 auto-loads its .afb.0; cuda-sieve
+     * takes the equivalent as --fb1. */
+    if (cfg->engine == ENGINE_CUDA)
+        slot->fb1 = ensure_gpu_fb_cached(cfg, &slot->lease, slot->job_local);
+    else
+        ensure_afb_cached(cfg, &slot->lease, slot->job_local);
 
     /* Local outfile path for the siever to write into. Use the workunit id
      * rather than the server's generic output name so concurrent client
      * processes sharing a workdir cannot unlink/replace each other's output. */
-    char output_name[sizeof(lease.workunit_id) + 4];
-    snprintf(output_name, sizeof(output_name), "%s.dat", lease.workunit_id);
-    char *outfile = path_join(cfg->workdir, output_name);
-    if (!outfile) {
+    char output_name[sizeof(slot->lease.workunit_id) + 4];
+    snprintf(output_name, sizeof(output_name), "%s.dat", slot->lease.workunit_id);
+    slot->outfile = path_join(cfg->workdir, output_name);
+    if (!slot->outfile) {
         if (shutdown_phase() >= SHUTDOWN_DRAINING)
-            release_active_lease(mgr, cfg, worker_idx);
+            release_active_lease(mgr, cfg, slot->active_idx);
         return -2;
     }
 
@@ -1464,11 +1665,19 @@ static int run_one_iteration(struct mg_mgr *mgr, const client_cfg_t *cfg, int wo
     if (cfg->engine != ENGINE_CUDA) {
         const char *siever_basename = strrchr(cfg->siever_path, '/');
         siever_basename = siever_basename ? siever_basename + 1 : cfg->siever_path;
-        if (strcmp(siever_basename, lease.siever) != 0) {
+        if (strcmp(siever_basename, slot->lease.siever) != 0) {
             fprintf(stderr, "client: WARNING — server requested '%s' but --siever is '%s'\n",
-                    lease.siever, siever_basename);
+                    slot->lease.siever, siever_basename);
         }
     }
+    return 1;
+}
+
+/* Stage 2: run the siever. `mgr` is used only for lease heartbeats.
+ *   1  relations ready to submit    -2  nothing to submit */
+static int stage_sieve(struct mg_mgr *mgr, pipe_slot_t *slot)
+{
+    const client_cfg_t *cfg = &slot->cfg;
 
     /* Heartbeat at a third of the lease window: two consecutive failures
      * still leave a full interval of slack before the server reclaims the
@@ -1476,13 +1685,13 @@ static int run_one_iteration(struct mg_mgr *mgr, const client_cfg_t *cfg, int wo
     sieve_ctx_t sc = {
         .mgr           = mgr,
         .cfg           = cfg,
-        .workunit_id   = lease.workunit_id,
+        .workunit_id   = slot->lease.workunit_id,
         .next_renew_ms = 0,
         .interval_ms   = 0,
         .lease_lost    = 0,
     };
-    if (lease.lease_seconds > 0) {
-        sc.interval_ms = (lease.lease_seconds * 1000) / 3;
+    if (slot->lease.lease_seconds > 0) {
+        sc.interval_ms = (slot->lease.lease_seconds * 1000) / 3;
         if (sc.interval_ms < 5000) sc.interval_ms = 5000;
         sc.next_renew_ms = monotonic_ms() + sc.interval_ms;
     }
@@ -1494,26 +1703,26 @@ static int run_one_iteration(struct mg_mgr *mgr, const client_cfg_t *cfg, int wo
      * areas and must never be crossed over. */
     int sieve_rc;
     if (cfg->engine == ENGINE_CUDA) {
-        sieve_rc = sieve_run_cuda(cfg->cuda_bench, job_local, outfile,
-                                  (uint32_t)lease.q_start,
-                                  (uint32_t)lease.q_range,
-                                  lease.side,
-                                  lease.gpu_args,
-                                  cfg->fb1_path,
+        sieve_rc = sieve_run_cuda(cfg->cuda_bench, slot->job_local, slot->outfile,
+                                  (uint32_t)slot->lease.q_start,
+                                  (uint32_t)slot->lease.q_range,
+                                  slot->lease.side,
+                                  slot->lease.gpu_args,
+                                  slot->fb1,
                                   cfg->cuda_device,
                                   should_cancel_siever,
                                   &sc);
     } else {
-        sieve_rc = sieve_run_local(cfg->siever_path, job_local, outfile,
-                                   (uint32_t)lease.q_start,
-                                   (uint32_t)lease.q_range,
-                                   lease.side,
-                                   lease.siever_args,
+        sieve_rc = sieve_run_local(cfg->siever_path, slot->job_local, slot->outfile,
+                                   (uint32_t)slot->lease.q_start,
+                                   (uint32_t)slot->lease.q_range,
+                                   slot->lease.side,
+                                   slot->lease.siever_args,
                                    should_cancel_siever,
                                    &sc);
     }
     gettimeofday(&t1, NULL);
-    double sieve_seconds = elapsed_seconds(t0, t1);
+    slot->sieve_seconds = elapsed_seconds(t0, t1);
 
     if (sc.lease_lost) {
         /* The server took this workunit back mid-sieve and has reissued it.
@@ -1521,72 +1730,346 @@ static int run_one_iteration(struct mg_mgr *mgr, const client_cfg_t *cfg, int wo
          * it rather than uploading into a certain 409. Nothing to release —
          * we no longer hold the lease. */
         fprintf(stderr, "client: discarding %s — lease was reclaimed\n",
-                lease.workunit_id);
-        active_lease_clear(worker_idx);
-        unlink(outfile);
-        free(outfile);
+                slot->lease.workunit_id);
+        active_lease_clear(slot->active_idx);
+        unlink(slot->outfile);
         return -2;
     }
     if (sieve_rc != 0) {
         fprintf(stderr, "client: siever returned %d (skipping submit)\n", sieve_rc);
         if (shutdown_phase() >= SHUTDOWN_DRAINING)
-            release_active_lease(mgr, cfg, worker_idx);
-        free(outfile);
+            release_active_lease(mgr, cfg, slot->active_idx);
         return -2;
     }
     off_t outfile_size = 0;
-    if (regular_file_size(outfile, &outfile_size) != 0) {
-        fprintf(stderr, "client: siever did not produce %s (skipping submit)\n", outfile);
+    if (regular_file_size(slot->outfile, &outfile_size) != 0) {
+        fprintf(stderr, "client: siever did not produce %s (skipping submit)\n",
+                slot->outfile);
         if (shutdown_phase() >= SHUTDOWN_DRAINING)
-            release_active_lease(mgr, cfg, worker_idx);
-        free(outfile);
+            release_active_lease(mgr, cfg, slot->active_idx);
         return -2;
     }
     if (outfile_size == 0) {
-        fprintf(stderr, "client: siever produced empty %s (skipping submit)\n", outfile);
+        fprintf(stderr, "client: siever produced empty %s (skipping submit)\n",
+                slot->outfile);
         if (shutdown_phase() >= SHUTDOWN_DRAINING)
-            release_active_lease(mgr, cfg, worker_idx);
-        unlink(outfile);
-        free(outfile);
+            release_active_lease(mgr, cfg, slot->active_idx);
+        unlink(slot->outfile);
         return -2;
     }
+    return 1;
+}
+
+/* Stage 3: upload and tidy up.  1 accepted, -2 otherwise. */
+static int stage_submit(struct mg_mgr *mgr, pipe_slot_t *slot)
+{
+    const client_cfg_t *cfg = &slot->cfg;
 
     /* Reading, zstd-compressing and uploading a gpu-class band's relations is
      * minutes of work over a throttled link, and it happens after the last
      * heartbeat. Renew once here so the upload starts with a full lease window
      * ahead of it, instead of racing whatever was left over from the sieve. */
-    if (sc.interval_ms > 0) {
-        if (do_renew(mgr, cfg, lease.workunit_id) == 1) {
+    if (slot->lease.lease_seconds > 0) {
+        if (do_renew(mgr, cfg, slot->lease.workunit_id) == 1) {
             fprintf(stderr, "client: discarding %s — lease was reclaimed "
-                            "before submit\n", lease.workunit_id);
-            active_lease_clear(worker_idx);
-            unlink(outfile);
-            free(outfile);
+                            "before submit\n", slot->lease.workunit_id);
+            active_lease_clear(slot->active_idx);
+            unlink(slot->outfile);
             return -2;
         }
     }
 
-    int sr = submit_with_retries(mgr, cfg, &lease, outfile, sieve_seconds);
+    int sr = submit_with_retries(mgr, cfg, &slot->lease, slot->outfile,
+                                 slot->sieve_seconds);
     if (sr == -1) {
-        fprintf(stderr, "client: submit cancelled; leaving %s for inspection\n", outfile);
-        free(outfile);
+        fprintf(stderr, "client: submit cancelled; leaving %s for inspection\n",
+                slot->outfile);
         return -2;
     }
     if (sr == -2) {
         fprintf(stderr, "client: submit failed permanently; leaving %s for inspection\n",
-                outfile);
-        active_lease_clear(worker_idx);
-        free(outfile);
+                slot->outfile);
+        active_lease_clear(slot->active_idx);
         return -2;
     }
 
-    active_lease_clear(worker_idx);
+    active_lease_clear(slot->active_idx);
     /* Tidy: remove the local rels file once the server accepted it, or once
      * the server says the workunit has already moved on. */
-    unlink(outfile);
-    free(outfile);
+    unlink(slot->outfile);
     return 1;
 }
+
+/* The full lease -> sieve -> submit cycle, run serially. Returns:
+ *   1  - completed a workunit (caller may continue immediately)
+ *   0  - no work right now (caller should backoff)
+ *  -1  - job is done (caller should exit cleanly)
+ *  -2  - transient failure (caller should backoff)
+ */
+static int run_one_iteration(struct mg_mgr *mgr, const client_cfg_t *cfg, int worker_idx)
+{
+    pipe_slot_t slot;
+    memset(&slot, 0, sizeof(slot));
+    slot.cfg        = *cfg;
+    slot.active_idx = worker_idx;
+
+    int r = stage_acquire(mgr, &slot);
+    if (r != 1) { slot_reset(&slot); return r; }
+
+    r = stage_sieve(mgr, &slot);
+    if (r != 1) { slot_reset(&slot); return -2; }
+
+    r = stage_submit(mgr, &slot);
+    slot_reset(&slot);
+    return r == 1 ? 1 : -2;
+}
+
+/* ---- pipelined worker (GPU) --------------------------------------------
+ *
+ * A CPU worker idling through a lease round trip costs nothing much: the other
+ * 7 or 15 cores keep sieving. A GPU is the whole machine, so every second
+ * spent uploading or waiting for a lease is a second the card does nothing.
+ *
+ * So the GPU worker runs the three stages concurrently over a ring of slots:
+ *
+ *     lease thread   ->  [ slot ]  ->  sieve loop  ->  [ slot ]  ->  submit thread
+ *
+ * One slot is being sieved, one is already leased and waiting, and a third may
+ * be uploading. The card moves straight from one band to the next.
+ *
+ * Each slot carries its own client_id (`<base>-sK`) because the server keeps
+ * at most one live lease per client_id — a prefetching client that reused one
+ * id would get handed the workunit it already holds instead of a new one.
+ */
+typedef enum {
+    SLOT_EMPTY = 0,   /* free; the lease thread may claim it        */
+    SLOT_READY,       /* leased and fetched; waiting for the card   */
+    SLOT_SIEVING,     /* the card is on it                          */
+    SLOT_DONE         /* relations written; waiting for the upload  */
+} slot_state_t;
+
+typedef struct {
+    pthread_mutex_t mu;
+    pthread_cond_t  cv;
+    pipe_slot_t    *slots;
+    slot_state_t   *state;
+    int             n;
+    int             no_more_work;   /* server says the job is complete */
+    int             finished;       /* sieve loop is done; drain and exit */
+    int             once;           /* --once: stop after one workunit */
+    int             completed;      /* workunits fully submitted */
+} pipeline_t;
+
+/* Find one slot in `want`; -1 if none. Caller holds the lock. */
+static int pipe_find(pipeline_t *p, slot_state_t want)
+{
+    for (int i = 0; i < p->n; i++)
+        if (p->state[i] == want) return i;
+    return -1;
+}
+
+static void *pipe_lease_thread(void *arg)
+{
+    pipeline_t *p = (pipeline_t *)arg;
+    struct mg_mgr mgr;
+    mg_mgr_init(&mgr);
+
+    for (;;) {
+        pthread_mutex_lock(&p->mu);
+        int idx;
+        while ((idx = pipe_find(p, SLOT_EMPTY)) < 0 &&
+               !p->finished && shutdown_phase() < SHUTDOWN_DRAINING) {
+            pthread_cond_wait(&p->cv, &p->mu);
+        }
+        int stop = p->finished || p->no_more_work ||
+                   shutdown_phase() >= SHUTDOWN_DRAINING || idx < 0;
+        if (!stop) p->state[idx] = SLOT_SIEVING;   /* reserve while we work */
+        pthread_mutex_unlock(&p->mu);
+        if (stop) break;
+
+        int r = stage_acquire(&mgr, &p->slots[idx]);
+
+        pthread_mutex_lock(&p->mu);
+        if (r == 1) {
+            p->state[idx] = SLOT_READY;
+        } else {
+            slot_reset(&p->slots[idx]);
+            p->state[idx] = SLOT_EMPTY;
+            /* -1 means the job is complete or we are draining: stop asking.
+             * 0 (no work now) and -2 (transient) both just back off. */
+            if (r == -1) p->no_more_work = 1;
+        }
+        pthread_cond_broadcast(&p->cv);
+        int done = p->no_more_work;
+        pthread_mutex_unlock(&p->mu);
+        if (done) break;
+
+        if (r == 0 || r == -2) {
+            /* Back off, but stay responsive: the sieve loop may finish (or
+             * --once may fire) while we are waiting for work that no longer
+             * matters, and shutdown should not have to sit out a full
+             * idle-backoff before this thread notices. */
+            for (int64_t i = 0;
+                 i < p->slots[idx].cfg.idle_backoff_seconds &&
+                 shutdown_phase() == SHUTDOWN_RUNNING;
+                 i++) {
+                pthread_mutex_lock(&p->mu);
+                int quit = p->finished || p->no_more_work;
+                pthread_mutex_unlock(&p->mu);
+                if (quit) break;
+                sleep(1);
+            }
+        }
+    }
+
+    /* Wake the sieve loop so it does not wait for work that is not coming. */
+    pthread_mutex_lock(&p->mu);
+    p->no_more_work = 1;
+    pthread_cond_broadcast(&p->cv);
+    pthread_mutex_unlock(&p->mu);
+
+    mg_mgr_free(&mgr);
+    return NULL;
+}
+
+static void *pipe_submit_thread(void *arg)
+{
+    pipeline_t *p = (pipeline_t *)arg;
+    struct mg_mgr mgr;
+    mg_mgr_init(&mgr);
+
+    for (;;) {
+        pthread_mutex_lock(&p->mu);
+        int idx;
+        while ((idx = pipe_find(p, SLOT_DONE)) < 0 && !p->finished) {
+            pthread_cond_wait(&p->cv, &p->mu);
+        }
+        if (idx < 0) { pthread_mutex_unlock(&p->mu); break; }  /* finished */
+        pthread_mutex_unlock(&p->mu);
+
+        int r = stage_submit(&mgr, &p->slots[idx]);
+
+        pthread_mutex_lock(&p->mu);
+        if (r == 1) p->completed++;
+        slot_reset(&p->slots[idx]);
+        p->state[idx] = SLOT_EMPTY;
+        pthread_cond_broadcast(&p->cv);
+        pthread_mutex_unlock(&p->mu);
+    }
+
+    mg_mgr_free(&mgr);
+    return NULL;
+}
+
+/* One GPU, `prefetch` lease slots. Returns when there is no more work or a
+ * shutdown was requested. */
+static void pipeline_run(const client_cfg_t *base_cfg, int worker_idx)
+{
+    int n = base_cfg->prefetch;
+    if (n < 1) n = 1;
+
+    pipeline_t p;
+    memset(&p, 0, sizeof(p));
+    pthread_mutex_init(&p.mu, NULL);
+    pthread_cond_init(&p.cv, NULL);
+    p.n     = n;
+    p.once  = base_cfg->once;
+    p.slots = calloc((size_t)n, sizeof(*p.slots));
+    p.state = calloc((size_t)n, sizeof(*p.state));
+    if (!p.slots || !p.state) {
+        fprintf(stderr, "client: pipeline alloc failed\n");
+        free(p.slots); free(p.state);
+        return;
+    }
+
+    for (int i = 0; i < n; i++) {
+        p.slots[i].cfg = *base_cfg;
+        /* Slot-private client_id and active-lease row. */
+        /* --prefetch is capped at 8, so the slot suffix is always one digit;
+         * %c keeps that obvious to the compiler as well as the reader. */
+        snprintf(p.slots[i].cfg.client_id, sizeof(p.slots[i].cfg.client_id),
+                 "%.*s-s%c", (int)(sizeof(p.slots[i].cfg.client_id) - 4),
+                 base_cfg->client_id, (char)('0' + i));
+        p.slots[i].active_idx = worker_idx * n + i;
+        p.state[i] = SLOT_EMPTY;
+    }
+
+    fprintf(stderr, "  [w%d] pipelined: %d lease slots (%s .. %s)\n",
+            worker_idx, n, p.slots[0].cfg.client_id,
+            p.slots[n - 1].cfg.client_id);
+
+    pthread_t lease_tid, submit_tid;
+    pthread_create(&lease_tid,  NULL, pipe_lease_thread,  &p);
+    pthread_create(&submit_tid, NULL, pipe_submit_thread, &p);
+
+    /* Sieve loop: the card, one band at a time. */
+    struct mg_mgr mgr;
+    mg_mgr_init(&mgr);
+    int sieved = 0;
+    for (;;) {
+        pthread_mutex_lock(&p.mu);
+        int idx;
+        while ((idx = pipe_find(&p, SLOT_READY)) < 0 && !p.no_more_work &&
+               shutdown_phase() < SHUTDOWN_CANCELLING) {
+            pthread_cond_wait(&p.cv, &p.mu);
+        }
+        if (idx < 0) { pthread_mutex_unlock(&p.mu); break; }
+        p.state[idx] = SLOT_SIEVING;
+        pthread_mutex_unlock(&p.mu);
+
+        int r = stage_sieve(&mgr, &p.slots[idx]);
+
+        pthread_mutex_lock(&p.mu);
+        if (r == 1) {
+            p.state[idx] = SLOT_DONE;      /* hand off to the submit thread */
+        } else {
+            slot_reset(&p.slots[idx]);
+            p.state[idx] = SLOT_EMPTY;
+        }
+        pthread_cond_broadcast(&p.cv);
+        pthread_mutex_unlock(&p.mu);
+
+        if (r == 1) sieved++;
+        if (p.once && sieved >= 1) break;
+        if (shutdown_phase() >= SHUTDOWN_CANCELLING) break;
+    }
+
+    /* Stop leasing, then let the submit thread drain what is already sieved:
+     * that work is finished and paid for, and the lease is still ours. */
+    pthread_mutex_lock(&p.mu);
+    p.no_more_work = 1;
+    pthread_cond_broadcast(&p.cv);
+    pthread_mutex_unlock(&p.mu);
+    pthread_join(lease_tid, NULL);
+
+    pthread_mutex_lock(&p.mu);
+    while (pipe_find(&p, SLOT_DONE) >= 0 || pipe_find(&p, SLOT_SIEVING) >= 0) {
+        pthread_cond_wait(&p.cv, &p.mu);
+    }
+    p.finished = 1;
+    pthread_cond_broadcast(&p.cv);
+    pthread_mutex_unlock(&p.mu);
+    pthread_join(submit_tid, NULL);
+
+    /* Any slot still holding a lease we never sieved goes back to the pool
+     * rather than waiting out its expiry. */
+    for (int i = 0; i < n; i++) {
+        if (p.state[i] == SLOT_READY) {
+            release_active_lease(&mgr, &p.slots[i].cfg, p.slots[i].active_idx);
+            slot_reset(&p.slots[i]);
+        }
+    }
+
+    printf("[w%d] pipeline finished: %d workunits submitted\n",
+           worker_idx, p.completed);
+
+    mg_mgr_free(&mgr);
+    free(p.slots);
+    free(p.state);
+    pthread_mutex_destroy(&p.mu);
+    pthread_cond_destroy(&p.cv);
+}
+
 /* ===================== worker thread ==================================== */
 
 typedef struct {
@@ -1635,6 +2118,13 @@ static void *worker_main(void *arg)
     } else {
         fprintf(stderr, "  [w%d] workdir=%s  client_id=%s\n",
                 idx, cfg.workdir, cfg.client_id);
+    }
+
+    if (cfg.prefetch > 1) {
+        /* Pipelined: leasing and uploading overlap with sieving. */
+        mg_mgr_free(&mgr);
+        pipeline_run(&cfg, idx);
+        return NULL;
     }
 
     while (shutdown_phase() < SHUTDOWN_CANCELLING) {
@@ -2268,8 +2758,11 @@ int main(int argc, char **argv)
     pthread_t     *tids = calloc((size_t)cfg.workers, sizeof(pthread_t));
     worker_args_t *args = calloc((size_t)cfg.workers, sizeof(worker_args_t));
     int           *joined = calloc((size_t)cfg.workers, sizeof(int));
-    g_active = calloc((size_t)cfg.workers, sizeof(active_lease_t));
-    g_active_count = cfg.workers;
+    /* One row per lease slot: a pipelined worker holds several leases at once
+     * and the cancellation path must be able to release every one of them. */
+    int active_rows = cfg.workers * (cfg.prefetch > 0 ? cfg.prefetch : 1);
+    g_active = calloc((size_t)active_rows, sizeof(active_lease_t));
+    g_active_count = active_rows;
     if (!tids || !args || !joined || !g_active) {
         fprintf(stderr, "client: alloc failed\n");
         free(tids); free(args); free(joined); free(g_active);

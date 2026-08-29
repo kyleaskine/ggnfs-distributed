@@ -24,6 +24,15 @@
 
 typedef int (*sieve_cancel_fn)(void *ctx);
 
+/* Run an arbitrary command through /bin/sh with the same isolation the two
+ * sievers get: its own process group (so a terminal Ctrl-C does not reach it)
+ * and a `should_cancel` poll that escalates SIGTERM -> SIGKILL to the group.
+ * Returns the exit code, or 128+signal. Used for out-of-band helpers such as
+ * cuda-sieve's fbgen_gpu. */
+int sieve_run_command(const char *syscmd,
+                      sieve_cancel_fn should_cancel,
+                      void *cancel_ctx);
+
 /* gnfs-lasieve4*. Appends to `outfile`, so any prior file there is removed
  * first. */
 int sieve_run_local(const char *siever_path,

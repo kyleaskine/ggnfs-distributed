@@ -251,7 +251,7 @@ narrower than `ln(q)` trap already documented in `CLAUDE.md`; real GPU bands at
 
 ## Phase 4 — Client: kill the idle time
 
-- [ ] **4.1 Factor-base cache.** `ensure_gpu_fb_cached()`, the direct
+- [x] **4.1 Factor-base cache.** `ensure_gpu_fb_cached()`, the direct
       analogue of `ensure_afb_cached()`: run
       `fbgen_gpu --poly JOB --lim <alim> --maxbits <logI> --out CACHE` once
       per (job sha, logI), stage through `.part` + rename, size-guard like
@@ -259,7 +259,7 @@ narrower than `ln(q)` trap already documented in `CLAUDE.md`; real GPU bands at
       `--fbgen-gpu=PATH`; omitted means skip the cache and pay in-process FB
       generation per workunit. **This is a bigger lever than the pipelining
       below** — in-process FB generation per workunit dwarfs lease latency.
-- [ ] **4.2 Lease slots + async submit.** `db_lease`'s idempotency guard
+- [x] **4.2 Lease slots + async submit.** `db_lease`'s idempotency guard
       means one `client_id` = one lease, so a prefetching client that reuses
       its id gets the *same* workunit back. Use **N client_ids as lease
       slots** — `<base>-g0-s0`, `-s1` — with one GPU executor draining them.
@@ -275,6 +275,52 @@ narrower than `ln(q)` trap already documented in `CLAUDE.md`; real GPU bands at
   - Shutdown: *draining* stops refilling, finishes the current sieve, drains
     the submit queue, releases unstarted slots. *Cancelling* kills the siever
     and releases all. Both reuse the existing phase machinery.
+
+**Gate — passed.**
+
+*Factor-base cache.* `fbgen_gpu` is invoked once per (job sha, logI) with
+`--lim` taken from the `.job`'s `alim` and `--maxbits` from the server's
+`gpu_args` logI (defaulting to cuda-sieve's own 15 when unset — `--maxbits`
+must match the width actually sieved at). Built exactly once across three
+successive workunits, and exactly once across three concurrent workers.
+Staged through a pid-unique path and renamed, so a partial file is never
+visible; keying the filename on (sha, logI) is what makes a content probe
+unnecessary, since a cache for another poly or width cannot be found under
+this name.
+
+*Pipeline.* Measured against a latency-injecting proxy (1.5 s per connection,
+standing in for the throttled links in this project's notes) with 3 s bands —
+deliberately the worst ratio, where per-workunit overhead rivals the band
+itself:
+
+| prefetch | card busy | avg gap between bands |
+|---:|---:|---:|
+| 1 (serial) | 44.9% | 4.10 s |
+| 2 (default) | 78.8% | 0.77 s |
+| 3 | 96.8% | 0.10 s |
+
+Correctness alongside it: no workunit was ever issued to two slots, no slot
+ever held two leases, and slot client_ids come through the server distinctly
+(`<base>-w0-s0`, `-s1`, ...). A clean two-band run gave 134/134 relations,
+each exactly once, with the gpu client's spare slot correctly falling back to
+the cpu-class band once the gpu band drained. Drain: with three leases held,
+the first Ctrl-C finished and submitted the in-flight work, released the
+prefetched-but-unstarted lease rather than making it wait out expiry, and
+exited with zero leases dangling.
+
+Real GPU bands at `--qrange=100000` run ~6 min, so overhead is proportionally
+far smaller than in this test and `--prefetch=2` should be ample; raise it if
+per-workunit overhead ever approaches band time.
+
+**Refactor note.** `run_one_iteration` was split into `stage_acquire` /
+`stage_sieve` / `stage_submit` so the serial and pipelined workers share one
+implementation rather than two copies drifting apart. The serial path calls
+them back to back and was regression-tested unchanged before the pipeline was
+built on top.
+
+**Pre-existing, unchanged:** the server never sends 410, so a client with no
+work idles on `--idle-backoff` forever rather than exiting; both the serial and
+pipelined workers behave identically here.
 
 ## Phase 5 — Ops and polish
 

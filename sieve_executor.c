@@ -121,6 +121,13 @@ static int run_child_cancelable(const char *syscmd,
     return wait_child_cancelable(pid, should_cancel, cancel_ctx);
 }
 
+int sieve_run_command(const char *syscmd,
+                      sieve_cancel_fn should_cancel,
+                      void *cancel_ctx)
+{
+    return run_child_cancelable(syscmd, should_cancel, cancel_ctx);
+}
+
 int sieve_run_local(const char *siever_path,
                     const char *job_infile,
                     const char *outfile,
