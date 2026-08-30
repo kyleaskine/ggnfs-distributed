@@ -53,7 +53,7 @@
     <div class="stat"><div class="num" id="wu-active">&mdash;</div><div class="lbl">in flight</div></div>
     <div class="stat"><div class="num" id="rels-total">&mdash;</div><div class="lbl">relations submitted</div></div>
     <div class="stat"><div class="num" id="rate-1h">&mdash;</div><div class="lbl">workunits / hr (last 1h)</div></div>
-    <div class="stat"><div class="num" id="eta">&mdash;</div><div class="lbl">ETA (last 1h rate)</div></div>
+    <div class="stat"><div class="num" id="eta">&mdash;</div><div class="lbl">ETA (q-width, last 1h)</div></div>
     <div class="stat"><div class="num" id="uptime">&mdash;</div><div class="lbl">server uptime</div></div>
   </div>
 
@@ -242,15 +242,14 @@
     var w    = s.workunits;
     // Progress is measured in q-width, not workunit count. A gpu-class band is
     // ~100x a cpu-class one, so "10 of 20 done" can mean anything between 1%
-    // and 99% of the actual sieving. Fall back to counts against an older
-    // server that does not report the q object.
-    var q       = w.q || null;
-    var qTotal  = q ? (q.total || 0) : 0;
-    var byWidth = qTotal > 0;
-    var done    = byWidth ? ((q.submitted || 0) + (q.verified || 0))
-                          : ((w.submitted || 0) + (w.verified || 0));
-    var total   = byWidth ? qTotal : (w.total || 0);
-    var pct     = total ? (100 * done / total) : 0;
+    // and 99% of the actual sieving. This page is embedded into the server
+    // binary at build time, so /stats always carries `q`; the ||{} is just so
+    // a stale tab left open across a downgrade renders zeros instead of
+    // throwing.
+    var q     = w.q || {};
+    var done  = (q.submitted || 0) + (q.verified || 0);
+    var total = q.total || 0;
+    var pct   = total ? (100 * done / total) : 0;
     document.getElementById('wu-pct').textContent     = pct.toFixed(1) + '%';
     document.getElementById('wu-active').textContent  = fmt(w.leased);
     document.getElementById('rels-total').textContent = fmt(s.submissions.total_relations);
@@ -260,14 +259,8 @@
     // ETA in the same units as progress: q-width remaining over q-width
     // completed per hour. Counting submissions per hour would mix a 6-minute
     // GPU band with a 26-minute CPU one and read badly wrong on a mixed fleet.
-    var remaining, hourlyRate;
-    if (byWidth) {
-      remaining  = (q.leased || 0) + (q.available || 0);
-      hourlyRate = w.q_passed_1h || 0;
-    } else {
-      remaining  = (w.leased || 0) + (w.available || 0);
-      hourlyRate = s.submissions.last_1h || 0;
-    }
+    var remaining  = (q.leased || 0) + (q.available || 0);
+    var hourlyRate = w.q_passed_1h || 0;
     var eta = document.getElementById('eta');
     eta.removeAttribute('title');
     if (remaining === 0) {
@@ -285,13 +278,12 @@
     bar.innerHTML = '';
     // Segment widths are q-width too, so the bar shows how much of the
     // campaign each state covers rather than how many rows are in it.
-    var src  = byWidth ? q : w;
     var segs = [
-      ['verified',  src.verified  || 0, 'b-verified'],
-      ['submitted', src.submitted || 0, 'b-submitted'],
-      ['leased',    src.leased    || 0, 'b-leased'],
-      ['failed',    src.failed    || 0, 'b-failed'],
-      ['poisoned',  src.poisoned  || 0, 'b-poisoned']
+      ['verified',  q.verified  || 0, 'b-verified'],
+      ['submitted', q.submitted || 0, 'b-submitted'],
+      ['leased',    q.leased    || 0, 'b-leased'],
+      ['failed',    q.failed    || 0, 'b-failed'],
+      ['poisoned',  q.poisoned  || 0, 'b-poisoned']
     ];
     if (total > 0) {
       for (var i = 0; i < segs.length; i++) {
@@ -300,15 +292,15 @@
         var d = document.createElement('div');
         d.className = cls;
         d.style.flex = String(n);
-        d.title = name + ': ' + fmt(n) + (byWidth ? ' q' : '');
+        d.title = name + ': ' + fmt(n) + ' q';
         bar.appendChild(d);
       }
-      var avail = src.available || 0;
+      var avail = q.available || 0;
       if (avail > 0) {
         var d2 = document.createElement('div');
         d2.style.flex = String(avail);
         d2.style.background = '#eee';
-        d2.title = 'available: ' + fmt(avail) + (byWidth ? ' q' : '');
+        d2.title = 'available: ' + fmt(avail) + ' q';
         bar.appendChild(d2);
       }
     }
@@ -317,15 +309,19 @@
       var parts = [];
       for (var ci = 0; ci < s.classes.length; ci++) {
         var c = s.classes[ci];
-        parts.push(c.name + ' ' + c.verified + '/' + c.total +
-                   ' (q ' + fmt(c.q_verified) + '/' + fmt(c.q_total) + ')');
+        // Same definition of "done" as the headline above — submitted counts,
+        // because the sieving for it is finished and only verification is
+        // outstanding. Reporting verified-only here made the class breakdown
+        // contradict the headline during any verifier backlog.
+        var cd  = (c.submitted || 0) + (c.verified || 0);
+        var cqd = (c.q_submitted || 0) + (c.q_verified || 0);
+        parts.push(escapeHtml(c.name) + ' ' + cd + '/' + c.total +
+                   ' (q ' + fmt(cqd) + '/' + fmt(c.q_total) + ')');
       }
       classLine = ' &middot; ' + parts.join(' &middot; ');
     }
     document.getElementById('bar-legend').innerHTML =
-      (byWidth
-        ? fmt(done) + ' / ' + fmt(total) + ' q-width done'
-        : done + ' / ' + w.total + ' workunits done') +
+      fmt(done) + ' / ' + fmt(total) + ' q-width done' +
       ' &middot; ' + (w.verified || 0) + '/' + (w.total || 0) + ' workunits' +
       ' &middot; ' + (w.leased || 0) + ' in flight' +
       ' &middot; ' + (w.available || 0) + ' pending' +

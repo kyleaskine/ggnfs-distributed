@@ -137,29 +137,51 @@ static int column_exists(sqlite3 *conn, const char *table, const char *column)
  * the verifier thread's second connection. */
 static int db_migrate(sqlite3 *conn)
 {
+    /* One writer at a time. This is a check-then-act: two processes opening the
+     * same jobdir during an upgrade can both observe a column missing, and the
+     * loser's ALTER fails with "duplicate column name" — a LOGICAL conflict
+     * that sqlite3_busy_timeout does nothing for, since neither statement ever
+     * blocks. BEGIN IMMEDIATE serialises the check with the ALTER so the
+     * second process re-reads the post-migration shape and finds nothing to
+     * do. Harmless when uncontended, and the whole block is idempotent. */
+    if (sqlite3_exec(conn, "BEGIN IMMEDIATE;", NULL, NULL, NULL) != SQLITE_OK) {
+        fprintf(stderr, "db: migrate: cannot begin: %s\n", sqlite3_errmsg(conn));
+        return -1;
+    }
+#define MIGRATE_FAIL() do { \
+        sqlite3_exec(conn, "ROLLBACK;", NULL, NULL, NULL); \
+        return -1; \
+    } while (0)
+
     /* workunits.class — 'cpu' (a gnfs-lasieve4-sized q_range) or 'gpu' (a
      * much wider one). Pre-existing rows are all CPU-sized by definition, so
      * the DEFAULT backfills them correctly. */
     int has = column_exists(conn, "workunits", "class");
-    if (has < 0) return -1;
+    if (has < 0) MIGRATE_FAIL();
     if (!has) {
         if (exec_or_log(conn,
                 "ALTER TABLE workunits ADD COLUMN class TEXT NOT NULL"
                 "     DEFAULT 'cpu';",
                 "migrate: add workunits.class") != 0)
-            return -1;
+            MIGRATE_FAIL();
         fprintf(stderr, "db: migrated schema — added workunits.class"
                         " (existing rows default to 'cpu')\n");
     }
 
     /* clients.last_class — informational only; NULL until the client leases. */
     has = column_exists(conn, "clients", "last_class");
-    if (has < 0) return -1;
+    if (has < 0) MIGRATE_FAIL();
     if (!has) {
         if (exec_or_log(conn,
                 "ALTER TABLE clients ADD COLUMN last_class TEXT;",
                 "migrate: add clients.last_class") != 0)
-            return -1;
+            MIGRATE_FAIL();
+    }
+#undef MIGRATE_FAIL
+    if (sqlite3_exec(conn, "COMMIT;", NULL, NULL, NULL) != SQLITE_OK) {
+        fprintf(stderr, "db: migrate: cannot commit: %s\n", sqlite3_errmsg(conn));
+        sqlite3_exec(conn, "ROLLBACK;", NULL, NULL, NULL);
+        return -1;
     }
     return 0;
 }
@@ -739,32 +761,26 @@ int db_release_lease(ggnfs_db_t *db, const char *workunit_id,
     return changed > 0 ? 0 : 1;
 }
 
-int db_clients_note_class(ggnfs_db_t *db, const char *client_id,
-                          const char *class)
+int db_clients_seen(ggnfs_db_t *db, const char *client_id, int64_t now_unix,
+                    const char *class)
 {
     sqlite3_stmt *st = NULL;
+    /* One statement, not two: an idle worker polling /lease on --idle-backoff
+     * is the highest-frequency request in the system and this runs on the same
+     * event-loop thread as /submit and /stats, so a second write transaction
+     * per poll is pure overhead. `class` may be NULL (every caller that is not
+     * /lease), in which case the stored value is left alone. */
     if (sqlite3_prepare_v2(db->conn,
-            "UPDATE clients SET last_class = ?2 WHERE id = ?1;",
-            -1, &st, NULL) != SQLITE_OK) {
-        return -1;
-    }
-    sqlite3_bind_text(st, 1, client_id, -1, SQLITE_STATIC);
-    sqlite3_bind_text(st, 2, class ? class : "cpu", -1, SQLITE_STATIC);
-    int rc = sqlite3_step(st);
-    sqlite3_finalize(st);
-    return (rc == SQLITE_DONE) ? 0 : -1;
-}
-
-int db_clients_seen(ggnfs_db_t *db, const char *client_id, int64_t now_unix)
-{
-    sqlite3_stmt *st = NULL;
-    if (sqlite3_prepare_v2(db->conn,
-            "INSERT INTO clients(id, first_seen, last_seen) VALUES (?1, ?2, ?2) "
-            "ON CONFLICT(id) DO UPDATE SET last_seen = ?2;",
+            "INSERT INTO clients(id, first_seen, last_seen, last_class) "
+            "VALUES (?1, ?2, ?2, ?3) "
+            "ON CONFLICT(id) DO UPDATE SET last_seen = ?2, "
+            "  last_class = COALESCE(?3, last_class);",
             -1, &st, NULL) != SQLITE_OK)
         return -1;
     sqlite3_bind_text (st, 1, client_id, -1, SQLITE_STATIC);
     sqlite3_bind_int64(st, 2, now_unix);
+    if (class) sqlite3_bind_text(st, 3, class, -1, SQLITE_STATIC);
+    else       sqlite3_bind_null(st, 3);
     int rc = sqlite3_step(st);
     sqlite3_finalize(st);
     return (rc == SQLITE_DONE) ? 0 : -1;
@@ -1050,6 +1066,10 @@ int db_stats_snapshot(ggnfs_db_t *db, int64_t now_unix, db_stats_t *out)
                 cc->q_total += qw;
                 if      (strcmp(sname, "available") == 0) cc->available += n;
                 else if (strcmp(sname, "leased")    == 0) cc->leased    += n;
+                else if (strcmp(sname, "submitted") == 0) {
+                    cc->submitted   += n;
+                    cc->q_submitted += qw;
+                }
                 else if (strcmp(sname, "verified")  == 0) {
                     cc->verified   += n;
                     cc->q_verified += qw;
@@ -1057,8 +1077,6 @@ int db_stats_snapshot(ggnfs_db_t *db, int64_t now_unix, db_stats_t *out)
             }
             sqlite3_finalize(st);
         }
-        out->q_total    = out->q.total;
-        out->q_verified = out->q.verified;
     }
 
     /* Q-width whose sieving finished in the last hour and has since passed

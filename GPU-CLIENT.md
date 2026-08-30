@@ -426,6 +426,59 @@ onto.
   after it on exactly the boxes that lack `fbgen_gpu`; it builds a bash array
   instead.
 
+## Second review pass (xhigh) after Phase 5
+
+15 findings, all real, all fixed. The theme was the GPU benchmark and the new
+bootstrap script — the code added last and exercised least.
+
+**The benchmark did not behave like a screening tool.** It passed a NULL cancel
+context, so `--max-seconds` was ignored entirely and the first Ctrl-C did
+nothing — on a wedged card, the exact case the tool exists for, it hung. It now
+uses the same `bench_should_cancel` the CPU phases do. It also printed the CPU
+default `--qrange` in its header while sieving the cuda default, printed an
+empty `--siever` and a meaningless worker count, and fired the siever-name
+mismatch warning on every GPU run. And when the server publishes no `gpu_args`
+it measured at bench's own default geometry and said nothing — the same
+corruption the Phase 5 gate caught, arriving by a different route; it warns
+loudly now.
+
+**The bootstrap script had three ways to produce a broken worker.** It skipped
+`make client` when a binary existed, so a box that had run an older bootstrap
+kept a client that rejects its own generated command line (the guard is gone;
+make is incremental anyway). It cleared `FBGEN` only when make returned
+non-zero, so a target that exits 0 without producing the binary left
+`--fbgen-gpu` pointing at nothing — now `[ -x ]` decides. And it spliced values
+into the generated arrays unquoted, so a pasted token with a stray space or a
+path with a space broke the runner; every element is quoted now. Plus `|| true`
+on the optional benchmark, since a below-threshold box is a result rather than
+a failed bootstrap.
+
+**Migration race.** `db_migrate`'s check-then-ALTER was not transactional: two
+processes opening the same jobdir during an upgrade could both see a column
+missing, and the loser's ALTER fails `db_open` with "duplicate column name".
+`sqlite3_busy_timeout` does nothing for a logical conflict, so the CLAUDE.md
+line added in the previous commit was wrong about this. Now wrapped in
+`BEGIN IMMEDIATE`, verified with six concurrent migrations of a copy of the
+real 430K-row jobdir: zero errors, schema correct.
+
+**Smaller.** `/lease` did two write transactions per poll and the idle poll is
+the highest-frequency request in the system — folded into one upsert. The
+per-class legend interpolated a server-derived string into `innerHTML` without
+escaping, the only one on the page that did. The class breakdown counted
+verified-only while the headline counted submitted+verified, so the two
+contradicted each other during any verifier backlog. `q_total`/`q_verified`
+were scalar duplicates of `q.total`/`q.verified`. The count-based dashboard
+fallback was unreachable — the page is embedded in the same binary that serves
+`/stats` — and doubled the render logic. And the generated worker scripts were
+not gitignored, which would have made every bootstrapped box's
+`git pull --ff-only` abort on its next re-run.
+
+**Noted, pre-existing, not fixed:** two concurrent `extend` runs can pick the
+same sequence number (`db_workunit_extent` reads it, then inserts) and one
+fails on the primary key. Surfaced by the concurrency test above. It fails
+loudly and corrupts nothing, and concurrent `extend` is not a normal
+operation.
+
 ## Expectations to set
 
 cuda-sieve finding 69 measured **99.97% recall and 1.6% genuinely new**

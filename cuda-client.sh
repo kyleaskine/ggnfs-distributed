@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
 # cuda-client.sh -- one-shot setup for a GPU ggnfs-distributed worker.
 #
-# The GPU counterpart to ggnfs-client.sh. Builds the sieve client, builds
+# The GPU counterpart to ggnfs-client.sh (which is deliberately untracked --
+# it carries a baked-in server and token). This one prompts for both and so
+# holds no deployment specifics, which is why it lives in the repo.
+#
+# Builds the sieve client, builds
 # cuda-sieve's `bench` (and `fbgen_gpu`), prompts for connection settings, and
 # writes run-cuda-client.sh plus benchmark-gpu.sh.
 #
@@ -17,7 +21,7 @@ set -euo pipefail
 REPO_URL="https://github.com/kyleaskine/ggnfs-distributed"
 REPO_DIR="ggnfs-distributed"
 
-DEFAULT_SERVER="http://165.227.115.69:8080"
+DEFAULT_SERVER=""
 DEFAULT_TOKEN=""
 DEFAULT_PREFETCH="2"
 DEFAULT_DEVICE="0"
@@ -89,12 +93,12 @@ else
 fi
 cd "$REPO_DIR"
 
-if [ -x ./ggnfs-sieve-client ]; then
-    echo "==> ggnfs-sieve-client already built, skipping make"
-else
-    echo "==> Building client"
-    make client
-fi
+# Always build: we just pulled, and a box that ran an older bootstrap has a
+# binary predating --engine=cuda. Skipping the build there produces a client
+# that rejects its own generated command line. make is incremental, so this is
+# a no-op when nothing changed.
+echo "==> Building client"
+make client
 CLIENT_DIR=$(pwd)
 
 # 3. cuda-sieve. Prefer a checkout the operator already has; otherwise ask.
@@ -137,19 +141,28 @@ if [ -x "$FBGEN" ]; then
 else
     echo "==> Building fbgen_gpu (lets the client cache the factor base once"
     echo "    per job instead of rebuilding it on every workunit)"
-    make -C "$CUDA_SIEVE_DIR/bench" GPU_ARCH=native fbgen_gpu || {
-        echo "warning: fbgen_gpu failed to build; the client will fall back to" >&2
-        echo "         building the factor base in-process on every workunit." >&2
-        FBGEN=""
-    }
+    make -C "$CUDA_SIEVE_DIR/bench" GPU_ARCH=native fbgen_gpu || true
+fi
+# Trust the artifact, not make's exit status: a target that is a no-op or
+# writes elsewhere exits 0 while leaving nothing here, and passing a
+# nonexistent --fbgen-gpu makes the client rebuild the ~230 MB factor base on
+# every single workunit while the summary below claims a cache is available.
+if [ ! -x "$FBGEN" ]; then
+    echo "warning: no fbgen_gpu binary; the client will build the factor base" >&2
+    echo "         in-process on every workunit." >&2
+    FBGEN=""
 fi
 
 # 4. Connection settings.
-prompt_tty SERVER_URL "Server URL"       "$DEFAULT_SERVER"
-prompt_tty TOKEN      "Auth token"       "$DEFAULT_TOKEN"
+prompt_tty SERVER_URL "Server URL (http://host:port)" "$DEFAULT_SERVER"
+prompt_tty TOKEN      "Auth token"                    "$DEFAULT_TOKEN"
 prompt_tty DEVICE     "CUDA device index" "$DEFAULT_DEVICE"
 prompt_tty PREFETCH   "Lease slots (prefetch)" "$DEFAULT_PREFETCH"
 
+if [ -z "$SERVER_URL" ]; then
+    echo "error: a server URL is required." >&2
+    exit 1
+fi
 if [ -z "$TOKEN" ]; then
     echo "error: a token is required (see <jobdir>/token on the server)." >&2
     exit 1
@@ -170,9 +183,10 @@ CLIENT_ID="$(hostname)-gpu$DEVICE"
 # Emitted into a bash ARRAY below, not spliced into a backslash-continued
 # command line: when fbgen_gpu is absent this line is empty, and an empty line
 # in the middle of a `\`-continued command silently truncates it -- dropping
-# every argument after it.
+# every argument after it. Every element is quoted in the generated file so a
+# path or token containing a space or a glob character survives.
 fbgen_arg=""
-[ -n "$FBGEN" ] && fbgen_arg="  --fbgen-gpu=$FBGEN"
+[ -n "$FBGEN" ] && fbgen_arg="  \"--fbgen-gpu=$FBGEN\""
 
 # 5. Runner + benchmark wrapper.
 cat > run-cuda-client.sh <<EOF
@@ -181,14 +195,14 @@ cat > run-cuda-client.sh <<EOF
 set -euo pipefail
 cd "\$(dirname "\$0")"
 args=(
-  --server-url=$SERVER_URL
-  --token=$TOKEN
+  "--server-url=$SERVER_URL"
+  "--token=$TOKEN"
   --engine=cuda
-  --cuda-bench=$BENCH
+  "--cuda-bench=$BENCH"
 $fbgen_arg
-  --device=$DEVICE
-  --prefetch=$PREFETCH
-  --client-id=$CLIENT_ID
+  "--device=$DEVICE"
+  "--prefetch=$PREFETCH"
+  "--client-id=$CLIENT_ID"
 )
 exec ./ggnfs-sieve-client "\${args[@]}" "\$@"
 EOF
@@ -203,12 +217,12 @@ set -euo pipefail
 cd "\$(dirname "\$0")"
 args=(
   benchmark
-  --server-url=$SERVER_URL
-  --token=$TOKEN
+  "--server-url=$SERVER_URL"
+  "--token=$TOKEN"
   --engine=cuda
-  --cuda-bench=$BENCH
+  "--cuda-bench=$BENCH"
 $fbgen_arg
-  --device=$DEVICE
+  "--device=$DEVICE"
 )
 exec ./ggnfs-sieve-client "\${args[@]}" "\$@"
 EOF
@@ -225,6 +239,9 @@ echo "    device    : $DEVICE, $PREFETCH lease slots"
 
 prompt_tty RUN_BENCH "Run the benchmark now? (y/N)" "N"
 case "$RUN_BENCH" in
-    [yY]*) ./benchmark-gpu.sh ;;
+    # Exit 3 (below --min-rels-per-sec) and 1 (bench failed) are results, not
+    # bootstrap failures; without `|| true` set -e would propagate them as this
+    # script's status after setup has actually succeeded.
+    [yY]*) ./benchmark-gpu.sh || true ;;
     *) echo "Skipping benchmark." ;;
 esac

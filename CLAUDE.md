@@ -171,7 +171,10 @@ those.
 --cuda-bench=... --fb1=...` times one fixed-width band on the card. Like the
 CPU benchmark it takes no lease and never submits, so it is safe against a
 live coordinator. `cuda-client.sh` bootstraps a GPU worker and writes both
-`run-cuda-client.sh` and `benchmark-gpu.sh`.
+`run-cuda-client.sh` and `benchmark-gpu.sh` (all three generated/deployment
+scripts are gitignored; `cuda-client.sh` itself is tracked because it prompts
+for server and token rather than baking them in, unlike `ggnfs-client.sh`,
+which is untracked for exactly that reason).
 
 ## Things that have bitten people (load-bearing detail)
 

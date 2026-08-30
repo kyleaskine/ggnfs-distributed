@@ -141,13 +141,12 @@ int db_renew_lease(ggnfs_db_t *db, const char *workunit_id,
 int db_release_lease(ggnfs_db_t *db, const char *workunit_id,
                      const char *client_id);
 
-/* Upsert a client's last_seen timestamp. */
-int db_clients_seen(ggnfs_db_t *db, const char *client_id, int64_t now_unix);
-
-/* Record the workunit class this client last asked /lease for. Shown on the
- * dashboard so a GPU box quietly requesting cpu-class work is visible. */
-int db_clients_note_class(ggnfs_db_t *db, const char *client_id,
-                          const char *class);
+/* Upsert a client's last_seen timestamp, and optionally the workunit class it
+ * just asked /lease for (shown on the dashboard, so a GPU box quietly
+ * requesting cpu-class work is visible). Pass class = NULL from any caller
+ * that is not /lease; the stored value is then left unchanged. */
+int db_clients_seen(ggnfs_db_t *db, const char *client_id, int64_t now_unix,
+                    const char *class);
 
 /* ---- verifier API (called from the verifier thread) ----------------- */
 
@@ -221,8 +220,10 @@ typedef struct {
     int64_t  total;
     int64_t  available;
     int64_t  leased;
+    int64_t  submitted;
     int64_t  verified;
     int64_t  q_total;                 /* SUM(q_range)                     */
+    int64_t  q_submitted;             /* SUM(q_range) WHERE submitted     */
     int64_t  q_verified;              /* SUM(q_range) WHERE verified      */
 } db_stats_class_t;
 
@@ -240,8 +241,6 @@ typedef struct {
      * rows makes 10-of-20 look like half the work. Same field names as `wu`,
      * but SUM(q_range) instead of COUNT(*). */
     db_workunit_counts_t  q;
-    int64_t  q_total;                 /* == q.total; kept for callers      */
-    int64_t  q_verified;              /* == q.verified; ditto              */
     int64_t  q_passed_1h;             /* q-width SUBMITTED in the last 1h that
                                        * has since passed verification; keyed
                                        * on submit time, see db_stats_snapshot */

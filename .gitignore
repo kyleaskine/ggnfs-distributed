@@ -20,6 +20,8 @@ rels/
 C191-ggnfs-client.sh
 ggnfs-client.sh
 run-client.sh
+run-cuda-client.sh
+benchmark-gpu.sh
 archive/
 .locks/
 benchmark.sh

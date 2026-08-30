@@ -2637,12 +2637,25 @@ static int run_benchmark_cuda(client_cfg_t *cfg, struct mg_mgr *mgr,
                               const proto_lease_response_t *lease,
                               const char *job_local,
                               uint32_t base_q, uint32_t qwidth,
-                              double min_rels)
+                              double min_rels, int64_t cap_ms)
 {
     char card[256];
     gpu_describe(card, sizeof(card));
     printf("card       : %s\n", card[0] ? card : "(nvidia-smi unavailable)");
     printf("gpu args   : %s\n", lease->gpu_args[0] ? lease->gpu_args : "(none)");
+    if (!lease->gpu_args[0]) {
+        /* Without the job's geometry bench falls back to its own default
+         * (logI 15), which sieves a different area than the campaign does —
+         * so the relation count is not the job's and the number is not
+         * comparable to anything. Worse, the --fb1 cache is keyed on the logI
+         * we think we are using, so it would be built for the wrong maxbits.
+         * This corrupts the measurement rather than merely slowing it. */
+        fprintf(stderr,
+                "benchmark: WARNING — the server publishes no gpu_args, so "
+                "bench will run at its OWN default geometry, not this job's. "
+                "The result is not comparable across boxes. Set it with "
+                "`extend --gpu-args=\"...\"` and restart serve.\n");
+    }
     fflush(stdout);
 
     /* Phase 0: the factor base, so the timed run measures sieving rather than
@@ -2670,15 +2683,25 @@ static int run_benchmark_cuda(client_cfg_t *cfg, struct mg_mgr *mgr,
 
     struct timeval t0, t1;
     gettimeofday(&t0, NULL);
+    /* Same cancellation contract as the CPU phases: --max-seconds is a safety
+     * cap and the FIRST Ctrl-C stops the run. A screening tool whose whole
+     * purpose is finding sick hardware must not hang on a wedged card. */
+    bench_cancel_t cc = { .deadline_ms = monotonic_ms() + cap_ms };
     int rc = sieve_run_cuda(cfg->cuda_bench, job_local, outfile,
                             base_q, qwidth, lease->side,
                             lease->gpu_args, fb1, cfg->cuda_device,
-                            should_cancel_siever, NULL);
+                            bench_should_cancel, &cc);
     gettimeofday(&t1, NULL);
     double secs = elapsed_seconds(t0, t1);
 
     if (rc != 0) {
-        fprintf(stderr, "benchmark: bench returned %d — no measurement.\n", rc);
+        if (monotonic_ms() >= cc.deadline_ms) {
+            fprintf(stderr, "benchmark: hit the --max-seconds cap before "
+                    "finishing the q-range — this box is too slow to measure "
+                    "this way, or the card is wedged.\n");
+        } else {
+            fprintf(stderr, "benchmark: bench returned %d — no measurement.\n", rc);
+        }
         unlink(outfile);
         return 1;
     }
@@ -2762,13 +2785,30 @@ static int run_benchmark(int argc, char **argv, client_cfg_t *cfg)
         return 2;
     }
 
+    /* The CPU default of 65 (~3 special-q) is about a minute on one core but
+     * well under a second on a card — far too short to measure. Resolve this
+     * BEFORE the banner, or the header advertises a width the run never
+     * sieves, and "fixed work, identical on every box" stops being checkable
+     * from the pasted output. */
+    if (cfg->engine == ENGINE_CUDA && !flag(argc, argv, "--qrange"))
+        qrange = 1000;
+
     char model[160];
     cpu_model(model, sizeof(model));
     printf("=== ggnfs box benchmark ===\n");
-    printf("cpu        : %s\n", model);
-    printf("threads    : %ld online / %ld configured\n", online_cpus(), configured_cpus());
-    printf("workers    : %d\n", cfg->workers);
-    printf("siever     : %s\n", cfg->siever_path);
+    if (cfg->engine == ENGINE_CUDA) {
+        /* Core counts and --siever say nothing about a GPU run; the card and
+         * the bench binary are what matter, and run_benchmark_cuda names the
+         * card once it has queried it. */
+        printf("engine     : cuda (%s)\n", cfg->cuda_bench);
+        printf("host cpu   : %s\n", model);
+    } else {
+        printf("cpu        : %s\n", model);
+        printf("threads    : %ld online / %ld configured\n",
+               online_cpus(), configured_cpus());
+        printf("workers    : %d\n", cfg->workers);
+        printf("siever     : %s\n", cfg->siever_path);
+    }
     printf("q-range    : %lld wide (fixed work, same as a workunit's q_range)\n",
            (long long)qrange);
     fflush(stdout);
@@ -2794,12 +2834,6 @@ static int run_benchmark(int argc, char **argv, client_cfg_t *cfg)
     char siever_args[128];
     snprintf(siever_args, sizeof(siever_args), "%s", lease.siever_args);
 
-    /* The CPU default of 65 (~3 special-q) is about a minute on one core but
-     * well under a second on a card — far too short to measure. Widen it for
-     * the cuda engine unless the operator said otherwise. */
-    if (cfg->engine == ENGINE_CUDA && !flag(argc, argv, "--qrange"))
-        qrange = 1000;
-
     /* Fixed anchor: --q if given, else the campaign's q_min. */
     int64_t anchor = q_override ? q_override : qmin;
     if (anchor < 1) {
@@ -2816,11 +2850,16 @@ static int run_benchmark(int argc, char **argv, client_cfg_t *cfg)
      * scaling a clean signal (no per-q-region cost differences to confound it).
      * Each worker is an independent process with its own private sieve arrays. */
 
-    const char *siever_basename = strrchr(cfg->siever_path, '/');
-    siever_basename = siever_basename ? siever_basename + 1 : cfg->siever_path;
-    if (lease.siever[0] && strcmp(siever_basename, lease.siever) != 0) {
-        fprintf(stderr, "benchmark: WARNING — server expects siever '%s' but --siever is '%s'; "
-                "results reflect the binary you gave.\n", lease.siever, siever_basename);
+    /* lasieve4-only: under --engine=cuda there is no --siever to compare, and
+     * the server names a gnfs-lasieve4 binary because that is what the CPU
+     * fleet runs. Without this guard the warning fired on every GPU run. */
+    if (cfg->engine != ENGINE_CUDA) {
+        const char *siever_basename = strrchr(cfg->siever_path, '/');
+        siever_basename = siever_basename ? siever_basename + 1 : cfg->siever_path;
+        if (lease.siever[0] && strcmp(siever_basename, lease.siever) != 0) {
+            fprintf(stderr, "benchmark: WARNING — server expects siever '%s' but --siever is '%s'; "
+                    "results reflect the binary you gave.\n", lease.siever, siever_basename);
+        }
     }
     printf("anchor q   : %u%s  side=%c  args=\"%s\"\n",
            base_q, q_override ? " (--q)" : " (q_min)", side,
@@ -2834,11 +2873,15 @@ static int run_benchmark(int argc, char **argv, client_cfg_t *cfg)
         return 1;
     }
 
+    /* Deadline is only a safety cap (a healthy box finishes the q-range well
+     * within it); 0 means no cap. Both engines use it. */
+    int64_t cap_ms = max_seconds > 0 ? (int64_t)max_seconds * 1000 : (int64_t)1 << 62;
+
     /* One card, one measurement — the 1-core/N-core split below is meaningless
      * for a GPU, so the cuda engine gets its own fixed-work run. */
     if (cfg->engine == ENGINE_CUDA) {
         int grc = run_benchmark_cuda(cfg, &mgr, &lease, job_local,
-                                     base_q, (uint32_t)qrange, min_rels);
+                                     base_q, (uint32_t)qrange, min_rels, cap_ms);
         mg_mgr_free(&mgr);
         return grc;
     }
@@ -2871,9 +2914,6 @@ static int run_benchmark(int argc, char **argv, client_cfg_t *cfg)
     if (shutdown_phase() >= SHUTDOWN_DRAINING) return 1;
 
     uint32_t qwidth = (uint32_t)qrange;
-    /* Deadline is only a safety cap (a healthy box finishes the q-range well
-     * within it); 0 means no cap. */
-    int64_t cap_ms = max_seconds > 0 ? (int64_t)max_seconds * 1000 : (int64_t)1 << 62;
 
     /* Phase 1: single core. */
     printf("\nphase 1 (1 core ): sieving q-range [%u, %u) ...\n", base_q, base_q + qwidth);

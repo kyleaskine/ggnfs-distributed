@@ -714,8 +714,7 @@ static void handle_lease(struct mg_connection *c, struct mg_http_message *hm,
         return;
     }
 
-    db_clients_seen(ctx->db, client_id, now_unix());
-    db_clients_note_class(ctx->db, client_id, class_want);
+    db_clients_seen(ctx->db, client_id, now_unix(), class_want);
 
     db_lease_result_t r;
     int rc = db_lease(ctx->db, client_id, ctx->lease_seconds, now_unix(),
@@ -942,7 +941,7 @@ static void handle_submit(struct mg_connection *c, struct mg_http_message *hm,
         fclose(f);
     }
 
-    db_clients_seen(ctx->db, client_id, now_unix());
+    db_clients_seen(ctx->db, client_id, now_unix(), NULL);
     int rc = db_submit(ctx->db, workunit_id, client_id, rel_path, body_sha,
                        num_relations, sieve_seconds, now_unix());
     if (rc == 1) {
@@ -995,7 +994,7 @@ static void handle_renew(struct mg_connection *c, struct mg_http_message *hm,
         return;
     }
 
-    db_clients_seen(ctx->db, client_id, now_unix());
+    db_clients_seen(ctx->db, client_id, now_unix(), NULL);
     int rc = db_renew_lease(ctx->db, workunit_id, client_id,
                             ctx->lease_seconds, now_unix());
     if (rc == 0) {
@@ -1030,7 +1029,7 @@ static void handle_release(struct mg_connection *c, struct mg_http_message *hm,
         return;
     }
 
-    db_clients_seen(ctx->db, client_id, now_unix());
+    db_clients_seen(ctx->db, client_id, now_unix(), NULL);
     int rc = db_release_lease(ctx->db, workunit_id, client_id);
     if (rc == 0) {
         send_json_take(c, 200, proto_encode_submit_response(1, "released", 0));
@@ -1087,8 +1086,6 @@ static char *format_stats_json(server_ctx_t *ctx, const db_stats_t *s,
         cJSON_AddNumberToObject(qw, "failed",    (double)s->q.failed);
         cJSON_AddNumberToObject(qw, "poisoned",  (double)s->q.poisoned);
     }
-    cJSON_AddNumberToObject(wu, "q_total",       (double)s->q_total);
-    cJSON_AddNumberToObject(wu, "q_verified",    (double)s->q_verified);
     cJSON_AddNumberToObject(wu, "q_passed_1h",   (double)s->q_passed_1h);
 
     cJSON *cls = cJSON_AddArrayToObject(root, "classes");
@@ -1103,8 +1100,10 @@ static char *format_stats_json(server_ctx_t *ctx, const db_stats_t *s,
         cJSON_AddNumberToObject(o, "total",      (double)cc->total);
         cJSON_AddNumberToObject(o, "available",  (double)cc->available);
         cJSON_AddNumberToObject(o, "leased",     (double)cc->leased);
+        cJSON_AddNumberToObject(o, "submitted",  (double)cc->submitted);
         cJSON_AddNumberToObject(o, "verified",   (double)cc->verified);
         cJSON_AddNumberToObject(o, "q_total",    (double)cc->q_total);
+        cJSON_AddNumberToObject(o, "q_submitted", (double)cc->q_submitted);
         cJSON_AddNumberToObject(o, "q_verified", (double)cc->q_verified);
         cJSON_AddItemToArray(cls, o);
     }
