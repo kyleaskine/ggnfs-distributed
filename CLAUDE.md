@@ -136,12 +136,29 @@ dominates. Carve GPU bands ~100x wider:
     --gpu-args="--logI 17 --J 16384"
 ```
 
-**`gpu_args` is not a translation of `siever_args`.** `-J 16` is lasieve4
-vocabulary; `--logI 17 --J 16384` is cuda-sieve's, and per cuda-sieve finding
-69 they describe *different sieve areas* (`2^17 x 2^15` vs `2^17 x 2^14`). The
-lease response ships both and the client picks by its own `--engine`. `serve`
-reads `gpu_args` from `meta` **once at startup**, so changing it needs a
-`serve` restart — `extend` says so when you set it.
+**Geometry is derived from the job's own siever, so you usually set nothing.**
+`-J n` is lasieve4 vocabulary and `--logI/--J` is cuda-sieve's; they are not
+the same words for the same thing, and the axis order differs. cuda-sieve
+finding 65 measured the equivalence by inverting the q-lattice from emitted
+relations:
+
+| GGNFS | rectangle | cuda-sieve |
+|---|---|---|
+| `I14e` | 2^14 x 2^13 | `--logI 14 --J 8192` |
+| `I14e -J 14` | 2^15 x 2^13 | `--logI 15 --J 8192` |
+| `I16e` | 2^16 x 2^15 | `--logI 16 --J 32768` |
+| `I16e -J 16` | 2^17 x 2^15 | `--logI 17 --J 32768` |
+
+One rule covers all of it, with GGNFS's J_bits defaulting to I-1:
+**`--logI` = J_bits + 1, `--J` = 2^(I-1)** (`derive_gpu_args` in `client.c`).
+
+Precedence: the client's `--gpu-args`, then `meta.gpu_args`, then the
+derivation. A configured value wins — that is operator intent — but the client
+warns when it disagrees with what the campaign's siever implies, because that
+combination is how a card quietly sieves a different area than the CPU fleet
+for a whole campaign. Every band logs the rectangle it used and where that
+came from. `serve` reads `gpu_args` from `meta` **once at startup**, so
+changing it needs a `serve` restart — `extend` says so when you set it.
 
 **Lease heartbeat.** `POST /renew` pushes `lease_expires` out; the client
 heartbeats at a third of the lease window, through the sieve *and* the upload,
@@ -157,6 +174,15 @@ threads. Each slot needs its own `client_id` (`<base>-w0-s0`) because the
 server keeps at most one live lease per `client_id`. Measured against a 1.5 s
 latency proxy with 3 s bands: 44.9% card-busy serial, 78.8% at 2, 96.8% at 3.
 
+**Non-ASCII in the `.job`.** `init` refuses a `.job` containing bytes
+cuda-sieve cannot parse (CRLF and tabs are fine). This matters because the
+`.job`'s SHA *is* the job's identity — workunit IDs derive from it and
+`finalize-nfs.sh` compares it — so it cannot be corrected afterwards without
+orphaning the campaign. A live job was found carrying a zero-width space after
+`alambda: 3.6`: lasieve4 ignored it for weeks while cuda-sieve refused the file
+outright. For campaigns already in that state the cuda client sieves from a
+sanitized copy and leaves the distributed file byte-exact.
+
 **Factor base.** `--fbgen-gpu=<path to cuda-sieve fbgen_gpu>` builds the
 `--fb1` cache once per `(job sha, logI)` instead of letting `bench` rebuild it
 every workunit (~230 MB on the C208). Keying the filename on `(sha, logI)` is
@@ -170,11 +196,10 @@ those.
 **Screening a GPU box.** `ggnfs-sieve-client benchmark --engine=cuda
 --cuda-bench=... --fb1=...` times one fixed-width band on the card. Like the
 CPU benchmark it takes no lease and never submits, so it is safe against a
-live coordinator. `cuda-client.sh` bootstraps a GPU worker and writes both
-`run-cuda-client.sh` and `benchmark-gpu.sh` (all three generated/deployment
-scripts are gitignored; `cuda-client.sh` itself is tracked because it prompts
-for server and token rather than baking them in, unlike `ggnfs-client.sh`,
-which is untracked for exactly that reason).
+live coordinator. `cuda-client.sh` bootstraps a GPU worker and writes `run-cuda-client.sh` and
+`benchmark-gpu.sh`. Like `ggnfs-client.sh` it bakes in the live server and
+token, so all of them are gitignored and deployed by copying to the webserver
+rather than by being cloned.
 
 ## Things that have bitten people (load-bearing detail)
 

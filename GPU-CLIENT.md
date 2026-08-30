@@ -479,6 +479,34 @@ fails on the primary key. Surfaced by the concurrency test above. It fails
 loudly and corrupts nothing, and concurrent `extend` is not a normal
 operation.
 
+## Field notes from the first production run
+
+Pointing the GPU at the live coordinator surfaced two things no amount of
+local testing would have:
+
+- **The distributed `.job` carried a zero-width space** (U+200B after
+  `alambda: 3.6`). lasieve4 had ignored it for weeks across 170 clients;
+  cuda-sieve refused the file outright, so the GPU could not sieve a single
+  band. Fixed in two places: `init` now rejects such a file before its SHA
+  becomes the job's identity, and for campaigns already in that state the
+  client sieves from a sanitized copy.
+- **The live job is a different shape than the one all the testing used** —
+  rational-side special-q (`--sq-side 0`), not algebraic. That path had never
+  been exercised end to end. It verified on the first try.
+
+Measured on that job (RTX 5070 vs a 9800X3D core): 4,266 relations in 23.4 s
+against ~3,530 in ~735 s — **~38x a core, ~3.2x the whole 12-worker box**, and
+21% more relations per band because GGNFS trims its factor-base bound to the
+special-q while cuda-sieve does not. That gap narrows as q climbs toward
+`alim`. Wall clock with `--prefetch=2` measured 24.6 s/band against 23.7 s of
+sieving: **96% card utilisation**.
+
+Sizing note: the earlier `--qrange=100000` recommendation came from AS276,
+where a 1000-wide band is ~3.7 s of GPU time. On this job the same width is
+23.4 s, so 10,000-25,000 is the right range and 100,000 would mean 32-minute
+bands for no gain. Size GPU bands from a measured band time, not from a
+multiplier.
+
 ## Expectations to set
 
 cuda-sieve finding 69 measured **99.97% recall and 1.6% genuinely new**

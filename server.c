@@ -237,6 +237,46 @@ static void usage_init(void)
         "    [--jobdir=<dir>]        default current dir\n");
 }
 
+/* Reject a .job carrying bytes cuda-sieve cannot parse, before its SHA becomes
+ * the job's identity.
+ *
+ * A live campaign was found distributing a file with a zero-width space
+ * (U+200B) after "alambda: 3.6". gnfs-lasieve4 ignores it; cuda-sieve refuses
+ * the file outright, so the GPU could not sieve that job at all. By then the
+ * SHA was load-bearing — workunit IDs derive from it and finalize-nfs.sh
+ * compares it — so it could only be worked around client-side.
+ *
+ * Catching it here fixes it once, for every engine and every future job.
+ * Tabs and newlines are legitimate separators. */
+static int job_bytes_are_clean(const char *path)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f) return 1;                    /* other code reports open failures */
+    int c, line = 1, bad = 0, bad_line = 0;
+    while ((c = fgetc(f)) != EOF) {
+        if (c == '\n') { line++; continue; }
+        /* CR is fine: .job files routinely have CRLF endings (AS276.job does)
+         * and cuda-sieve parses them without complaint. Only bytes it actually
+         * chokes on are worth refusing a campaign over. */
+        if (c == '\t' || c == '\r' || (c >= 0x20 && c <= 0x7e)) continue;
+        if (!bad) bad_line = line;
+        bad++;
+    }
+    fclose(f);
+    if (bad) {
+        fprintf(stderr,
+            "init: %s contains %d unparseable byte(s) (first on line %d).\n"
+            "  gnfs-lasieve4 tolerates these; cuda-sieve refuses the file, so a\n"
+            "  GPU client could never sieve this job. The .job's SHA becomes the\n"
+            "  job's identity here, so this cannot be fixed later without\n"
+            "  orphaning the campaign.\n"
+            "  Clean it first, e.g.:  perl -i -pe 's/[^\\x20-\\x7e\\t\\r\\n]//g' %s\n",
+            path, bad, bad_line, path);
+        return 0;
+    }
+    return 1;
+}
+
 static int cmd_init(int argc, char **argv)
 {
     const char *job_path    = flag(argc, argv, "--job");
@@ -304,6 +344,12 @@ static int cmd_init(int argc, char **argv)
     if (!files_dir || !rels_dir) { free(files_dir); free(rels_dir); return 1; }
     if (mkdir_p(files_dir) != 0 || mkdir_p(rels_dir) != 0) {
         free(files_dir); free(rels_dir); return 1;
+    }
+
+    /* Check the bytes BEFORE hashing: once the SHA is taken it is the job's
+     * identity and the file can no longer be corrected. */
+    if (!job_bytes_are_clean(job_path)) {
+        free(files_dir); free(rels_dir); return 2;
     }
 
     /* Hash + copy the .job file into <jobdir>/files/<sha>.job. */
