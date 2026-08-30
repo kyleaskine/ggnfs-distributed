@@ -1153,6 +1153,66 @@ static void ensure_afb_cached(const client_cfg_t *cfg,
  *   -1  - 410 Gone (job complete, caller should exit)
  *   -2  - other error (caller should backoff)
  */
+/* ---- cuda-sieve poly input --------------------------------------------
+ *
+ * cuda-sieve parses the .job more strictly than gnfs-lasieve4 does, and a
+ * real campaign was found distributing a file with a zero-width space
+ * (U+200B, e2 80 8b) after "alambda: 3.6". lasieve4 ignores the trailing
+ * bytes and the whole CPU fleet sieved happily for weeks; bench refuses the
+ * file outright with "alambda must be finite and nonnegative", which blocks
+ * the GPU on that job completely.
+ *
+ * We cannot fix it at the source: the .job's SHA is the job's identity —
+ * workunit IDs derive from it and finalize-nfs.sh refuses to assemble if
+ * yafu's nfs.job SHA differs — so editing it would orphan a live campaign.
+ * Instead write a sanitized sibling for bench only. The original stays
+ * byte-exact for lasieve4 and for the cache's SHA check.
+ *
+ * The edit is deliberately minimal — drop bytes outside printable ASCII, keep
+ * newlines, keep every value — and it is loud when it fires. Note that
+ * cuda-sieve does not even use lambda (it derives its own survivor allowance
+ * and only reports the file's), so this is stripping junk out of a field the
+ * consumer ignores.
+ */
+static const char *cuda_job_file(const char *job_local, char *out, size_t out_n)
+{
+    snprintf(out, out_n, "%s.cuda", job_local);
+
+    size_t len = 0;
+    unsigned char *buf = read_file(job_local, &len);
+    if (!buf) return job_local;    /* let bench report the real problem */
+
+    unsigned char *clean = malloc(len ? len : 1);
+    if (!clean) { free(buf); return job_local; }
+    size_t n = 0;
+    for (size_t i = 0; i < len; i++) {
+        unsigned char c = buf[i];
+        if (c == '\n' || (c >= 0x20 && c <= 0x7e)) clean[n++] = c;
+    }
+    free(buf);
+
+    if (n == len) {                /* already clean — no sibling needed */
+        free(clean);
+        return job_local;
+    }
+
+    /* pid-staged + rename so concurrent clients sharing a workdir never see a
+     * partial file, matching the factor-base cache. */
+    char staged[420];
+    snprintf(staged, sizeof(staged), "%s.%d.part", out, (int)getpid());
+    int ok = (write_file(staged, clean, n) == 0) && (rename(staged, out) == 0);
+    free(clean);
+    if (!ok) {
+        unlink(staged);
+        fprintf(stderr, "client: cannot write %s; passing the .job unmodified\n", out);
+        return job_local;
+    }
+    fprintf(stderr, "client: the .job contains %zu non-ASCII/control byte(s) that "
+            "cuda-sieve rejects; sieving from a sanitized copy (%s). The "
+            "distributed file is unchanged.\n", len - n, out);
+    return out;
+}
+
 /* ---- cuda-sieve factor-base cache (--fb1) ------------------------------
  *
  * The direct analogue of ensure_afb_cached above. Without a --fb1 file, bench
@@ -1628,6 +1688,8 @@ typedef struct {
     client_cfg_t            cfg;         /* copy, with this slot's client_id */
     proto_lease_response_t  lease;
     char                    job_local[256];
+    char                    job_poly[300];   /* what bench gets; == job_local
+                                              * unless sanitising was needed */
     const char             *fb1;         /* cuda only; owned by the FB cache */
     char                   *outfile;     /* malloc'd */
     double                  sieve_seconds;
@@ -1684,11 +1746,17 @@ static int stage_acquire(struct mg_mgr *mgr, pipe_slot_t *slot)
 
     /* One-time per job: pre-generate the factor base so the siever does not
      * rebuild it on every workunit. lasieve4 auto-loads its .afb.0; cuda-sieve
-     * takes the equivalent as --fb1. */
-    if (cfg->engine == ENGINE_CUDA)
-        slot->fb1 = ensure_gpu_fb_cached(cfg, &slot->lease, slot->job_local, mgr);
-    else
+     * takes the equivalent as --fb1. Both the factor-base generator and bench
+     * share the strict poly parser, so both get the sanitized path. */
+    if (cfg->engine == ENGINE_CUDA) {
+        char poly[300];
+        snprintf(slot->job_poly, sizeof(slot->job_poly), "%s",
+                 cuda_job_file(slot->job_local, poly, sizeof(poly)));
+        slot->fb1 = ensure_gpu_fb_cached(cfg, &slot->lease, slot->job_poly, mgr);
+    } else {
+        snprintf(slot->job_poly, sizeof(slot->job_poly), "%s", slot->job_local);
         ensure_afb_cached(cfg, &slot->lease, slot->job_local);
+    }
 
     /* Local outfile path for the siever to write into. Use the workunit id
      * rather than the server's generic output name so concurrent client
@@ -1749,7 +1817,7 @@ static int stage_sieve(struct mg_mgr *mgr, pipe_slot_t *slot)
      * areas and must never be crossed over. */
     int sieve_rc;
     if (cfg->engine == ENGINE_CUDA) {
-        sieve_rc = sieve_run_cuda(cfg->cuda_bench, slot->job_local, slot->outfile,
+        sieve_rc = sieve_run_cuda(cfg->cuda_bench, slot->job_poly, slot->outfile,
                                   (uint32_t)slot->lease.q_start,
                                   (uint32_t)slot->lease.q_range,
                                   slot->lease.side,
@@ -2660,6 +2728,9 @@ static int run_benchmark_cuda(client_cfg_t *cfg, struct mg_mgr *mgr,
 
     /* Phase 0: the factor base, so the timed run measures sieving rather than
      * a one-time build. Same reasoning as the CPU path's .afb cache. */
+    char poly_buf[300];
+    job_local = cuda_job_file(job_local, poly_buf, sizeof(poly_buf));
+
     printf("\nfactor base: building/validating cache ...\n");
     fflush(stdout);
     struct timeval f0, f1;
