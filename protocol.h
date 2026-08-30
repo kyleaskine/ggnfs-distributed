@@ -27,6 +27,12 @@ typedef struct {
     const char *file_url;         /* "/file/<sha>" */
     const char *output_name;
     int64_t     output_max_bytes;
+    /* >1 when this lease is a BLOCK: `workunit_id` is then the block's anchor
+     * workunit and [q_start, q_start+q_range) spans all of its members. The
+     * client sieves it exactly like an ordinary workunit — that is the point
+     * of anchored addressing — so this is informational, for logging and for
+     * deciding how to pace heartbeats. 0 or absent means an ordinary lease. */
+    int64_t     block_members;
 } proto_lease_response_args;
 
 char *proto_encode_lease_response(const proto_lease_response_args *a);
@@ -38,14 +44,20 @@ char *proto_encode_lease_response(const proto_lease_response_args *a);
  * other and describe different sieve areas. Either may be "".
  */
 
-/* Decode {"client_id": "...", "client_version": "...", "class": "..."}.
- * Each output buffer may be NULL to ignore that field. "class" is absent on
+/* Decode {"client_id", "client_version", "class", "block", "block_max_members"}.
+ * Each output may be NULL to ignore that field. "class" is absent on
  * pre-class clients and comes back empty, which callers read as "cpu".
+ *
+ * *want_block is 1 only if the client explicitly asked for a block, so every
+ * client built before blocks existed keeps getting ordinary workunits with no
+ * negotiation. *block_max_members is the client's requested cap and is advice
+ * only — the server clamps it, since it flows into a LIMIT.
  * Returns 0 on success, -1 on parse error. */
 int proto_decode_lease_request(const char *body, size_t body_len,
                                char *client_id_buf,      size_t client_id_buf_n,
                                char *client_version_buf, size_t client_version_buf_n,
-                               char *class_buf,          size_t class_buf_n);
+                               char *class_buf,          size_t class_buf_n,
+                               int *want_block, int64_t *block_max_members);
 
 /* Client-side: decode a /lease success response (the JSON the server's
  * encoder above produces). MVP supports exactly one entry in `files`. */
@@ -64,6 +76,7 @@ typedef struct {
     char    file_url[160];
     char    output_name[64];
     int64_t output_max_bytes;
+    int64_t block_members;   /* >1 = this is a block; see the encoder above */
 } proto_lease_response_t;
 
 int proto_decode_lease_response(const char *body, size_t body_len,
@@ -71,9 +84,12 @@ int proto_decode_lease_response(const char *body, size_t body_len,
 
 /* Build the JSON request body for POST /lease. Caller free()s.
  * `class` is the workunit class this client wants ("cpu" / "gpu"); NULL
- * means "cpu". */
+ * means "cpu". `want_block` asks for a block lease; `block_max_members` (0 =
+ * let the server decide) caps how many workunits it may span. A server that
+ * predates blocks ignores both and returns an ordinary lease. */
 char *proto_encode_lease_request(const char *client_id, const char *client_version,
-                                 const char *class);
+                                 const char *class, int want_block,
+                                 int64_t block_max_members);
 
 /* ---- /submit ---- */
 

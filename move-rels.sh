@@ -70,31 +70,49 @@ if [ "$verified_only" -eq 1 ]; then
     command -v sqlite3 >/dev/null 2>&1 \
         || { echo "--verified-only: sqlite3 not on PATH" >&2; exit 1; }
 
-    # Read verified workunit ids into an associative set. -readonly keeps us
-    # safe even if a writer is active; the dot-command is the cheapest way
-    # to dump a single column.
+    # Read verified ids into an associative set. -readonly keeps us safe even
+    # if a writer is active; the dot-command is the cheapest way to dump a
+    # single column.
+    #
+    # Two id spaces, because a relation file is named after whatever was
+    # leased. A single workunit's file is <workunit_id>.dat[.zst]; a GPU
+    # block's is <block_id>.dat[.zst] -- named after the block, not its anchor
+    # workunit, so a re-sieved anchor cannot overwrite a block's relations.
+    # Reading only `workunits` here would leave every block file behind as
+    # unrecognised while quietly moving the CPU ones.
     declare -A verified
     while IFS= read -r id; do
         [ -n "$id" ] && verified["$id"]=1
     done < <(sqlite3 -readonly -batch "$db" \
         "SELECT id FROM workunits WHERE state = 'verified';")
 
+    # gpu_blocks only exists on a jobdir served by a build that has blocks;
+    # tolerate its absence rather than failing on an older one.
+    while IFS= read -r id; do
+        [ -n "$id" ] && verified["$id"]=1
+    done < <(sqlite3 -readonly -batch "$db" \
+        "SELECT id FROM gpu_blocks WHERE state = 'verified';" 2>/dev/null || true)
+
     if [ "${#verified[@]}" -eq 0 ]; then
-        echo "no verified workunits found in $db"
+        echo "no verified workunits or blocks found in $db"
         exit 0
     fi
 
     filtered=()
+    skipped=0
     for item in "${items[@]}"; do
         base="${item##*/}"
-        # Strip .dat.zst / .dat to recover the workunit id.
+        # Strip .dat.zst / .dat to recover the workunit or block id.
         wid="${base%.zst}"
         wid="${wid%.dat}"
         if [ -n "${verified[$wid]:-}" ]; then
             filtered+=( "$item" )
+        else
+            skipped=$(( skipped + 1 ))
         fi
     done
     items=( "${filtered[@]}" )
+    [ "$skipped" -gt 0 ] && echo "skipping $skipped unverified file(s)"
 fi
 
 if [ "${#items[@]}" -eq 0 ]; then

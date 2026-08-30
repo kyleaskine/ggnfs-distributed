@@ -594,6 +594,15 @@ typedef struct client_cfg_s {
      * card sieving across lease round trips and uploads. */
     int         prefetch;
 
+    /* Ask /lease for a BLOCK: one lease held over N contiguous workunits.
+     * Nothing else in this client changes shape, because a block is addressed
+     * by its anchor workunit and reported through the ordinary q_start /
+     * q_range / workunit_id fields — sieve, heartbeat, submit and release all
+     * run the same code. A server that predates blocks ignores the request and
+     * returns an ordinary workunit, so this is safe to send anywhere. */
+    int         want_blocks;
+    int64_t     block_max_members;      /* 0 = let the server size it */
+
     /* --cpu-pin parsed list. cpu_pin_count == 0 disables pinning. */
     int         cpu_pin_count;
     int         cpu_pin_list[CLIENT_MAX_WORKERS];
@@ -624,6 +633,11 @@ static void usage(void)
         "                                   \"--logI 16 --J 32768\". Without it the server's\n"
         "                                   gpu_args is used, and failing that the\n"
         "                                   rectangle is derived from the job's siever\n"
+        "    [--blocks=yes|no]              lease a BLOCK: one lease over N contiguous\n"
+        "                                   workunits, sized by the server. Default yes\n"
+        "                                   under --engine=cuda, no otherwise. Removes\n"
+        "                                   the per-band siever startup cost.\n"
+        "    [--block-max-members=N]        cap a block's workunit count (server clamps).\n"
         "    [--prefetch=N]                 lease slots per worker (default: 2 under\n"
         "                                   --engine=cuda, else 1). >1 overlaps leasing\n"
         "                                   and uploading with sieving\n"
@@ -648,6 +662,8 @@ static int parse_config(int argc, char **argv, client_cfg_t *cfg)
     cfg->http_concurrency = 16;
     snprintf(cfg->lease_class, sizeof(cfg->lease_class), "cpu");
     cfg->engine      = ENGINE_LASIEVE4;
+    cfg->want_blocks = -1;     /* resolved per engine once --engine is known */
+    cfg->block_max_members = 0;
     cfg->cuda_device = -1;
     cfg->prefetch    = 0;      /* resolved per engine once --engine is known */
     snprintf(cfg->workdir, sizeof(cfg->workdir), "%s", "/tmp/ggnfs-client");
@@ -672,6 +688,39 @@ static int parse_config(int argc, char **argv, client_cfg_t *cfg)
      * you point a card at a CPU band to drain a tail. */
     if (cfg->engine == ENGINE_CUDA)
         snprintf(cfg->lease_class, sizeof(cfg->lease_class), "gpu");
+
+    const char *blocks_s = flag(argc, argv, "--blocks");
+    if (blocks_s && *blocks_s) {
+        if      (strcmp(blocks_s, "yes") == 0 || strcmp(blocks_s, "1") == 0)
+            cfg->want_blocks = 1;
+        else if (strcmp(blocks_s, "no")  == 0 || strcmp(blocks_s, "0") == 0)
+            cfg->want_blocks = 0;
+        else {
+            fprintf(stderr, "client: --blocks must be 'yes' or 'no'\n");
+            return -1;
+        }
+    }
+    /* A block is sized for a card. On one CPU core it would run tens of hours,
+     * blow through --lease-seconds, and be reclaimed having produced nothing —
+     * the same asymmetry the old gpu/cpu class chain encoded. Default it off
+     * for lasieve4 and let an operator override with eyes open. */
+    if (cfg->want_blocks < 0)
+        cfg->want_blocks = (cfg->engine == ENGINE_CUDA) ? 1 : 0;
+    else if (cfg->want_blocks && cfg->engine != ENGINE_CUDA)
+        fprintf(stderr, "client: warning: --blocks=yes with --engine=%s — a "
+                        "block is sized for a GPU and may not finish inside "
+                        "the lease window on one core\n",
+                engine_name(cfg->engine));
+
+    const char *bmm_s = flag(argc, argv, "--block-max-members");
+    if (bmm_s && *bmm_s) {
+        int64_t n = 0;
+        if (parse_int64_arg(bmm_s, &n) != 0 || n < 1) {
+            fprintf(stderr, "client: --block-max-members must be >= 1\n");
+            return -1;
+        }
+        cfg->block_max_members = n;
+    }
 
     const char *lease_class = flag(argc, argv, "--lease-class");
     if (lease_class && *lease_class) {
@@ -1548,8 +1597,12 @@ static int do_lease(struct mg_mgr *mgr, const client_cfg_t *cfg,
     char url[512];
     if (join_url(url, sizeof(url), cfg->server_url, "/lease") != 0) return -2;
 
+    /* want_blocks is 1 by default under --engine=cuda. When it is 0 the encoder
+     * emits no block fields at all, so the request is byte-identical to what a
+     * pre-block client sent and an old server sees nothing new. */
     char *body = proto_encode_lease_request(cfg->client_id, CLIENT_VERSION,
-                                            cfg->lease_class);
+                                            cfg->lease_class, cfg->want_blocks,
+                                            cfg->block_max_members);
     if (!body) return -2;
     size_t body_len = strlen(body);
 
@@ -1894,6 +1947,19 @@ static int stage_acquire(struct mg_mgr *mgr, pipe_slot_t *slot)
         return -1;
     }
 
+    /* A block prints as what it is. Without this the only visible difference
+     * between a block and an ordinary lease is a q_range 50x larger, which is
+     * exactly the kind of thing an operator should not have to infer. */
+    if (slot->lease.block_members > 1) {
+        printf("client: leased BLOCK %s  %lld workunits  q=[%lld,%lld)  width=%lld\n",
+               slot->lease.workunit_id,
+               (long long)slot->lease.block_members,
+               (long long)slot->lease.q_start,
+               (long long)(slot->lease.q_start + slot->lease.q_range),
+               (long long)slot->lease.q_range);
+    } else if (cfg->want_blocks) {
+        printf("client: no block available; took a single workunit\n");
+    }
     printf("client: leased %s  q=[%lld,%lld)  width=%lld  side=%c  engine=%s  args=%s\n",
            slot->lease.workunit_id,
            (long long)slot->lease.q_start,

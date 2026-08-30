@@ -32,6 +32,8 @@ char *proto_encode_lease_response(const proto_lease_response_args *a)
     cJSON_AddStringToObject(root, "command_template", a->command_template);
     cJSON_AddStringToObject(root, "siever_args",      a->siever_args ? a->siever_args : "");
     cJSON_AddStringToObject(root, "gpu_args",         a->gpu_args    ? a->gpu_args    : "");
+    if (a->block_members > 0)
+        cJSON_AddNumberToObject(root, "block_members", (double)a->block_members);
 
     cJSON_AddStringToObject(file0, "name",   a->file_name);
     cJSON_AddStringToObject(file0, "sha256", a->file_sha256_hex);
@@ -69,8 +71,11 @@ static void copy_str_field(cJSON *root, const char *name,
 int proto_decode_lease_request(const char *body, size_t body_len,
                                char *client_id_buf,      size_t client_id_buf_n,
                                char *client_version_buf, size_t client_version_buf_n,
-                               char *class_buf,          size_t class_buf_n)
+                               char *class_buf,          size_t class_buf_n,
+                               int *want_block, int64_t *block_max_members)
 {
+    if (want_block)         *want_block = 0;
+    if (block_max_members)  *block_max_members = 0;
     cJSON *root = cJSON_ParseWithLength(body, body_len);
     if (!root) return -1;
     copy_str_field(root, "client_id",      client_id_buf,      client_id_buf_n);
@@ -78,18 +83,36 @@ int proto_decode_lease_request(const char *body, size_t body_len,
     /* Absent on clients built before workunit classes existed; the caller
      * treats an empty class as "cpu", which is what those clients are. */
     copy_str_field(root, "class",          class_buf,          class_buf_n);
+    if (want_block) {
+        const cJSON *b = cJSON_GetObjectItemCaseSensitive(root, "block");
+        *want_block = (cJSON_IsTrue(b) || (cJSON_IsNumber(b) && b->valuedouble > 0));
+    }
+    if (block_max_members) {
+        const cJSON *m = cJSON_GetObjectItemCaseSensitive(root, "block_max_members");
+        if (cJSON_IsNumber(m) && m->valuedouble > 0)
+            *block_max_members = (int64_t)m->valuedouble;
+    }
     cJSON_Delete(root);
     return 0;
 }
 
 char *proto_encode_lease_request(const char *client_id, const char *client_version,
-                                 const char *class)
+                                 const char *class, int want_block,
+                                 int64_t block_max_members)
 {
     cJSON *root = cJSON_CreateObject();
     if (!root) return NULL;
     cJSON_AddStringToObject(root, "client_id",      client_id      ? client_id      : "");
     cJSON_AddStringToObject(root, "client_version", client_version ? client_version : "");
     cJSON_AddStringToObject(root, "class",          class          ? class          : "cpu");
+    /* Emitted only when asked for, so the request a pre-block client sends is
+     * byte-identical to what it sent before and an old server sees nothing new. */
+    if (want_block) {
+        cJSON_AddBoolToObject(root, "block", 1);
+        if (block_max_members > 0)
+            cJSON_AddNumberToObject(root, "block_max_members",
+                                    (double)block_max_members);
+    }
     char *s = json_to_alloced(root);
     cJSON_Delete(root);
     return s;
@@ -134,6 +157,10 @@ int proto_decode_lease_response(const char *body, size_t body_len,
     out->q_start       = copy_int_field(root, "q_start",       0);
     out->q_range       = copy_int_field(root, "q_range",       0);
     out->lease_seconds = copy_int_field(root, "lease_seconds", 0);
+    /* Absent from servers predating blocks, and from ordinary leases on a
+     * server that has them. Not required: 0 simply means "an ordinary
+     * workunit", which is how every existing client already treats it. */
+    out->block_members = copy_int_field(root, "block_members", 0);
 
     /* side is "a" or "r" */
     cJSON *side = cJSON_GetObjectItemCaseSensitive(root, "side");

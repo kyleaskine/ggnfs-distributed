@@ -307,8 +307,13 @@ static size_t rstrip_eol(char *line, size_t len)
     return len;
 }
 
-static int relation_has_q_in_range(const verify_relation_t *rel,
-                                   char side, int64_t q_start, int64_t q_range)
+/* Is any sieved-side prime in [q_start, q_start+q_range)? When `out_q` is
+ * non-NULL the SMALLEST such prime is returned through it, which costs a full
+ * scan instead of an early exit — so callers that only need the yes/no (every
+ * ordinary submission) pass NULL and keep the fast path. */
+static int relation_q_in_range(const verify_relation_t *rel,
+                               char side, int64_t q_start, int64_t q_range,
+                               uint64_t *out_q)
 {
     /* The special-q is *one of* the primes on the sieved side. We don't know
      * which one a priori (it's typically the largest, but lasieve4 doesn't
@@ -320,15 +325,43 @@ static int relation_has_q_in_range(const verify_relation_t *rel,
 
     uint64_t q_lo = (uint64_t)q_start;
     uint64_t q_hi = q_lo + (uint64_t)q_range;   /* exclusive */
+    uint64_t best = 0;
+    int      found = 0;
     for (int i = 0; i < n; i++) {
-        if (primes[i] >= q_lo && primes[i] < q_hi) return 1;
+        if (primes[i] >= q_lo && primes[i] < q_hi) {
+            if (!out_q) return 1;
+            if (!found || primes[i] < best) { best = primes[i]; found = 1; }
+        }
     }
-    return 0;
+    if (found && out_q) *out_q = best;
+    return found;
+}
+
+static int relation_has_q_in_range(const verify_relation_t *rel,
+                                   char side, int64_t q_start, int64_t q_range)
+{
+    return relation_q_in_range(rel, side, q_start, q_range, NULL);
+}
+
+/* Index of the member containing q, or -1. bounds[] is ascending with
+ * n_members+1 entries, so this is an ordinary upper-bound search. */
+static int coverage_bucket(const verify_coverage_t *cov, uint64_t q)
+{
+    int lo = 0, hi = cov->n_members;      /* answer in [lo, hi) */
+    if (cov->n_members <= 0) return -1;
+    if ((int64_t)q <  cov->bounds[0])          return -1;
+    if ((int64_t)q >= cov->bounds[cov->n_members]) return -1;
+    while (hi - lo > 1) {
+        int mid = lo + (hi - lo) / 2;
+        if ((int64_t)q >= cov->bounds[mid]) lo = mid; else hi = mid;
+    }
+    return lo;
 }
 
 int verify_parse_file_check(const char *path,
                             const verify_check_t *check,
                             verify_reservoir_t *reservoir,
+                            verify_coverage_t  *coverage,
                             int64_t *out_parsed,
                             int64_t *out_failed,
                             int64_t *out_q_violations,
@@ -364,8 +397,13 @@ int verify_parse_file_check(const char *path,
             }
             continue;
         }
-        if (check_q && !relation_has_q_in_range(&rel, check->side,
-                                                check->q_start, check->q_range)) {
+        uint64_t qmatch  = 0;
+        int      want_q   = (coverage && coverage->n_members > 0);
+        int      in_range = check_q
+            ? relation_q_in_range(&rel, check->side, check->q_start,
+                                  check->q_range, want_q ? &qmatch : NULL)
+            : 0;
+        if (check_q && !in_range) {
             qviol++;
             if (out_first_reason && reason_buflen > 0 && out_first_reason[0] == '\0') {
                 snprintf(out_first_reason, reason_buflen,
@@ -377,6 +415,11 @@ int verify_parse_file_check(const char *path,
             continue;
         }
         parsed++;
+
+        if (want_q && in_range) {
+            int m = coverage_bucket(coverage, qmatch);
+            if (m >= 0) coverage->counts[m]++;
+        }
 
         /* Algorithm R: each accepted relation has cap/sampled_from probability
          * of replacing a uniformly-chosen slot, giving a uniform random sample
@@ -409,7 +452,7 @@ int verify_parse_file_check(const char *path,
 
 int verify_parse_file(const char *path, int64_t *out_parsed, int64_t *out_failed)
 {
-    return verify_parse_file_check(path, NULL, NULL,
+    return verify_parse_file_check(path, NULL, NULL, NULL,
                                    out_parsed, out_failed, NULL, NULL, 0);
 }
 
@@ -1016,6 +1059,26 @@ static int spotcheck_k_for(int base_k, int64_t base_q_range, int64_t q_range)
 /* Drain every pending submission; returns when the queue is empty (or on
  * a DB error after logging it). `poly` may be NULL — in that case the norm
  * spot-check is silently skipped (parse + q-range only). */
+/* One resolution point for both submission shapes, so every early-exit in the
+ * drain loop below stays a one-liner and no failure path can forget that a
+ * block has members. Ordinary submissions keep exactly their old behaviour. */
+static void resolve_fail(ggnfs_db_t *db, const db_pending_t *p,
+                         const char *reason, int64_t max_attempts, int64_t now)
+{
+    if (p->block_id[0]) {
+        int64_t req = 0, poi = 0;
+        db_block_verify_fail(db, p->submission_id, reason, max_attempts, now,
+                             &req, &poi);
+        fprintf(stderr, "verify: %s (block %s, %lld members) FAIL: %s"
+                        "  [requeued=%lld poisoned=%lld]\n",
+                p->workunit_id, p->block_id, (long long)p->member_count, reason,
+                (long long)req, (long long)poi);
+    } else {
+        db_verify_fail(db, p->submission_id, reason, max_attempts, now, NULL);
+        fprintf(stderr, "verify: %s FAIL: %s\n", p->workunit_id, reason);
+    }
+}
+
 static void drain_pending(verify_thread_t *vt, ggnfs_db_t *db,
                           const verify_poly_gmp_t *poly)
 {
@@ -1053,8 +1116,11 @@ static void drain_pending(verify_thread_t *vt, ggnfs_db_t *db,
         char    first_reason[160] = {0};
 
         if (!p.file_path) {
-            db_verify_fail(db, p.submission_id, "submission has no file_path",
-                           vt->max_attempts, now, NULL);
+            /* resolve_fail, not db_verify_fail: for a block the latter requeues
+             * only the anchor and leaves every other member stuck in
+             * 'submitted' forever, since the sweep only touches 'leased'. */
+            resolve_fail(db, &p, "submission has no file_path",
+                         vt->max_attempts, now);
             db_pending_free(&p);
             continue;
         }
@@ -1088,25 +1154,47 @@ static void drain_pending(verify_thread_t *vt, ggnfs_db_t *db,
             .seed = (unsigned int)(now ^ (uintptr_t)p.file_path),
         };
 
+        /* For a block, count relations per member so a sub-range that produced
+         * nothing can be charged on its own instead of dragging the whole
+         * block down. Only worth setting up when there is more than one
+         * member. */
+        verify_coverage_t  cov     = {0};
+        verify_coverage_t *cov_arg = NULL;
+        int64_t *mstarts = NULL, *mbounds = NULL, *mcounts = NULL;
+        int      n_members = 0;
+        if (p.block_id[0] && p.member_count > 1 &&
+            db_block_members(db, p.q_start, p.q_start + p.q_range,
+                             &mstarts, &n_members) == 0 && n_members > 1) {
+            mbounds = malloc((size_t)(n_members + 1) * sizeof(*mbounds));
+            mcounts = calloc((size_t)n_members, sizeof(*mcounts));
+            if (mbounds && mcounts) {
+                memcpy(mbounds, mstarts, (size_t)n_members * sizeof(*mbounds));
+                mbounds[n_members] = p.q_start + p.q_range;
+                cov.bounds    = mbounds;
+                cov.n_members = n_members;
+                cov.counts    = mcounts;
+                cov_arg       = &cov;
+            }
+        }
+#define DRAIN_NEXT() do { free(mstarts); free(mbounds); free(mcounts); \
+                          db_pending_free(&p); } while (0)
+
         int io_err = (verify_parse_file_check(p.file_path, &check,
                                               rescap > 0 ? &reservoir : NULL,
+                                              cov_arg,
                                               &parsed, &failed, &qviol,
                                               first_reason, sizeof(first_reason)) != 0);
         if (io_err) {
             char reason[256];
             snprintf(reason, sizeof(reason), "open %s: %s",
                      p.file_path, strerror(errno));
-            db_verify_fail(db, p.submission_id, reason,
-                           vt->max_attempts, now, NULL);
-            db_pending_free(&p);
+            resolve_fail(db, &p, reason, vt->max_attempts, now);
+            DRAIN_NEXT();
             continue;
         }
         if (parsed == 0 && failed == 0 && qviol == 0) {
-            const char *reason = "empty relation file";
-            db_verify_fail(db, p.submission_id, reason,
-                           vt->max_attempts, now, NULL);
-            fprintf(stderr, "verify: %s FAIL: %s\n", p.workunit_id, reason);
-            db_pending_free(&p);
+            resolve_fail(db, &p, "empty relation file", vt->max_attempts, now);
+            DRAIN_NEXT();
             continue;
         }
         if (failed > 0 || qviol > 0) {
@@ -1115,10 +1203,8 @@ static void drain_pending(verify_thread_t *vt, ggnfs_db_t *db,
                      "parse_fail=%lld q_out_of_range=%lld accepted=%lld (first: %s)",
                      (long long)failed, (long long)qviol, (long long)parsed,
                      first_reason[0] ? first_reason : "?");
-            db_verify_fail(db, p.submission_id, reason,
-                           vt->max_attempts, now, NULL);
-            fprintf(stderr, "verify: %s FAIL: %s\n", p.workunit_id, reason);
-            db_pending_free(&p);
+            resolve_fail(db, &p, reason, vt->max_attempts, now);
+            DRAIN_NEXT();
             continue;
         }
 
@@ -1133,25 +1219,118 @@ static void drain_pending(verify_thread_t *vt, ggnfs_db_t *db,
                          "norm spot-check failed: %d/%d (first: %s)",
                          spotfails, reservoir.count,
                          spot_reason[0] ? spot_reason : "?");
-                db_verify_fail(db, p.submission_id, reason,
-                               vt->max_attempts, now, NULL);
-                fprintf(stderr, "verify: %s FAIL: %s\n", p.workunit_id, reason);
-                db_pending_free(&p);
+                resolve_fail(db, &p, reason, vt->max_attempts, now);
+                DRAIN_NEXT();
                 continue;
             }
         }
 
-        db_verify_pass(db, p.submission_id, parsed, now);
-        if (rescap > 0) {
-            fprintf(stderr, "verify: %s PASS (%lld relations, spotcheck k=%d/%lld)\n",
-                    p.workunit_id, (long long)parsed,
-                    reservoir.count, (long long)reservoir.sampled_from);
+        if (p.block_id[0]) {
+            /* Members that contributed nothing are the one thing a passing
+             * block can still be wrong about, and they are safe to requeue on
+             * their own precisely because they contributed nothing: the stored
+             * file has no relations for those ranges, so re-sieving them
+             * cannot duplicate anything already assembled. */
+            int64_t *empty = NULL;
+            int      n_empty = 0;
+            if (cov_arg) {
+                /* A THRESHOLD, not a zero test. Attribution is by the smallest
+                 * sieved-side prime inside the block range, and a relation
+                 * occasionally carries a second in-range prime below its own
+                 * special-q. Measured on a real 6-member block with one
+                 * member's relations deliberately omitted: that member still
+                 * attracted 1 stray against a median of 3383, so `== 0` never
+                 * fires. A member that was genuinely sieved carries thousands,
+                 * so 1/20th of the median separates the two by two orders of
+                 * magnitude while staying far away from any real member. */
+                /* Compare relation DENSITY, not raw counts. A block is sized
+                 * by accumulated q-width and imposes no same-width rule, so a
+                 * run can legitimately mix a 1,000-wide row left by an early
+                 * `extend --qrange=1000` with 20,000-wide ones. Yield scales
+                 * with width, so on raw counts the narrow member sits at ~1/20
+                 * of the median and gets requeued despite having sieved
+                 * perfectly — duplicating its relations and walking it toward
+                 * 'poisoned'. */
+                int64_t *dens   = malloc((size_t)n_members * sizeof(*dens));
+                int64_t *sorted = malloc((size_t)n_members * sizeof(*sorted));
+                if (dens && sorted) {
+                    for (int i = 0; i < n_members; i++) {
+                        int64_t w = mbounds[i + 1] - mbounds[i];
+                        dens[i] = w > 0 ? (mcounts[i] * 1000) / w : 0;
+                    }
+                    memcpy(sorted, dens, (size_t)n_members * sizeof(*sorted));
+                    for (int i = 1; i < n_members; i++) {   /* insertion sort */
+                        int64_t v = sorted[i]; int j = i - 1;
+                        while (j >= 0 && sorted[j] > v) { sorted[j+1] = sorted[j]; j--; }
+                        sorted[j+1] = v;
+                    }
+                    /* Median normally, but MAX when the median is zero.
+                     * A median of 0 means more than half the members produced
+                     * nothing — a truncated or killed siever run — and that is
+                     * exactly when this check matters most. Guarding on
+                     * `median > 0` would skip the requeue and let
+                     * db_block_verify_pass mark every one of those unsieved
+                     * sub-ranges 'verified', losing them silently for the rest
+                     * of the campaign. */
+                    int64_t ref = sorted[n_members / 2];
+                    if (ref == 0) ref = sorted[n_members - 1];
+                    free(sorted); sorted = NULL;
+
+                    if (ref > 0) {
+                        empty = malloc((size_t)n_members * sizeof(*empty));
+                        if (empty) {
+                            for (int i = 0; i < n_members; i++)
+                                if (dens[i] * 20 < ref)
+                                    empty[n_empty++] = mbounds[i];
+                        }
+                    } else {
+                        /* Nothing bucketed anywhere, yet the file parsed. Do
+                         * not guess which members are real — say so instead. */
+                        fprintf(stderr, "verify: %s — no relation bucketed to "
+                                        "any member; coverage check skipped\n",
+                                p.block_id);
+                    }
+                }
+                free(sorted);
+                free(dens);
+            }
+            int64_t req = 0, poi = 0;
+            db_block_verify_pass(db, p.submission_id, parsed,
+                                 empty, n_empty, vt->max_attempts, now,
+                                 &req, &poi);
+            fprintf(stderr, "verify: %s (block %s) PASS (%lld relations, "
+                            "%d/%d members covered", p.workunit_id, p.block_id,
+                    (long long)parsed,
+                    cov_arg ? n_members - n_empty : (int)p.member_count,
+                    cov_arg ? n_members : (int)p.member_count);
+            if (rescap > 0)
+                fprintf(stderr, ", spotcheck k=%d/%lld",
+                        reservoir.count, (long long)reservoir.sampled_from);
+            fprintf(stderr, ")\n");
+            for (int i = 0; i < n_empty; i++)
+                fprintf(stderr, "verify: %s — member q=%lld produced "
+                                "essentially no relations; re-queued\n",
+                        p.block_id, (long long)empty[i]);
+            if (n_empty > 0)
+                fprintf(stderr, "verify: %s — %d/%d members starved; "
+                                "requeued=%lld poisoned=%lld\n",
+                        p.block_id, n_empty, n_members,
+                        (long long)req, (long long)poi);
+            free(empty);
         } else {
-            fprintf(stderr, "verify: %s PASS (%lld relations)\n",
-                    p.workunit_id, (long long)parsed);
+            db_verify_pass(db, p.submission_id, parsed, now);
+            if (rescap > 0) {
+                fprintf(stderr, "verify: %s PASS (%lld relations, spotcheck k=%d/%lld)\n",
+                        p.workunit_id, (long long)parsed,
+                        reservoir.count, (long long)reservoir.sampled_from);
+            } else {
+                fprintf(stderr, "verify: %s PASS (%lld relations)\n",
+                        p.workunit_id, (long long)parsed);
+            }
         }
-        db_pending_free(&p);
+        DRAIN_NEXT();
     }
+#undef DRAIN_NEXT
 
     free(resbuf);
 }

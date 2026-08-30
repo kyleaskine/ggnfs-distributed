@@ -71,10 +71,59 @@ N=$(awk '/^n:/ { print $2 }' "$yafu_dir/nfs.job" | tr -d '\r')
 [ -n "$N" ] || { echo "could not parse n: from $yafu_dir/nfs.job" >&2; exit 1; }
 
 shopt -s nullglob
-dat_files=( "$jobdir"/rels/wu-*.dat )
-zst_files=( "$jobdir"/rels/wu-*.dat.zst )
+
+# Which relation files go into nfs.dat.
+#
+# Prefer the database: `SELECT ... WHERE verify_status='passed'` is the only
+# source that knows which submissions actually passed. Globbing the directory
+# assembles failed submissions too (their files are left on disk), and it
+# cannot tell a superseded file from a current one. It also has to know every
+# filename shape the server has ever used -- a block's file is named after its
+# block, not a workunit, precisely so a re-sieved anchor cannot overwrite it.
+#
+# Paths in the DB are absolute and recorded on the SERVER, so a jobdir that was
+# rsynced here (pull-rels.sh) will not match them. Re-root every basename under
+# this jobdir's rels/ instead of trusting the stored directory.
+dat_files=()
+zst_files=()
+selected_from="database"
+db="$jobdir/job.db"
+
+if [ -f "$db" ] && command -v sqlite3 >/dev/null 2>&1; then
+    missing=0
+    while IFS= read -r fp; do
+        [ -n "$fp" ] || continue
+        f="$jobdir/rels/${fp##*/}"
+        if [ ! -f "$f" ]; then
+            missing=$(( missing + 1 ))
+            continue
+        fi
+        case "$f" in
+            *.zst) zst_files+=( "$f" ) ;;
+            *)     dat_files+=( "$f" ) ;;
+        esac
+    done < <(sqlite3 "$db" \
+        "SELECT file_path FROM submissions WHERE verify_status='passed' ORDER BY id;")
+
+    if [ "$missing" -gt 0 ]; then
+        echo "warning: $missing passed submission(s) have no file under $jobdir/rels" >&2
+        echo "         (moved away by move-rels.sh? assembling without them)" >&2
+    fi
+fi
+
+# Fallback: no DB, no sqlite3, or a DB that recorded nothing. Match BOTH
+# shapes -- omitting blk-* here would silently drop every GPU block while
+# still finding CPU files, so `total` would stay non-zero and nothing would
+# look wrong until filtering came up short.
+if [ "$(( ${#dat_files[@]} + ${#zst_files[@]} ))" -eq 0 ]; then
+    selected_from="directory glob (no verify status available)"
+    dat_files=( "$jobdir"/rels/wu-*.dat "$jobdir"/rels/blk-*.dat )
+    zst_files=( "$jobdir"/rels/wu-*.dat.zst "$jobdir"/rels/blk-*.dat.zst )
+fi
+
 total=$(( ${#dat_files[@]} + ${#zst_files[@]} ))
-[ "$total" -gt 0 ] || { echo "no wu-*.dat or wu-*.dat.zst under $jobdir/rels" >&2; exit 1; }
+[ "$total" -gt 0 ] || { echo "no relation files under $jobdir/rels" >&2; exit 1; }
+echo "selecting relation files from: $selected_from"
 
 if [ ${#zst_files[@]} -gt 0 ]; then
     command -v zstd >/dev/null || { echo "zstd not found in PATH, needed to decompress .dat.zst" >&2; exit 1; }
