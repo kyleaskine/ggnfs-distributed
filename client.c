@@ -145,17 +145,28 @@ typedef struct {
     int                 lease_lost;      /* set if the server 409'd us */
 } sieve_ctx_t;
 
+/* Latched once per process: an older coordinator has no /renew at all, and
+ * re-probing it on every workunit would burn a round trip and a warning line
+ * per band per worker forever. */
+static int g_renew_unsupported = 0;
+
 static int should_cancel_siever(void *ctx)
 {
     if (shutdown_phase() >= SHUTDOWN_CANCELLING) return 1;
 
     sieve_ctx_t *sc = (sieve_ctx_t *)ctx;
-    if (!sc || sc->next_renew_ms == 0) return 0;
-    if (sc->lease_lost) return 1;         /* decided below; abort promptly */
+    if (!sc) return 0;
+    /* Must precede the next_renew_ms test: the lease-lost branch below zeroes
+     * next_renew_ms, so checking that first would swallow this and let the
+     * siever keep grinding on a workunit we no longer hold. */
+    if (sc->lease_lost) return 1;
+    if (sc->next_renew_ms == 0 || g_renew_unsupported) return 0;
 
-    /* Don't start an HTTP round trip we are about to abandon: during drain the
-     * next Ctrl-C should reach the siever in ~100 ms, not after a renew. */
-    if (shutdown_phase() >= SHUTDOWN_DRAINING) return 0;
+    /* Draining deliberately keeps heartbeating. Drain is the phase where the
+     * client finishes a long band it fully intends to submit, so dropping the
+     * heartbeat here is exactly when losing the lease costs the most. The
+     * second Ctrl-C stays responsive because do_renew runs on a 5s budget with
+     * abort_on_cancel, not because we stop renewing. */
 
     int64_t now = monotonic_ms();
     if (now < sc->next_renew_ms) return 0;
@@ -174,9 +185,13 @@ static int should_cancel_siever(void *ctx)
     }
     if (r == 2) {
         /* Server predates /renew. The lease is fine — we just cannot extend
-         * it, exactly as before this feature existed. Keep sieving. */
-        fprintf(stderr, "client: server has no /renew; lease heartbeat "
-                        "disabled (workunit %s)\n", sc->workunit_id);
+         * it, exactly as before this feature existed. Keep sieving, and latch
+         * it process-wide so we stop asking. */
+        if (!g_renew_unsupported) {
+            fprintf(stderr, "client: server has no /renew; lease heartbeat "
+                            "disabled for this run\n");
+            g_renew_unsupported = 1;
+        }
         sc->next_renew_ms = 0;
         return 0;
     }
@@ -1200,21 +1215,32 @@ static int64_t job_alim(const char *job_path)
  * slower sieving, not wrong sieving. */
 static const char *ensure_gpu_fb_cached(const client_cfg_t *cfg,
                                         const proto_lease_response_t *lease,
-                                        const char *job_local)
+                                        const char *job_local,
+                                        struct mg_mgr *mgr)
 {
     /* An explicit --fb1 is the operator's call and is used as given. */
     if (cfg->fb1_path[0]) return cfg->fb1_path;
     if (cfg->fbgen_gpu[0] == '\0') return NULL;
 
-    pthread_mutex_lock(&g_fb1_mu);
-    if (g_fb1_failed)    { pthread_mutex_unlock(&g_fb1_mu); return NULL; }
-    if (g_fb1_ready[0])  { pthread_mutex_unlock(&g_fb1_mu); return g_fb1_ready; }
-
+    /* Build the key BEFORE any early return. The whole point of keying on
+     * (job sha, logI) is that a cache built for a different width is not
+     * reusable — and gpu_args can change under a running client, since the
+     * documented way to change it is `extend --gpu-args=...` plus a `serve`
+     * restart, which does not restart the clients. Short-circuiting on
+     * g_fb1_ready before computing the key would keep feeding bench an
+     * --fb1 built at the old maxbits alongside the new --logI. */
     int logI = gpu_args_logI(lease->gpu_args);
 
     char cache[320];
     snprintf(cache, sizeof(cache), "%s/%.16s.roots1.m%d",
              cfg->file_cache_dir, lease->file_sha256_hex, logI);
+
+    pthread_mutex_lock(&g_fb1_mu);
+    if (g_fb1_failed) { pthread_mutex_unlock(&g_fb1_mu); return NULL; }
+    if (strcmp(g_fb1_ready, cache) == 0) {
+        pthread_mutex_unlock(&g_fb1_mu);
+        return g_fb1_ready;
+    }
 
     if (file_exists(cache)) {
         snprintf(g_fb1_ready, sizeof(g_fb1_ready), "%s", cache);
@@ -1245,7 +1271,24 @@ static const char *ensure_gpu_fb_cached(const client_cfg_t *cfg,
              "%s --poly %s --lim %lld --maxbits %d --out %s",
              cfg->fbgen_gpu, job_local, (long long)alim, logI, staged);
 
-    int rc = sieve_run_command(syscmd, should_cancel_siever, NULL);
+    /* Generation can run for minutes, and the workunit is already leased by
+     * the time we get here — so heartbeat through it exactly as we do through
+     * a sieve, or the lease lapses before the first band is even started. */
+    sieve_ctx_t fbsc = {
+        .mgr           = mgr,
+        .cfg           = cfg,
+        .workunit_id   = lease->workunit_id,
+        .next_renew_ms = 0,
+        .interval_ms   = 0,
+        .lease_lost    = 0,
+    };
+    if (mgr && lease->lease_seconds > 0) {
+        fbsc.interval_ms = (lease->lease_seconds * 1000) / 3;
+        if (fbsc.interval_ms < 5000) fbsc.interval_ms = 5000;
+        fbsc.next_renew_ms = monotonic_ms() + fbsc.interval_ms;
+    }
+
+    int rc = sieve_run_command(syscmd, should_cancel_siever, &fbsc);
 
     off_t sz = 0;
     if (rc == 0 && regular_file_size(staged, &sz) == 0 && sz > 0 &&
@@ -1548,8 +1591,9 @@ static void release_active_leases(const client_cfg_t *base_cfg)
     int n = 0;
 
     pthread_mutex_lock(&g_active_mu);
+    /* g_active_count is workers*prefetch, not workers: a pipelined worker holds
+     * several leases at once and every one of them has to be released here. */
     n = g_active_count;
-    if (n > CLIENT_MAX_WORKERS) n = CLIENT_MAX_WORKERS;
     pthread_mutex_unlock(&g_active_mu);
 
     struct mg_mgr mgr;
@@ -1588,6 +1632,7 @@ typedef struct {
     char                   *outfile;     /* malloc'd */
     double                  sieve_seconds;
     int                     active_idx;
+    int                     lease_lost;  /* set by the heartbeat thread on 409 */
 } pipe_slot_t;
 
 static void slot_reset(pipe_slot_t *slot)
@@ -1596,6 +1641,7 @@ static void slot_reset(pipe_slot_t *slot)
     slot->outfile = NULL;
     slot->fb1 = NULL;
     slot->sieve_seconds = 0.0;
+    slot->lease_lost = 0;
     memset(&slot->lease, 0, sizeof(slot->lease));
 }
 
@@ -1640,7 +1686,7 @@ static int stage_acquire(struct mg_mgr *mgr, pipe_slot_t *slot)
      * rebuild it on every workunit. lasieve4 auto-loads its .afb.0; cuda-sieve
      * takes the equivalent as --fb1. */
     if (cfg->engine == ENGINE_CUDA)
-        slot->fb1 = ensure_gpu_fb_cached(cfg, &slot->lease, slot->job_local);
+        slot->fb1 = ensure_gpu_fb_cached(cfg, &slot->lease, slot->job_local, mgr);
     else
         ensure_afb_cached(cfg, &slot->lease, slot->job_local);
 
@@ -1725,14 +1771,15 @@ static int stage_sieve(struct mg_mgr *mgr, pipe_slot_t *slot)
     slot->sieve_seconds = elapsed_seconds(t0, t1);
 
     if (sc.lease_lost) {
-        /* The server took this workunit back mid-sieve and has reissued it.
-         * Whatever we produced belongs to somebody else's lease now, so drop
-         * it rather than uploading into a certain 409. Nothing to release —
-         * we no longer hold the lease. */
-        fprintf(stderr, "client: discarding %s — lease was reclaimed\n",
-                slot->lease.workunit_id);
+        /* The server took this workunit back mid-sieve and has reissued it, so
+         * uploading would be a certain 409 and there is no lease to release.
+         * The partial output is kept rather than unlinked: the file is left
+         * exactly like every other failure path here, so an operator can still
+         * salvage it by hand if the band turns out to be expensive to redo. */
+        fprintf(stderr, "client: %s lease was reclaimed; not submitting, "
+                        "leaving %s for inspection\n",
+                slot->lease.workunit_id, slot->outfile);
         active_lease_clear(slot->active_idx);
-        unlink(slot->outfile);
         return -2;
     }
     if (sieve_rc != 0) {
@@ -1771,10 +1818,14 @@ static int stage_submit(struct mg_mgr *mgr, pipe_slot_t *slot)
      * ahead of it, instead of racing whatever was left over from the sieve. */
     if (slot->lease.lease_seconds > 0) {
         if (do_renew(mgr, cfg, slot->lease.workunit_id) == 1) {
-            fprintf(stderr, "client: discarding %s — lease was reclaimed "
-                            "before submit\n", slot->lease.workunit_id);
+            /* A completed band. The server reissued the workunit while we were
+             * sieving, so /submit would 409 — but these relations are valid and
+             * are precisely what the reissued workunit will re-derive, so they
+             * are kept on disk rather than deleted. */
+            fprintf(stderr, "client: %s lease was reclaimed before submit; "
+                            "leaving %s for inspection\n",
+                    slot->lease.workunit_id, slot->outfile);
             active_lease_clear(slot->active_idx);
-            unlink(slot->outfile);
             return -2;
         }
     }
@@ -1932,6 +1983,75 @@ static void *pipe_lease_thread(void *arg)
     return NULL;
 }
 
+/* A prefetched slot holds a real server lease while it waits its turn on the
+ * card, and stage_sieve's heartbeat only covers the slot actually sieving. So
+ * an idle slot's lease would quietly lapse, the sweep would requeue it with
+ * attempt_count++ and reissue it to somebody else, and we would sieve a band
+ * we no longer own — repeat enough times and the workunit is poisoned. This
+ * thread renews every held lease that the sieve callback is not already
+ * covering. */
+static void *pipe_heartbeat_thread(void *arg)
+{
+    pipeline_t *p = (pipeline_t *)arg;
+    struct mg_mgr mgr;
+    mg_mgr_init(&mgr);
+
+    int64_t next_ms = 0;
+    for (;;) {
+        pthread_mutex_lock(&p->mu);
+        int done = p->finished;
+        pthread_mutex_unlock(&p->mu);
+        if (done || shutdown_phase() >= SHUTDOWN_CANCELLING) break;
+
+        int64_t now = monotonic_ms();
+        if (next_ms == 0 || now < next_ms) {
+            if (next_ms == 0) next_ms = now;   /* first pass: renew immediately */
+            else { sleep(1); continue; }
+        }
+
+        /* Snapshot under the lock; do the HTTP outside it. */
+        struct { int idx; char wu[64]; } todo[8];
+        int n_todo = 0;
+        int64_t interval = 0;
+        pthread_mutex_lock(&p->mu);
+        for (int i = 0; i < p->n && n_todo < (int)(sizeof(todo)/sizeof(todo[0])); i++) {
+            /* SIEVING is the sieve callback's job; EMPTY holds no lease. */
+            if (p->state[i] != SLOT_READY && p->state[i] != SLOT_DONE) continue;
+            if (p->slots[i].lease_lost) continue;
+            if (p->slots[i].lease.workunit_id[0] == '\0') continue;
+            if (p->slots[i].lease.lease_seconds <= 0) continue;
+            interval = (p->slots[i].lease.lease_seconds * 1000) / 3;
+            todo[n_todo].idx = i;
+            snprintf(todo[n_todo].wu, sizeof(todo[n_todo].wu), "%s",
+                     p->slots[i].lease.workunit_id);
+            n_todo++;
+        }
+        pthread_mutex_unlock(&p->mu);
+
+        for (int k = 0; k < n_todo; k++) {
+            /* cfg is written once at setup and never mutated, so reading it
+             * outside the lock is safe. */
+            int r = do_renew(&mgr, &p->slots[todo[k].idx].cfg, todo[k].wu);
+            if (r != 1) continue;
+            pthread_mutex_lock(&p->mu);
+            /* Only mark it if the slot still holds the same workunit. */
+            if (strcmp(p->slots[todo[k].idx].lease.workunit_id, todo[k].wu) == 0) {
+                fprintf(stderr, "client: queued workunit %s was reclaimed by "
+                                "the server; dropping it\n", todo[k].wu);
+                p->slots[todo[k].idx].lease_lost = 1;
+                pthread_cond_broadcast(&p->cv);
+            }
+            pthread_mutex_unlock(&p->mu);
+        }
+
+        if (interval < 5000) interval = 5000;
+        next_ms = monotonic_ms() + interval;
+    }
+
+    mg_mgr_free(&mgr);
+    return NULL;
+}
+
 static void *pipe_submit_thread(void *arg)
 {
     pipeline_t *p = (pipeline_t *)arg;
@@ -1945,9 +2065,21 @@ static void *pipe_submit_thread(void *arg)
             pthread_cond_wait(&p->cv, &p->mu);
         }
         if (idx < 0) { pthread_mutex_unlock(&p->mu); break; }  /* finished */
+        int lost = p->slots[idx].lease_lost;
         pthread_mutex_unlock(&p->mu);
 
-        int r = stage_submit(&mgr, &p->slots[idx]);
+        int r;
+        if (lost) {
+            /* Reclaimed while queued: /submit would 409. Keep the relations on
+             * disk, same as every other give-up path. */
+            fprintf(stderr, "client: not submitting %s (lease reclaimed); "
+                            "leaving %s for inspection\n",
+                    p->slots[idx].lease.workunit_id, p->slots[idx].outfile);
+            active_lease_clear(p->slots[idx].active_idx);
+            r = -2;
+        } else {
+            r = stage_submit(&mgr, &p->slots[idx]);
+        }
 
         pthread_mutex_lock(&p->mu);
         if (r == 1) p->completed++;
@@ -1998,9 +2130,28 @@ static void pipeline_run(const client_cfg_t *base_cfg, int worker_idx)
             worker_idx, n, p.slots[0].cfg.client_id,
             p.slots[n - 1].cfg.client_id);
 
-    pthread_t lease_tid, submit_tid;
-    pthread_create(&lease_tid,  NULL, pipe_lease_thread,  &p);
-    pthread_create(&submit_tid, NULL, pipe_submit_thread, &p);
+    pthread_t lease_tid, submit_tid, hb_tid;
+    int have_lease  = pthread_create(&lease_tid,  NULL, pipe_lease_thread,  &p) == 0;
+    int have_submit = pthread_create(&submit_tid, NULL, pipe_submit_thread, &p) == 0;
+    int have_hb     = pthread_create(&hb_tid,     NULL, pipe_heartbeat_thread, &p) == 0;
+    if (!have_lease || !have_submit || !have_hb) {
+        /* Joining an uninitialized pthread_t is undefined; bail out cleanly
+         * instead, the way main's own worker spawn loop does. */
+        fprintf(stderr, "client: [w%d] pipeline thread create failed: %s\n",
+                worker_idx, strerror(errno));
+        pthread_mutex_lock(&p.mu);
+        p.no_more_work = 1;
+        p.finished = 1;
+        pthread_cond_broadcast(&p.cv);
+        pthread_mutex_unlock(&p.mu);
+        if (have_lease)  pthread_join(lease_tid, NULL);
+        if (have_submit) pthread_join(submit_tid, NULL);
+        if (have_hb)     pthread_join(hb_tid, NULL);
+        free(p.slots); free(p.state);
+        pthread_mutex_destroy(&p.mu);
+        pthread_cond_destroy(&p.cv);
+        return;
+    }
 
     /* Sieve loop: the card, one band at a time. */
     struct mg_mgr mgr;
@@ -2014,6 +2165,15 @@ static void pipeline_run(const client_cfg_t *base_cfg, int worker_idx)
             pthread_cond_wait(&p.cv, &p.mu);
         }
         if (idx < 0) { pthread_mutex_unlock(&p.mu); break; }
+        int lost = p.slots[idx].lease_lost;
+        if (lost) {
+            /* Reclaimed while it sat in the queue — never start the card on it. */
+            slot_reset(&p.slots[idx]);
+            p.state[idx] = SLOT_EMPTY;
+            pthread_cond_broadcast(&p.cv);
+            pthread_mutex_unlock(&p.mu);
+            continue;
+        }
         p.state[idx] = SLOT_SIEVING;
         pthread_mutex_unlock(&p.mu);
 
@@ -2032,6 +2192,23 @@ static void pipeline_run(const client_cfg_t *base_cfg, int worker_idx)
         if (r == 1) sieved++;
         if (p.once && sieved >= 1) break;
         if (shutdown_phase() >= SHUTDOWN_CANCELLING) break;
+
+        if (r != 1) {
+            /* Back off exactly like the serial worker does. Without this a
+             * siever that fails instantly — a wrong --cuda-bench path exits 127
+             * in about 150 ms — becomes a lease-and-abandon storm that drains
+             * the available pool into 'leased' rows nobody is working on. */
+            for (int64_t i = 0;
+                 i < base_cfg->idle_backoff_seconds &&
+                 shutdown_phase() == SHUTDOWN_RUNNING;
+                 i++) {
+                pthread_mutex_lock(&p.mu);
+                int quit = p.no_more_work;
+                pthread_mutex_unlock(&p.mu);
+                if (quit) break;
+                sleep(1);
+            }
+        }
     }
 
     /* Stop leasing, then let the submit thread drain what is already sieved:
@@ -2050,6 +2227,7 @@ static void pipeline_run(const client_cfg_t *base_cfg, int worker_idx)
     pthread_cond_broadcast(&p.cv);
     pthread_mutex_unlock(&p.mu);
     pthread_join(submit_tid, NULL);
+    pthread_join(hb_tid, NULL);
 
     /* Any slot still holding a lease we never sieved goes back to the pool
      * rather than waiting out its expiry. */

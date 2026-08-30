@@ -322,6 +322,73 @@ built on top.
 work idles on `--idle-backoff` forever rather than exiting; both the serial and
 pipelined workers behave identically here.
 
+## Review pass after Phase 4 (xhigh) — and the first real-hardware run
+
+Running the real `bench` on an RTX 5070 found what the stand-ins could not:
+**`VERIFY_MAX_PRIMES_PER_SIDE` was 32 and real cuda-sieve output reaches 35.**
+The cap counts primes with multiplicity — a relation lists a prime once per
+division — and a 224-bit algebraic norm carrying a high power of a small prime
+blows past it (the first offending line had thirteen factors of 2). bench's own
+first-q validation prints "most factors 40 of 64". gnfs-lasieve4 never came
+close, the C208 corpus peaking at 13, which is why it sat undiscovered; no
+existing relation was ever affected. Raised to 64, matching cuda-sieve's
+`TD_FMAX`, which is a hard cap on its side. This was the worst possible failure
+mode: one bad line fails the whole file, so every GPU workunit would have
+failed, requeued, and poisoned while looking like a cuda-sieve bug.
+
+An `xhigh` review then raised 15 findings, all real, all fixed:
+
+**Lease correctness (the expensive class).**
+- Prefetched slots held real leases that nothing renewed — only the slot being
+  sieved was heartbeated. A queued slot's lease would lapse, the sweep would
+  reissue the workunit, and we would sieve a band we no longer owned. Added a
+  pipeline heartbeat thread covering every held lease; slots reclaimed while
+  queued are now dropped before the card ever starts them.
+- The heartbeat was switched off during drain — precisely the phase where the
+  client is finishing a long band it intends to submit. Now it keeps
+  heartbeating; the second Ctrl-C stays responsive because `do_renew` runs on a
+  5 s budget with `abort_on_cancel`, not because we stop renewing.
+- `should_cancel_siever` tested `next_renew_ms == 0` before `lease_lost`, and
+  the lease-lost branch zeroes `next_renew_ms` — so the abort could never fire.
+  Masked only because `wait_child_cancelable` stops polling once cancelling.
+- `stage_submit` **deleted** a fully sieved band when the pre-submit renew
+  returned 409. Those relations are valid; every neighbouring path keeps its
+  file "for inspection". Now kept.
+- `release_active_leases` still clamped to `CLIENT_MAX_WORKERS`, but
+  `g_active_count` is now `workers * prefetch` — leases above row 255 were
+  never released.
+
+**Spot-check scaling never engaged in the real deployment.** `meta.base_q_range`
+was written only by `init`, but the documented GPU rollout is `extend
+--class=gpu` onto a campaign whose meta predates all of this. And `init
+--class=gpu` would have stored the *GPU* width as the baseline. Replaced with a
+value derived from the rows: the **mode** of `q_range`. Verified on a copy of
+the real 430,005-row jobdir — baseline 1000, correctly ignoring both the
+100000-wide GPU band and stray `q_range=1` rows a minimum would have latched
+onto.
+
+**Robustness.**
+- No idle backoff after a sieve failure in the pipeline (the serial worker has
+  one): a wrong `--cuda-bench` exits 127 in ~150 ms and became a
+  lease-and-abandon storm. Measured after the fix: 5 leases in 25 s with the
+  available pool intact, against several per second before.
+- `pthread_create` returns were ignored, then the possibly-uninitialized ids
+  joined.
+- `sqlite3_busy_timeout` was applied *after* the migration DDL, so the 430K-row
+  `ALTER TABLE` / `CREATE INDEX` had a zero-length retry window against a live
+  `serve`.
+- The factor-base build held an un-heartbeated lease across a multi-minute
+  `fbgen_gpu` run; it now heartbeats like a sieve does.
+- The FB cache short-circuited on a process global before computing `logI`, so
+  a client running across a `gpu_args` change kept feeding bench an `--fb1`
+  built at the old `maxbits`.
+- The "server has no /renew" disable was stack-local and re-probed every
+  workunit; latched process-wide.
+- `q_verified_1h` was keyed on submission time, not verification — renamed
+  `q_passed_1h` and documented, since there is no verified-at column to key on
+  (`completed_at` is set at submit).
+- A per-class cJSON object leaked when the array allocation failed.
+
 ## Phase 5 — Ops and polish
 
 - [ ] **5.1 Dashboard.** Progress and ETA are `done / w.total` *workunits*

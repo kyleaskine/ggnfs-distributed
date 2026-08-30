@@ -429,15 +429,6 @@ static int cmd_init(int argc, char **argv)
     db_meta_set(db, "siever_args", siever_args ? siever_args : "");
     db_meta_set(db, "gpu_args",    gpu_args    ? gpu_args    : "");
     db_meta_set(db, "lease_order", lease_order_norm);
-    {
-        /* The CPU-sized q_range this job was laid out with. The verifier
-         * scales its norm spot-check sample size against it, so a 100x GPU
-         * workunit gets proportionally more samples rather than the same 50
-         * spread over 100x the relations. */
-        char buf[32];
-        snprintf(buf, sizeof(buf), "%lld", (long long)qrange);
-        db_meta_set(db, "base_q_range", buf);
-    }
 
     db_close(db);
 
@@ -1085,10 +1076,13 @@ static char *format_stats_json(server_ctx_t *ctx, const db_stats_t *s,
      * "workunits done / total" is not progress; these are. */
     cJSON_AddNumberToObject(wu, "q_total",       (double)s->q_total);
     cJSON_AddNumberToObject(wu, "q_verified",    (double)s->q_verified);
-    cJSON_AddNumberToObject(wu, "q_verified_1h", (double)s->q_verified_1h);
+    cJSON_AddNumberToObject(wu, "q_passed_1h",   (double)s->q_passed_1h);
 
     cJSON *cls = cJSON_AddArrayToObject(root, "classes");
-    for (int i = 0; i < s->class_count; i++) {
+    /* cJSON_AddItemToArray does not take ownership when the array is NULL, so
+     * without this guard every object built below would leak on the
+     * allocation-failure path — once per dashboard poll. */
+    for (int i = 0; cls && i < s->class_count; i++) {
         const db_stats_class_t *cc = &s->classes[i];
         cJSON *o = cJSON_CreateObject();
         if (!o) continue;

@@ -46,6 +46,18 @@ int db_workunit_insert(ggnfs_db_t *db, const char *id,
  * q_start+q_range, i.e. one past the highest-Q workunit (0 if empty). */
 int db_workunit_extent(ggnfs_db_t *db, int64_t *out_count, int64_t *out_q_end);
 
+/* The job's baseline band width: the most common q_range in the workunits
+ * table. The verifier scales its norm spot-check against it so sample
+ * *density* stays constant across mixed band sizes.
+ *
+ * Derived rather than configured on purpose: `extend --class=gpu` is the
+ * normal way a GPU band joins an existing CPU campaign, and that jobdir's
+ * meta was written by an older `init` that recorded nothing. Reading it off
+ * the rows is correct for such a jobdir, for a job that was gpu-class from
+ * the start, and for one whose band sizes change later.
+ * Returns 0 on success (*out set; 0 if the table is empty), -1 on error. */
+int db_workunit_base_q_range(ggnfs_db_t *db, int64_t *out);
+
 /* Check whether the half-open range [qmin, qmax) overlaps any existing
  * workunit. Returns 1 if there is an overlap (and fills *out_q_start /
  * *out_q_range with the first overlapping workunit found, if non-NULL),
@@ -219,7 +231,9 @@ typedef struct {
     /* q-width progress: the size-weighted view of the same rows. */
     int64_t  q_total;                 /* SUM(q_range) over all workunits  */
     int64_t  q_verified;              /* SUM(q_range) WHERE verified      */
-    int64_t  q_verified_1h;           /* q-width passing verify in last 1h */
+    int64_t  q_passed_1h;             /* q-width SUBMITTED in the last 1h that
+                                       * has since passed verification; keyed
+                                       * on submit time, see db_stats_snapshot */
 
     int              class_count;
     db_stats_class_t classes[DB_STATS_MAX_CLASSES];

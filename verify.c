@@ -988,14 +988,20 @@ struct verify_thread_s {
     char           *db_path;       /* malloc'd */
     int64_t         max_attempts;
     int             spotcheck_k;   /* 0 disables norm spot-check */
-    int64_t         base_q_range;  /* meta.base_q_range; 0 = unknown, no scaling */
+    int64_t         base_q_range;  /* narrowest band in the job; 0 = no scaling */
 };
 
 /* A GPU-class workunit covers ~100x the q-width of a CPU-class one and yields
  * proportionally more relations, so a fixed K would sample it ~100x more
  * thinly. Scale K by q_range / base_q_range so sample *density* is what stays
  * constant, and cap the multiplier so a pathological q_range can't ask for an
- * unbounded reservoir. */
+ * unbounded reservoir.
+ *
+ * base_q_range is the job's most common band width, read off the workunits table
+ * at the top of every drain pass rather than from a config value. That is what
+ * makes it right for the normal GPU rollout — `extend --class=gpu` onto a
+ * campaign whose meta predates all of this — and it keeps working when a later
+ * extend introduces a narrower band. */
 #define SPOTCHECK_MAX_SCALE 32
 
 static int spotcheck_k_for(int base_k, int64_t base_q_range, int64_t q_range)
@@ -1020,6 +1026,21 @@ static void drain_pending(verify_thread_t *vt, ggnfs_db_t *db,
     verify_relation_t *resbuf   = NULL;
     int                resalloc = 0;
     const int          spot_on  = (poly && vt->spotcheck_k > 0);
+
+    /* Cheap (one indexed aggregate) and only once per drain pass, not per
+     * submission — but it does need re-reading, because `extend` can add a
+     * narrower band while the verifier is running. */
+    if (spot_on) {
+        int64_t base = 0;
+        if (db_workunit_base_q_range(db, &base) == 0 && base > 0) {
+            if (base != vt->base_q_range) {
+                fprintf(stderr, "verify: spot-check baseline q_range=%lld "
+                        "(k=%d, scaling to %dx)\n",
+                        (long long)base, vt->spotcheck_k, SPOTCHECK_MAX_SCALE);
+            }
+            vt->base_q_range = base;
+        }
+    }
 
     for (;;) {
         db_pending_t p;
@@ -1157,21 +1178,9 @@ static void *verify_thread_run(void *arg)
             if (!poly) {
                 fprintf(stderr, "verify: poly_load failed — spot-check disabled\n");
             } else {
-                char *m_base = db_meta_get(db, "base_q_range");
-                vt->base_q_range = m_base ? strtoll(m_base, NULL, 10) : 0;
-                free(m_base);
-                if (vt->base_q_range > 0) {
-                    fprintf(stderr, "verify: spot-check enabled (k=%d at "
-                            "q_range=%lld, scaling to %dx, poly degree %d)\n",
-                            vt->spotcheck_k, (long long)vt->base_q_range,
-                            SPOTCHECK_MAX_SCALE, poly->degree);
-                } else {
-                    /* Pre-base_q_range jobdir: every workunit gets the flat K,
-                     * which is exactly the old behaviour. */
-                    fprintf(stderr, "verify: spot-check enabled (k=%d flat — "
-                            "meta has no base_q_range, poly degree %d)\n",
-                            vt->spotcheck_k, poly->degree);
-                }
+                fprintf(stderr, "verify: spot-check enabled (k=%d, poly degree "
+                        "%d); sample size scales with band width\n",
+                        vt->spotcheck_k, poly->degree);
             }
         } else {
             fprintf(stderr, "verify: meta has no poly — spot-check disabled\n");

@@ -161,6 +161,13 @@ ggnfs_db_t *db_open(const char *path)
         sqlite3_close(conn);
         return NULL;
     }
+    /* Set the busy timeout BEFORE any DDL. db_migrate's ALTER TABLE and
+     * SCHEMA_SQL_POST's CREATE INDEX are the most contended statements this
+     * process ever runs — a 430K-row index build against a jobdir whose
+     * `serve` is mid-write — and without the timeout they take SQLITE_BUSY
+     * immediately and fail db_open outright. */
+    sqlite3_busy_timeout(conn, 5000);
+
     if (exec_or_log(conn, SCHEMA_SQL, "schema init") != 0) {
         sqlite3_close(conn);
         return NULL;
@@ -176,12 +183,12 @@ ggnfs_db_t *db_open(const char *path)
     /* Best-effort; don't fail open if FK enforcement can't be turned on. */
     (void)exec_or_log(conn, "PRAGMA foreign_keys = ON;", "enable foreign_keys");
 
-    /* Two connections (main event loop + verifier thread) will share this file
-     * once the verifier lands. WAL mode allows readers + one writer; busy_timeout
-     * resolves the brief contention window when both try to commit at once.
-     * 5s is long enough to ride out the other side's BEGIN IMMEDIATE / UPDATE /
-     * COMMIT but short enough that a real deadlock is still loud. */
-    sqlite3_busy_timeout(conn, 5000);
+    /* (The busy timeout is set above, before the schema DDL.) Two connections
+     * — main event loop and verifier thread — share this file. WAL mode allows
+     * readers + one writer; the timeout resolves the brief contention window
+     * when both try to commit at once. 5s is long enough to ride out the other
+     * side's BEGIN IMMEDIATE / UPDATE / COMMIT but short enough that a real
+     * deadlock is still loud. */
 
     ggnfs_db_t *db = calloc(1, sizeof(*db));
     if (!db) { sqlite3_close(conn); return NULL; }
@@ -366,6 +373,34 @@ int db_workunit_get(ggnfs_db_t *db, const char *id, db_lease_result_t *out)
 
 /* [a,b) and [c,d) overlap iff a < d AND c < b. Here [qmin,qmax) is the new
  * range and [q_start, q_start+q_range) is the existing workunit row. */
+int db_workunit_base_q_range(ggnfs_db_t *db, int64_t *out)
+{
+    sqlite3_stmt *st = NULL;
+    /* The MODE, not the minimum. A campaign is laid out at one band width and
+     * then extended with others, so the most common width is the baseline the
+     * job was designed around. MIN would be hostage to a single leftover
+     * sliver — a partial extend, a hand-inserted probe row — and would inflate
+     * the spot-check sample for every workunit in the job. */
+    if (sqlite3_prepare_v2(db->conn,
+            "SELECT q_range FROM workunits "
+            "GROUP BY q_range ORDER BY COUNT(*) DESC, q_range ASC LIMIT 1;",
+            -1, &st, NULL) != SQLITE_OK) {
+        fprintf(stderr, "db_workunit_base_q_range: %s\n", sqlite3_errmsg(db->conn));
+        return -1;
+    }
+    int rc = sqlite3_step(st);
+    int result = -1;
+    if (rc == SQLITE_ROW) {
+        if (out) *out = sqlite3_column_int64(st, 0);
+        result = 0;
+    } else if (rc == SQLITE_DONE) {
+        if (out) *out = 0;          /* empty table */
+        result = 0;
+    }
+    sqlite3_finalize(st);
+    return result;
+}
+
 int db_workunit_overlap(ggnfs_db_t *db, int64_t qmin, int64_t qmax,
                         int64_t *out_q_start, int64_t *out_q_range)
 {
@@ -992,9 +1027,17 @@ int db_stats_snapshot(ggnfs_db_t *db, int64_t now_unix, db_stats_t *out)
         }
     }
 
-    /* Q-width verified in the last hour — the numerator for a size-weighted
-     * ETA. Counts each workunit once via its passing submission, so a
-     * re-sieved workunit does not inflate the rate. */
+    /* Q-width whose sieving finished in the last hour and has since passed
+     * verification — the numerator for a size-weighted ETA.
+     *
+     * Keyed on received_at (when the relations arrived) rather than on when
+     * the verifier got to them, because the quantity an ETA wants is sieving
+     * throughput, and submission is when the sieving actually finished. There
+     * is no verified-at column to key on in any case: `completed_at` is set on
+     * the submitted transition, not the verified one. The trade-off is at the
+     * window edge — a band submitted 70 minutes ago but verified 2 minutes ago
+     * counts zero here while still counting in q_verified — so during a
+     * verification backlog this reads low. */
     {
         sqlite3_stmt *st = NULL;
         if (sqlite3_prepare_v2(db->conn,
@@ -1004,7 +1047,7 @@ int db_stats_snapshot(ggnfs_db_t *db, int64_t now_unix, db_stats_t *out)
                 -1, &st, NULL) == SQLITE_OK) {
             sqlite3_bind_int64(st, 1, now_unix - 3600);
             if (sqlite3_step(st) == SQLITE_ROW)
-                out->q_verified_1h = sqlite3_column_int64(st, 0);
+                out->q_passed_1h = sqlite3_column_int64(st, 0);
             sqlite3_finalize(st);
         }
     }
