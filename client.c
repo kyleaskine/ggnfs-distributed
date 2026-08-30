@@ -2494,11 +2494,16 @@ static void bench_usage(void)
         "usage: ggnfs-sieve-client benchmark \\\n"
         "    --server-url=http://host:port  (required)\n"
         "    --token=<bearer token>         (required)\n"
-        "    --siever=<path>                (required) gnfs-lasieve4* binary. benchmark\n"
-        "                                   has no cuda engine yet; --engine is ignored\n"
+        "    --siever=<path>                gnfs-lasieve4* binary (required unless\n"
+        "                                   --engine=cuda)\n"
+        "    [--engine=cuda]                screen a GPU instead: one fixed-work run\n"
+        "                                   on the card. Requires --cuda-bench; pass\n"
+        "                                   --fbgen-gpu or --fb1 so the timing excludes\n"
+        "                                   the factor-base build\n"
         "    [--workers=N]                  sievers in the all-core phase (default: all online CPUs)\n"
         "    [--cpu-pin=0,2,4,...]          (Linux) pin each worker; length must equal --workers\n"
         "    [--qrange=65]                  q-interval WIDTH to sieve (siever -c; like a workunit's q_range);\n"
+        "                                   default 1000 under --engine=cuda\n"
         "                                   holds ~width/ln(q) special-q; widen for ~1min single-core\n"
         "    [--q=N]                        fixed q anchor (default: campaign q_min from /stats)\n"
         "    [--max-seconds=300]            per-phase safety cap so a stuck box can't hang (0 = no cap)\n"
@@ -2555,6 +2560,7 @@ static int bench_fetch_params(struct mg_mgr *mgr, const client_cfg_t *cfg,
     memset(out, 0, sizeof(*out));
     cJSON *j_sha  = cJSON_GetObjectItemCaseSensitive(root, "job_sha256");
     cJSON *j_args = cJSON_GetObjectItemCaseSensitive(root, "siever_args");
+    cJSON *j_gargs = cJSON_GetObjectItemCaseSensitive(root, "gpu_args");
     cJSON *j_side = cJSON_GetObjectItemCaseSensitive(root, "side");
     cJSON *j_siev = cJSON_GetObjectItemCaseSensitive(root, "siever");
     cJSON *j_wu   = cJSON_GetObjectItemCaseSensitive(root, "workunits");
@@ -2569,6 +2575,14 @@ static int bench_fetch_params(struct mg_mgr *mgr, const client_cfg_t *cfg,
     }
     snprintf(out->file_sha256_hex, sizeof(out->file_sha256_hex), "%s", j_sha->valuestring);
     snprintf(out->file_url, sizeof(out->file_url), "/file/%s", out->file_sha256_hex);
+    /* Without this the cuda benchmark runs at bench's built-in default
+     * geometry rather than the job's, which both understates the card (a
+     * smaller sieve area yields fewer relations) and pairs that default logI
+     * with an --fb1 built for a different maxbits. Absent on a server too old
+     * to publish it, in which case "" is the honest answer. */
+    snprintf(out->gpu_args, sizeof(out->gpu_args), "%s",
+             (j_gargs && cJSON_IsString(j_gargs) && j_gargs->valuestring)
+                 ? j_gargs->valuestring : "");
     snprintf(out->siever_args, sizeof(out->siever_args), "%s",
              (j_args && cJSON_IsString(j_args) && j_args->valuestring) ? j_args->valuestring : "");
     out->side = (j_side && cJSON_IsString(j_side) && j_side->valuestring &&
@@ -2586,6 +2600,114 @@ static int bench_fetch_params(struct mg_mgr *mgr, const client_cfg_t *cfg,
     *out_qmin = qmin;
     *out_qmax = qmax;
     cJSON_Delete(root);
+    return 0;
+}
+
+/* Read a card's name and board power, best-effort. "" if nvidia-smi is absent
+ * — a benchmark that cannot name the hardware is still a valid measurement,
+ * just less useful when comparing rented boxes. */
+static void gpu_describe(char *out, size_t n)
+{
+    out[0] = '\0';
+    FILE *f = popen("nvidia-smi --query-gpu=name,memory.total,power.limit "
+                    "--format=csv,noheader 2>/dev/null", "r");
+    if (!f) return;
+    char line[256];
+    if (fgets(line, sizeof(line), f)) {
+        size_t l = strlen(line);
+        while (l && (line[l-1] == '\n' || line[l-1] == '\r')) line[--l] = '\0';
+        snprintf(out, n, "%s", line);
+    }
+    pclose(f);
+}
+
+/*
+ * GPU screening. The CPU benchmark's shape — one core, then every core — has
+ * no analogue here: a box has one card and it is either fast or it is not. So
+ * this measures the one thing that matters, on the same fixed-work principle:
+ * sieve a fixed q-interval width from a fixed anchor and time it. Identical
+ * work on every box, so wall time is a pure hardware signal, and the relation
+ * count comes out the same everywhere — which also checks that the card is
+ * producing correct output, not merely producing it quickly.
+ *
+ * Like the CPU path it takes NO lease and never calls /submit, so it is safe
+ * to run against a live coordinator.
+ */
+static int run_benchmark_cuda(client_cfg_t *cfg, struct mg_mgr *mgr,
+                              const proto_lease_response_t *lease,
+                              const char *job_local,
+                              uint32_t base_q, uint32_t qwidth,
+                              double min_rels)
+{
+    char card[256];
+    gpu_describe(card, sizeof(card));
+    printf("card       : %s\n", card[0] ? card : "(nvidia-smi unavailable)");
+    printf("gpu args   : %s\n", lease->gpu_args[0] ? lease->gpu_args : "(none)");
+    fflush(stdout);
+
+    /* Phase 0: the factor base, so the timed run measures sieving rather than
+     * a one-time build. Same reasoning as the CPU path's .afb cache. */
+    printf("\nfactor base: building/validating cache ...\n");
+    fflush(stdout);
+    struct timeval f0, f1;
+    gettimeofday(&f0, NULL);
+    const char *fb1 = ensure_gpu_fb_cached(cfg, lease, job_local, mgr);
+    gettimeofday(&f1, NULL);
+    printf("factor base: %.1fs (%s)\n", elapsed_seconds(f0, f1),
+           fb1 ? "cache ready" : "none — bench will build it in-process");
+    if (!fb1) {
+        fprintf(stderr, "benchmark: WARNING — no --fb1 cache (pass --fbgen-gpu "
+                "or --fb1); the timed run below includes the factor-base build "
+                "and understates sieving throughput.\n");
+    }
+    if (shutdown_phase() >= SHUTDOWN_DRAINING) return 1;
+
+    char outfile[320];
+    snprintf(outfile, sizeof(outfile), "%s/bench.dat", cfg->workdir);
+
+    printf("\nsieving q-range [%u, %u) on the GPU ...\n", base_q, base_q + qwidth);
+    fflush(stdout);
+
+    struct timeval t0, t1;
+    gettimeofday(&t0, NULL);
+    int rc = sieve_run_cuda(cfg->cuda_bench, job_local, outfile,
+                            base_q, qwidth, lease->side,
+                            lease->gpu_args, fb1, cfg->cuda_device,
+                            should_cancel_siever, NULL);
+    gettimeofday(&t1, NULL);
+    double secs = elapsed_seconds(t0, t1);
+
+    if (rc != 0) {
+        fprintf(stderr, "benchmark: bench returned %d — no measurement.\n", rc);
+        unlink(outfile);
+        return 1;
+    }
+    long long rels = count_newlines(outfile);
+    unlink(outfile);
+    if (rels <= 0) {
+        fprintf(stderr, "benchmark: bench produced no relations. A q-range "
+                "narrower than ~ln(q) contains no prime special-q; widen "
+                "--qrange.\n");
+        return 1;
+    }
+
+    double rate = secs > 0 ? (double)rels / secs : 0.0;
+    printf("\n=== gpu benchmark ===\n");
+    printf("  q-range width    : %u  (fixed work: identical on every box)\n", qwidth);
+    printf("  relations        : %lld\n", rels);
+    printf("  wall             : %.1fs\n", secs);
+    printf("  throughput       : %.1f rel/s\n", rate);
+    printf("  seconds / 1000 q : %.1f   <- compare this across boxes\n",
+           qwidth > 0 ? secs * 1000.0 / (double)qwidth : 0.0);
+    if (card[0]) printf("  card             : %s\n", card);
+    printf("\nrel/s only means something relative to a box you trust; run this\n"
+           "once on a known-good card to set the yardstick.\n");
+
+    if (min_rels > 0.0 && rate < min_rels) {
+        fprintf(stderr, "\nbenchmark: REJECT — %.1f rel/s is below "
+                "--min-rels-per-sec=%.1f\n", rate, min_rels);
+        return 3;
+    }
     return 0;
 }
 
@@ -2672,6 +2794,12 @@ static int run_benchmark(int argc, char **argv, client_cfg_t *cfg)
     char siever_args[128];
     snprintf(siever_args, sizeof(siever_args), "%s", lease.siever_args);
 
+    /* The CPU default of 65 (~3 special-q) is about a minute on one core but
+     * well under a second on a card — far too short to measure. Widen it for
+     * the cuda engine unless the operator said otherwise. */
+    if (cfg->engine == ENGINE_CUDA && !flag(argc, argv, "--qrange"))
+        qrange = 1000;
+
     /* Fixed anchor: --q if given, else the campaign's q_min. */
     int64_t anchor = q_override ? q_override : qmin;
     if (anchor < 1) {
@@ -2695,7 +2823,8 @@ static int run_benchmark(int argc, char **argv, client_cfg_t *cfg)
                 "results reflect the binary you gave.\n", lease.siever, siever_basename);
     }
     printf("anchor q   : %u%s  side=%c  args=\"%s\"\n",
-           base_q, q_override ? " (--q)" : " (q_min)", side, siever_args);
+           base_q, q_override ? " (--q)" : " (q_min)", side,
+           cfg->engine == ENGINE_CUDA ? lease.gpu_args : siever_args);
     fflush(stdout);
 
     char job_local[256];
@@ -2703,6 +2832,15 @@ static int run_benchmark(int argc, char **argv, client_cfg_t *cfg)
         fprintf(stderr, "benchmark: could not fetch the job file.\n");
         mg_mgr_free(&mgr);
         return 1;
+    }
+
+    /* One card, one measurement — the 1-core/N-core split below is meaningless
+     * for a GPU, so the cuda engine gets its own fixed-work run. */
+    if (cfg->engine == ENGINE_CUDA) {
+        int grc = run_benchmark_cuda(cfg, &mgr, &lease, job_local,
+                                     base_q, (uint32_t)qrange, min_rels);
+        mg_mgr_free(&mgr);
+        return grc;
     }
 
     /* Phase 0: build the factor-base cache once so phases 1-2 measure sieving,
@@ -2883,10 +3021,14 @@ int main(int argc, char **argv)
     /* Show the benchmark usage (not the generic client usage parse_config would
      * print) when a benchmark invocation is missing a required flag. */
     if (is_bench) {
-        const char *u = flag(argc, argv, "--server-url");
-        const char *t = flag(argc, argv, "--token");
-        const char *s = flag(argc, argv, "--siever");
-        if (!u || !*u || !t || !*t || !s || !*s) {
+        const char *u  = flag(argc, argv, "--server-url");
+        const char *t  = flag(argc, argv, "--token");
+        const char *e  = flag(argc, argv, "--engine");
+        int is_cuda    = e && strcmp(e, "cuda") == 0;
+        /* Each engine needs its own binary: --cuda-bench for the GPU path,
+         * --siever for the CPU one. */
+        const char *bin = flag(argc, argv, is_cuda ? "--cuda-bench" : "--siever");
+        if (!u || !*u || !t || !*t || !bin || !*bin) {
             bench_usage();
             return 2;
         }

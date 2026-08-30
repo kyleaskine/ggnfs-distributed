@@ -55,7 +55,8 @@ static const char SCHEMA_SQL[] =
     "  last_seen       INTEGER NOT NULL,"
     "  total_relations INTEGER NOT NULL DEFAULT 0,"
     "  total_workunits INTEGER NOT NULL DEFAULT 0,"
-    "  total_failures  INTEGER NOT NULL DEFAULT 0"
+    "  total_failures  INTEGER NOT NULL DEFAULT 0,"
+    "  last_class      TEXT"
     ");"
     "CREATE TABLE IF NOT EXISTS files ("
     "  sha256  TEXT PRIMARY KEY,"
@@ -149,6 +150,16 @@ static int db_migrate(sqlite3 *conn)
             return -1;
         fprintf(stderr, "db: migrated schema — added workunits.class"
                         " (existing rows default to 'cpu')\n");
+    }
+
+    /* clients.last_class — informational only; NULL until the client leases. */
+    has = column_exists(conn, "clients", "last_class");
+    if (has < 0) return -1;
+    if (!has) {
+        if (exec_or_log(conn,
+                "ALTER TABLE clients ADD COLUMN last_class TEXT;",
+                "migrate: add clients.last_class") != 0)
+            return -1;
     }
     return 0;
 }
@@ -728,6 +739,22 @@ int db_release_lease(ggnfs_db_t *db, const char *workunit_id,
     return changed > 0 ? 0 : 1;
 }
 
+int db_clients_note_class(ggnfs_db_t *db, const char *client_id,
+                          const char *class)
+{
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db->conn,
+            "UPDATE clients SET last_class = ?2 WHERE id = ?1;",
+            -1, &st, NULL) != SQLITE_OK) {
+        return -1;
+    }
+    sqlite3_bind_text(st, 1, client_id, -1, SQLITE_STATIC);
+    sqlite3_bind_text(st, 2, class ? class : "cpu", -1, SQLITE_STATIC);
+    int rc = sqlite3_step(st);
+    sqlite3_finalize(st);
+    return (rc == SQLITE_DONE) ? 0 : -1;
+}
+
 int db_clients_seen(ggnfs_db_t *db, const char *client_id, int64_t now_unix)
 {
     sqlite3_stmt *st = NULL;
@@ -993,8 +1020,13 @@ int db_stats_snapshot(ggnfs_db_t *db, int64_t now_unix, db_stats_t *out)
                 const char *cname = cls ? (const char *)cls : "cpu";
                 const char *sname = stt ? (const char *)stt : "";
 
-                out->q_total += qw;
-                if (strcmp(sname, "verified") == 0) out->q_verified += qw;
+                out->q.total += qw;
+                if      (strcmp(sname, "available") == 0) out->q.available += qw;
+                else if (strcmp(sname, "leased")    == 0) out->q.leased    += qw;
+                else if (strcmp(sname, "submitted") == 0) out->q.submitted += qw;
+                else if (strcmp(sname, "verified")  == 0) out->q.verified  += qw;
+                else if (strcmp(sname, "failed")    == 0) out->q.failed    += qw;
+                else if (strcmp(sname, "poisoned")  == 0) out->q.poisoned  += qw;
 
                 /* Find or append this class's row. A jobdir should only ever
                  * hold the classes init/extend accept, so overflowing
@@ -1025,6 +1057,8 @@ int db_stats_snapshot(ggnfs_db_t *db, int64_t now_unix, db_stats_t *out)
             }
             sqlite3_finalize(st);
         }
+        out->q_total    = out->q.total;
+        out->q_verified = out->q.verified;
     }
 
     /* Q-width whose sieving finished in the last hour and has since passed
@@ -1118,7 +1152,8 @@ int db_stats_snapshot(ggnfs_db_t *db, int64_t now_unix, db_stats_t *out)
             "  COALESCE(SUM(s.num_relations), 0), "
             "  COALESCE(AVG(s.sieve_seconds), 0.0), "
             "  COALESCE((SELECT id FROM workunits "
-            "            WHERE state='leased' AND leased_to=c.id LIMIT 1), '') "
+            "            WHERE state='leased' AND leased_to=c.id LIMIT 1), ''), "
+            "  COALESCE(c.last_class, '') "
             "FROM clients c "
             "LEFT JOIN submissions s ON s.client_id = c.id "
             "WHERE c.total_relations > 0 "
@@ -1144,6 +1179,9 @@ int db_stats_snapshot(ggnfs_db_t *db, int64_t now_unix, db_stats_t *out)
                     if (cur)
                         snprintf(cc->current_workunit,
                                  sizeof(cc->current_workunit), "%s", cur);
+                    const unsigned char *lc = sqlite3_column_text(st, 8);
+                    if (lc)
+                        snprintf(cc->last_class, sizeof(cc->last_class), "%s", lc);
                 }
                 out->clients      = arr;
                 out->client_count = n;

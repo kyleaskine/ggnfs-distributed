@@ -715,6 +715,7 @@ static void handle_lease(struct mg_connection *c, struct mg_http_message *hm,
     }
 
     db_clients_seen(ctx->db, client_id, now_unix());
+    db_clients_note_class(ctx->db, client_id, class_want);
 
     db_lease_result_t r;
     int rc = db_lease(ctx->db, client_id, ctx->lease_seconds, now_unix(),
@@ -1074,6 +1075,18 @@ static char *format_stats_json(server_ctx_t *ctx, const db_stats_t *s,
     cJSON_AddNumberToObject(wu, "q_max",     (double)s->q_max);
     /* Size-weighted progress. With a GPU band ~100x wider than a CPU one,
      * "workunits done / total" is not progress; these are. */
+    /* Per-state q-width: the same five buckets as the counts above, weighted
+     * by band width. The dashboard's bar and percentage read from these. */
+    cJSON *qw = cJSON_AddObjectToObject(wu, "q");
+    if (qw) {
+        cJSON_AddNumberToObject(qw, "total",     (double)s->q.total);
+        cJSON_AddNumberToObject(qw, "available", (double)s->q.available);
+        cJSON_AddNumberToObject(qw, "leased",    (double)s->q.leased);
+        cJSON_AddNumberToObject(qw, "submitted", (double)s->q.submitted);
+        cJSON_AddNumberToObject(qw, "verified",  (double)s->q.verified);
+        cJSON_AddNumberToObject(qw, "failed",    (double)s->q.failed);
+        cJSON_AddNumberToObject(qw, "poisoned",  (double)s->q.poisoned);
+    }
     cJSON_AddNumberToObject(wu, "q_total",       (double)s->q_total);
     cJSON_AddNumberToObject(wu, "q_verified",    (double)s->q_verified);
     cJSON_AddNumberToObject(wu, "q_passed_1h",   (double)s->q_passed_1h);
@@ -1118,6 +1131,7 @@ static char *format_stats_json(server_ctx_t *ctx, const db_stats_t *s,
         cJSON_AddNumberToObject(o, "total_failures",     (double)cc->total_failures);
         cJSON_AddNumberToObject(o, "avg_sieve_seconds",  cc->avg_sieve_seconds);
         cJSON_AddStringToObject(o, "current_workunit",   cc->current_workunit);
+        cJSON_AddStringToObject(o, "class",              cc->last_class);
         cJSON_AddItemToArray(clients, o);
     }
 

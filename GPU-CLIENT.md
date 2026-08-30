@@ -391,17 +391,40 @@ onto.
 
 ## Phase 5 — Ops and polish
 
-- [ ] **5.1 Dashboard.** Progress and ETA are `done / w.total` *workunits*
+- [x] **5.1 Dashboard.** Progress and ETA are `done / w.total` *workunits*
       (`dashboard.html:235`) — meaningless with two sizes. Switch to q-width
       from 2.3, and add an engine/class column to the client table.
-- [ ] **5.2 `benchmark --engine=cuda`.** Same fixed-work screening idea for
+- [x] **5.2 `benchmark --engine=cuda`.** Same fixed-work screening idea for
       rented GPU boxes.
-- [ ] **5.3 GPU bootstrap script** (`cuda-client.sh`), plus a check that
+- [x] **5.3 GPU bootstrap script** (`cuda-client.sh`), plus a check that
       `pull-rels.sh` / `move-rels.sh` / `finalize-nfs.sh` are indifferent to
       the source. They should be — same `rels/` naming, and relations verify
       identically.
-- [ ] **5.4 Docs.** Fold the class/engine split, the inclusive-`--qrange`
+- [x] **5.4 Docs.** Fold the class/engine split, the inclusive-`--qrange`
       trap, and the sizing rationale into `CLAUDE.md`.
+
+**Gate — passed.**
+
+- *Dashboard.* Rendered headless against a job of 400 cpu bands (1000 wide, all
+  done) plus 4 gpu bands (100000 wide, none done): **count-based would read
+  99.0% "nearly finished"; q-width reads the true 50.0%.** ETA is q-width
+  remaining over `q_passed_1h`. Bar segments, per-class breakdown and a client
+  `class` column all render, and `clientGroupId` now strips the `-sK` slot
+  suffix so a prefetching GPU box is one row rather than N.
+- *GPU benchmark.* Real card: 5251 relations in 27.9 s at q=32001000 — exactly
+  matching what the live sieving run produced for that same band, which is the
+  check that caught `bench_fetch_params` never copying `gpu_args` (it had been
+  running at bench's default logI 15 while passing an `--fb1` built for
+  maxbits 17, understating the card by ~2x and mismatching the factor base).
+- *Downstream.* `finalize-nfs.sh` assembled `nfs.dat` from four GPU-produced
+  submissions unchanged — 21,781 relations plus its `N:` header. The scripts
+  glob `wu-*.dat*` and carry no engine or band-size assumptions.
+- *Bootstrap.* `cuda-client.sh` is shellcheck-clean, and both generated-script
+  variants were verified: with and without `fbgen_gpu`, arguments and
+  pass-through `"$@"` survive. The first draft spliced an optionally-empty line
+  into a backslash-continued command, which silently truncated every argument
+  after it on exactly the boxes that lack `fbgen_gpu`; it builds a bash array
+  instead.
 
 ## Expectations to set
 

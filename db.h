@@ -144,6 +144,11 @@ int db_release_lease(ggnfs_db_t *db, const char *workunit_id,
 /* Upsert a client's last_seen timestamp. */
 int db_clients_seen(ggnfs_db_t *db, const char *client_id, int64_t now_unix);
 
+/* Record the workunit class this client last asked /lease for. Shown on the
+ * dashboard so a GPU box quietly requesting cpu-class work is visible. */
+int db_clients_note_class(ggnfs_db_t *db, const char *client_id,
+                          const char *class);
+
 /* ---- verifier API (called from the verifier thread) ----------------- */
 
 typedef struct {
@@ -204,6 +209,7 @@ typedef struct {
     double  avg_sieve_seconds;        /* over this client's submissions    */
     int64_t total_failures;
     char    current_workunit[64];     /* "" if no active lease            */
+    char    last_class[16];           /* class it last asked /lease for   */
 } db_stats_client_t;
 
 /* Per-class rollup. Workunit counts alone stopped meaning much once a GPU
@@ -228,9 +234,14 @@ typedef struct {
     int64_t  q_min;                   /* MIN(q_start) — 0 if no rows      */
     int64_t  q_max;                   /* MAX(q_start + q_range) — 0 ditto */
 
-    /* q-width progress: the size-weighted view of the same rows. */
-    int64_t  q_total;                 /* SUM(q_range) over all workunits  */
-    int64_t  q_verified;              /* SUM(q_range) WHERE verified      */
+    /* q-width progress: the size-weighted view of the same rows. Every
+     * user-facing progress number should come from here rather than from
+     * `wu`, because a gpu-class band is ~100x a cpu-class one and counting
+     * rows makes 10-of-20 look like half the work. Same field names as `wu`,
+     * but SUM(q_range) instead of COUNT(*). */
+    db_workunit_counts_t  q;
+    int64_t  q_total;                 /* == q.total; kept for callers      */
+    int64_t  q_verified;              /* == q.verified; ditto              */
     int64_t  q_passed_1h;             /* q-width SUBMITTED in the last 1h that
                                        * has since passed verification; keyed
                                        * on submit time, see db_stats_snapshot */
