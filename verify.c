@@ -988,7 +988,30 @@ struct verify_thread_s {
     char           *db_path;       /* malloc'd */
     int64_t         max_attempts;
     int             spotcheck_k;   /* 0 disables norm spot-check */
+    int64_t         base_q_range;  /* narrowest band in the job; 0 = no scaling */
 };
+
+/* A GPU-class workunit covers ~100x the q-width of a CPU-class one and yields
+ * proportionally more relations, so a fixed K would sample it ~100x more
+ * thinly. Scale K by q_range / base_q_range so sample *density* is what stays
+ * constant, and cap the multiplier so a pathological q_range can't ask for an
+ * unbounded reservoir.
+ *
+ * base_q_range is the job's most common band width, read off the workunits table
+ * at the top of every drain pass rather than from a config value. That is what
+ * makes it right for the normal GPU rollout — `extend --class=gpu` onto a
+ * campaign whose meta predates all of this — and it keeps working when a later
+ * extend introduces a narrower band. */
+#define SPOTCHECK_MAX_SCALE 32
+
+static int spotcheck_k_for(int base_k, int64_t base_q_range, int64_t q_range)
+{
+    if (base_k <= 0) return 0;
+    if (base_q_range <= 0 || q_range <= base_q_range) return base_k;
+    int64_t scale = q_range / base_q_range;
+    if (scale > SPOTCHECK_MAX_SCALE) scale = SPOTCHECK_MAX_SCALE;
+    return (int)(base_k * scale);
+}
 
 /* Drain every pending submission; returns when the queue is empty (or on
  * a DB error after logging it). `poly` may be NULL — in that case the norm
@@ -996,15 +1019,26 @@ struct verify_thread_s {
 static void drain_pending(verify_thread_t *vt, ggnfs_db_t *db,
                           const verify_poly_gmp_t *poly)
 {
-    /* Reservoir buffer reused across submissions; allocated lazily so K=0
-     * users pay nothing. */
-    verify_relation_t *resbuf = NULL;
-    int                rescap = (poly && vt->spotcheck_k > 0) ? vt->spotcheck_k : 0;
-    if (rescap > 0) {
-        resbuf = malloc((size_t)rescap * sizeof(*resbuf));
-        if (!resbuf) {
-            fprintf(stderr, "verify: reservoir malloc failed; spot-check disabled\n");
-            rescap = 0;
+    /* Reservoir buffer reused across submissions, grown on demand: a job with
+     * only CPU-class workunits never allocates more than K entries, while a
+     * GPU-class one grows once and then reuses. `resalloc` is what is
+     * allocated; `rescap` is what this submission actually wants. */
+    verify_relation_t *resbuf   = NULL;
+    int                resalloc = 0;
+    const int          spot_on  = (poly && vt->spotcheck_k > 0);
+
+    /* Cheap (one indexed aggregate) and only once per drain pass, not per
+     * submission — but it does need re-reading, because `extend` can add a
+     * narrower band while the verifier is running. */
+    if (spot_on) {
+        int64_t base = 0;
+        if (db_workunit_base_q_range(db, &base) == 0 && base > 0) {
+            if (base != vt->base_q_range) {
+                fprintf(stderr, "verify: spot-check baseline q_range=%lld "
+                        "(k=%d, scaling to %dx)\n",
+                        (long long)base, vt->spotcheck_k, SPOTCHECK_MAX_SCALE);
+            }
+            vt->base_q_range = base;
         }
     }
 
@@ -1030,6 +1064,24 @@ static void drain_pending(verify_thread_t *vt, ggnfs_db_t *db,
             .q_range = p.q_range,
             .side    = p.side,
         };
+        int rescap = spot_on ? spotcheck_k_for(vt->spotcheck_k,
+                                               vt->base_q_range, p.q_range)
+                             : 0;
+        if (rescap > resalloc) {
+            verify_relation_t *nb = realloc(resbuf,
+                                            (size_t)rescap * sizeof(*resbuf));
+            if (!nb) {
+                /* Keep whatever we already have and sample at that size
+                 * rather than dropping the spot-check entirely. */
+                fprintf(stderr, "verify: reservoir realloc to %d failed; "
+                                "sampling %d\n", rescap, resalloc);
+                rescap = resalloc;
+            } else {
+                resbuf   = nb;
+                resalloc = rescap;
+            }
+        }
+
         verify_reservoir_t reservoir = {
             .buf  = resbuf,
             .cap  = rescap,
@@ -1126,7 +1178,8 @@ static void *verify_thread_run(void *arg)
             if (!poly) {
                 fprintf(stderr, "verify: poly_load failed — spot-check disabled\n");
             } else {
-                fprintf(stderr, "verify: spot-check enabled (k=%d, poly degree %d)\n",
+                fprintf(stderr, "verify: spot-check enabled (k=%d, poly degree "
+                        "%d); sample size scales with band width\n",
                         vt->spotcheck_k, poly->degree);
             }
         } else {

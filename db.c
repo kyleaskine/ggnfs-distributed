@@ -20,6 +20,7 @@ static const char SCHEMA_SQL[] =
     "  q_start       INTEGER NOT NULL,"
     "  q_range       INTEGER NOT NULL,"
     "  side          TEXT NOT NULL CHECK (side IN ('a','r')),"
+    "  class         TEXT NOT NULL DEFAULT 'cpu',"
     "  state         TEXT NOT NULL CHECK (state IN"
     "                  ('available','leased','submitted','verified','failed','poisoned')),"
     "  attempt_count INTEGER NOT NULL DEFAULT 0,"
@@ -30,7 +31,6 @@ static const char SCHEMA_SQL[] =
     "  completed_at  INTEGER,"
     "  expected_rels INTEGER"
     ");"
-    "CREATE INDEX IF NOT EXISTS idx_wu_state ON workunits(state);"
     "CREATE INDEX IF NOT EXISTS idx_wu_lease_expires"
     "    ON workunits(lease_expires) WHERE state = 'leased';"
     "CREATE TABLE IF NOT EXISTS submissions ("
@@ -55,7 +55,8 @@ static const char SCHEMA_SQL[] =
     "  last_seen       INTEGER NOT NULL,"
     "  total_relations INTEGER NOT NULL DEFAULT 0,"
     "  total_workunits INTEGER NOT NULL DEFAULT 0,"
-    "  total_failures  INTEGER NOT NULL DEFAULT 0"
+    "  total_failures  INTEGER NOT NULL DEFAULT 0,"
+    "  last_class      TEXT"
     ");"
     "CREATE TABLE IF NOT EXISTS files ("
     "  sha256  TEXT PRIMARY KEY,"
@@ -67,6 +68,29 @@ static const char SCHEMA_SQL[] =
     "  key   TEXT PRIMARY KEY,"
     "  value TEXT"
     ");";
+
+/* Runs after db_migrate has guaranteed every column below exists. Anything
+ * naming a migrated column has to live here rather than in SCHEMA_SQL, which
+ * executes against the pre-migration shape on a legacy jobdir.
+ *
+ * idx_wu_lease subsumes the old state-only index: `state` is still the
+ * leading column, so the GROUP BY state counting queries use it unchanged,
+ * while db_lease's `state = 'available' AND class = ? ORDER BY q_start` is
+ * now covered end to end. q_range is the last column purely to make the
+ * per-class q-width rollup in db_stats_snapshot covering — without it that
+ * GROUP BY does a table lookup per row, and /stats runs on the same thread
+ * as /lease and /submit every time the dashboard polls.
+ *
+ * idx_sub_received turns the "q-width verified in the last hour" query from a
+ * full submissions scan into a range scan over one hour, which matters as
+ * submissions grow into the hundreds of thousands. */
+static const char SCHEMA_SQL_POST[] =
+    "DROP INDEX IF EXISTS idx_wu_state;"
+    "DROP INDEX IF EXISTS idx_wu_state_class;"
+    "CREATE INDEX IF NOT EXISTS idx_wu_lease"
+    "    ON workunits(state, class, q_start, q_range);"
+    "CREATE INDEX IF NOT EXISTS idx_sub_received"
+    "    ON submissions(received_at);";
 
 static int exec_or_log(sqlite3 *conn, const char *sql, const char *what)
 {
@@ -80,6 +104,88 @@ static int exec_or_log(sqlite3 *conn, const char *sql, const char *what)
     return 0;
 }
 
+/* Does `table` already have a column named `column`? 1 yes, 0 no, -1 error. */
+static int column_exists(sqlite3 *conn, const char *table, const char *column)
+{
+    sqlite3_stmt *st = NULL;
+    char sql[128];
+    /* PRAGMA won't take a bound parameter for the table name, but `table` is
+     * always a literal from this file — never user input. */
+    snprintf(sql, sizeof(sql), "PRAGMA table_info(%s);", table);
+    if (sqlite3_prepare_v2(conn, sql, -1, &st, NULL) != SQLITE_OK) {
+        fprintf(stderr, "db: table_info(%s): %s\n", table, sqlite3_errmsg(conn));
+        return -1;
+    }
+    int found = 0, rc;
+    while ((rc = sqlite3_step(st)) == SQLITE_ROW) {
+        const unsigned char *name = sqlite3_column_text(st, 1);
+        if (name && strcmp((const char *)name, column) == 0) { found = 1; break; }
+    }
+    sqlite3_finalize(st);
+    if (rc != SQLITE_ROW && rc != SQLITE_DONE) return -1;
+    return found;
+}
+
+/* Bring an existing jobdir's schema up to the current shape.
+ *
+ * SCHEMA_SQL creates tables with `CREATE TABLE IF NOT EXISTS`, so a jobdir
+ * initialized by an older build keeps whatever columns it was created with —
+ * new ones in SCHEMA_SQL are silently ignored there. Every column added after
+ * the initial release therefore needs a matching step here.
+ *
+ * Each step must be idempotent: db_open runs this on every open, including
+ * the verifier thread's second connection. */
+static int db_migrate(sqlite3 *conn)
+{
+    /* One writer at a time. This is a check-then-act: two processes opening the
+     * same jobdir during an upgrade can both observe a column missing, and the
+     * loser's ALTER fails with "duplicate column name" — a LOGICAL conflict
+     * that sqlite3_busy_timeout does nothing for, since neither statement ever
+     * blocks. BEGIN IMMEDIATE serialises the check with the ALTER so the
+     * second process re-reads the post-migration shape and finds nothing to
+     * do. Harmless when uncontended, and the whole block is idempotent. */
+    if (sqlite3_exec(conn, "BEGIN IMMEDIATE;", NULL, NULL, NULL) != SQLITE_OK) {
+        fprintf(stderr, "db: migrate: cannot begin: %s\n", sqlite3_errmsg(conn));
+        return -1;
+    }
+#define MIGRATE_FAIL() do { \
+        sqlite3_exec(conn, "ROLLBACK;", NULL, NULL, NULL); \
+        return -1; \
+    } while (0)
+
+    /* workunits.class — 'cpu' (a gnfs-lasieve4-sized q_range) or 'gpu' (a
+     * much wider one). Pre-existing rows are all CPU-sized by definition, so
+     * the DEFAULT backfills them correctly. */
+    int has = column_exists(conn, "workunits", "class");
+    if (has < 0) MIGRATE_FAIL();
+    if (!has) {
+        if (exec_or_log(conn,
+                "ALTER TABLE workunits ADD COLUMN class TEXT NOT NULL"
+                "     DEFAULT 'cpu';",
+                "migrate: add workunits.class") != 0)
+            MIGRATE_FAIL();
+        fprintf(stderr, "db: migrated schema — added workunits.class"
+                        " (existing rows default to 'cpu')\n");
+    }
+
+    /* clients.last_class — informational only; NULL until the client leases. */
+    has = column_exists(conn, "clients", "last_class");
+    if (has < 0) MIGRATE_FAIL();
+    if (!has) {
+        if (exec_or_log(conn,
+                "ALTER TABLE clients ADD COLUMN last_class TEXT;",
+                "migrate: add clients.last_class") != 0)
+            MIGRATE_FAIL();
+    }
+#undef MIGRATE_FAIL
+    if (sqlite3_exec(conn, "COMMIT;", NULL, NULL, NULL) != SQLITE_OK) {
+        fprintf(stderr, "db: migrate: cannot commit: %s\n", sqlite3_errmsg(conn));
+        sqlite3_exec(conn, "ROLLBACK;", NULL, NULL, NULL);
+        return -1;
+    }
+    return 0;
+}
+
 ggnfs_db_t *db_open(const char *path)
 {
     sqlite3 *conn = NULL;
@@ -88,19 +194,34 @@ ggnfs_db_t *db_open(const char *path)
         sqlite3_close(conn);
         return NULL;
     }
+    /* Set the busy timeout BEFORE any DDL. db_migrate's ALTER TABLE and
+     * SCHEMA_SQL_POST's CREATE INDEX are the most contended statements this
+     * process ever runs — a 430K-row index build against a jobdir whose
+     * `serve` is mid-write — and without the timeout they take SQLITE_BUSY
+     * immediately and fail db_open outright. */
+    sqlite3_busy_timeout(conn, 5000);
+
     if (exec_or_log(conn, SCHEMA_SQL, "schema init") != 0) {
+        sqlite3_close(conn);
+        return NULL;
+    }
+    if (db_migrate(conn) != 0) {
+        sqlite3_close(conn);
+        return NULL;
+    }
+    if (exec_or_log(conn, SCHEMA_SQL_POST, "schema init (post-migrate)") != 0) {
         sqlite3_close(conn);
         return NULL;
     }
     /* Best-effort; don't fail open if FK enforcement can't be turned on. */
     (void)exec_or_log(conn, "PRAGMA foreign_keys = ON;", "enable foreign_keys");
 
-    /* Two connections (main event loop + verifier thread) will share this file
-     * once the verifier lands. WAL mode allows readers + one writer; busy_timeout
-     * resolves the brief contention window when both try to commit at once.
-     * 5s is long enough to ride out the other side's BEGIN IMMEDIATE / UPDATE /
-     * COMMIT but short enough that a real deadlock is still loud. */
-    sqlite3_busy_timeout(conn, 5000);
+    /* (The busy timeout is set above, before the schema DDL.) Two connections
+     * — main event loop and verifier thread — share this file. WAL mode allows
+     * readers + one writer; the timeout resolves the brief contention window
+     * when both try to commit at once. 5s is long enough to ride out the other
+     * side's BEGIN IMMEDIATE / UPDATE / COMMIT but short enough that a real
+     * deadlock is still loud. */
 
     ggnfs_db_t *db = calloc(1, sizeof(*db));
     if (!db) { sqlite3_close(conn); return NULL; }
@@ -197,14 +318,28 @@ char *db_files_path_for(ggnfs_db_t *db, const char *sha256_hex)
 
 /* ---- workunits -------------------------------------------------------- */
 
+/* Fill *out from a lease statement's RETURNING row: id, q_start, q_range,
+ * side, class in that column order. */
+static void lease_result_from_row(sqlite3_stmt *st, db_lease_result_t *out)
+{
+    const unsigned char *id    = sqlite3_column_text (st, 0);
+    const unsigned char *side  = sqlite3_column_text (st, 3);
+    const unsigned char *class = sqlite3_column_text (st, 4);
+    snprintf(out->id,    sizeof(out->id),    "%s", id    ? (const char *)id    : "");
+    snprintf(out->class, sizeof(out->class), "%s", class ? (const char *)class : "cpu");
+    out->q_start = sqlite3_column_int64(st, 1);
+    out->q_range = sqlite3_column_int64(st, 2);
+    out->side    = side ? (char)side[0] : '?';
+}
+
 int db_workunit_insert(ggnfs_db_t *db, const char *id,
                        int64_t q_start, int64_t q_range, char side,
-                       int64_t now_unix)
+                       const char *class, int64_t now_unix)
 {
     sqlite3_stmt *st = NULL;
     if (sqlite3_prepare_v2(db->conn,
-            "INSERT INTO workunits(id, q_start, q_range, side, state, attempt_count, created_at) "
-            "VALUES (?1, ?2, ?3, ?4, 'available', 0, ?5);",
+            "INSERT INTO workunits(id, q_start, q_range, side, class, state, attempt_count, created_at) "
+            "VALUES (?1, ?2, ?3, ?4, ?5, 'available', 0, ?6);",
             -1, &st, NULL) != SQLITE_OK) {
         fprintf(stderr, "db_workunit_insert: %s\n", sqlite3_errmsg(db->conn));
         return -1;
@@ -214,7 +349,8 @@ int db_workunit_insert(ggnfs_db_t *db, const char *id,
     sqlite3_bind_int64 (st, 2, q_start);
     sqlite3_bind_int64 (st, 3, q_range);
     sqlite3_bind_text  (st, 4, side_str, 1, SQLITE_TRANSIENT);
-    sqlite3_bind_int64 (st, 5, now_unix);
+    sqlite3_bind_text  (st, 5, class && *class ? class : "cpu", -1, SQLITE_STATIC);
+    sqlite3_bind_int64 (st, 6, now_unix);
     int rc = sqlite3_step(st);
     sqlite3_finalize(st);
     return (rc == SQLITE_DONE) ? 0 : -1;
@@ -246,7 +382,7 @@ int db_workunit_get(ggnfs_db_t *db, const char *id, db_lease_result_t *out)
     if (!id || !out) return -1;
     sqlite3_stmt *st = NULL;
     if (sqlite3_prepare_v2(db->conn,
-            "SELECT id, q_start, q_range, side FROM workunits WHERE id = ?1;",
+            "SELECT id, q_start, q_range, side, class FROM workunits WHERE id = ?1;",
             -1, &st, NULL) != SQLITE_OK) {
         fprintf(stderr, "db_workunit_get: %s\n", sqlite3_errmsg(db->conn));
         return -1;
@@ -255,12 +391,8 @@ int db_workunit_get(ggnfs_db_t *db, const char *id, db_lease_result_t *out)
     int rc = sqlite3_step(st);
     int result;
     if (rc == SQLITE_ROW) {
-        const unsigned char *rid  = sqlite3_column_text(st, 0);
-        const unsigned char *side = sqlite3_column_text(st, 3);
-        snprintf(out->id, sizeof(out->id), "%s", rid ? (const char *)rid : "");
-        out->q_start = sqlite3_column_int64(st, 1);
-        out->q_range = sqlite3_column_int64(st, 2);
-        out->side    = side ? (char)side[0] : '?';
+        /* Same column order the lease statements return. */
+        lease_result_from_row(st, out);
         result = 0;
     } else if (rc == SQLITE_DONE) {
         result = 1;
@@ -274,6 +406,34 @@ int db_workunit_get(ggnfs_db_t *db, const char *id, db_lease_result_t *out)
 
 /* [a,b) and [c,d) overlap iff a < d AND c < b. Here [qmin,qmax) is the new
  * range and [q_start, q_start+q_range) is the existing workunit row. */
+int db_workunit_base_q_range(ggnfs_db_t *db, int64_t *out)
+{
+    sqlite3_stmt *st = NULL;
+    /* The MODE, not the minimum. A campaign is laid out at one band width and
+     * then extended with others, so the most common width is the baseline the
+     * job was designed around. MIN would be hostage to a single leftover
+     * sliver — a partial extend, a hand-inserted probe row — and would inflate
+     * the spot-check sample for every workunit in the job. */
+    if (sqlite3_prepare_v2(db->conn,
+            "SELECT q_range FROM workunits "
+            "GROUP BY q_range ORDER BY COUNT(*) DESC, q_range ASC LIMIT 1;",
+            -1, &st, NULL) != SQLITE_OK) {
+        fprintf(stderr, "db_workunit_base_q_range: %s\n", sqlite3_errmsg(db->conn));
+        return -1;
+    }
+    int rc = sqlite3_step(st);
+    int result = -1;
+    if (rc == SQLITE_ROW) {
+        if (out) *out = sqlite3_column_int64(st, 0);
+        result = 0;
+    } else if (rc == SQLITE_DONE) {
+        if (out) *out = 0;          /* empty table */
+        result = 0;
+    }
+    sqlite3_finalize(st);
+    return result;
+}
+
 int db_workunit_overlap(ggnfs_db_t *db, int64_t qmin, int64_t qmax,
                         int64_t *out_q_start, int64_t *out_q_range)
 {
@@ -346,9 +506,69 @@ int db_lease_expire_sweep(ggnfs_db_t *db,
     return 0;
 }
 
+/* Try to claim one available workunit of exactly `class`. Returns 0 on claim
+ * (out filled), 1 if that class has nothing available, -1 on error. */
+static int lease_try_class(ggnfs_db_t *db, const char *client_id,
+                           int64_t lease_seconds, int64_t now_unix,
+                           int lease_desc, const char *class,
+                           db_lease_result_t *out)
+{
+    /* Atomic claim: pick the next available row, flip it to 'leased', return
+     * the columns the caller needs. SQLite RETURNING (3.35+) gives us the
+     * post-update row in a single statement. `lease_desc` selects the q_start
+     * ordering: ascending (default) or descending (useful when neighboring
+     * sieve work is going up from a higher q, so we want to close the gap
+     * downward and avoid stranding a small leftover band). */
+    static const char *const sql_asc =
+            "UPDATE workunits "
+            "  SET state = 'leased',"
+            "      leased_at = ?1,"
+            "      leased_to = ?2,"
+            "      lease_expires = ?3 "
+            "  WHERE id = (SELECT id FROM workunits "
+            "              WHERE state = 'available' AND class = ?4 "
+            "              ORDER BY q_start ASC LIMIT 1) "
+            "RETURNING id, q_start, q_range, side, class;";
+    static const char *const sql_desc =
+            "UPDATE workunits "
+            "  SET state = 'leased',"
+            "      leased_at = ?1,"
+            "      leased_to = ?2,"
+            "      lease_expires = ?3 "
+            "  WHERE id = (SELECT id FROM workunits "
+            "              WHERE state = 'available' AND class = ?4 "
+            "              ORDER BY q_start DESC LIMIT 1) "
+            "RETURNING id, q_start, q_range, side, class;";
+
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db->conn, lease_desc ? sql_desc : sql_asc,
+                           -1, &st, NULL) != SQLITE_OK) {
+        fprintf(stderr, "db_lease: %s\n", sqlite3_errmsg(db->conn));
+        return -1;
+    }
+    sqlite3_bind_int64(st, 1, now_unix);
+    sqlite3_bind_text (st, 2, client_id, -1, SQLITE_STATIC);
+    sqlite3_bind_int64(st, 3, now_unix + lease_seconds);
+    sqlite3_bind_text (st, 4, class, -1, SQLITE_STATIC);
+
+    int result;
+    int rc = sqlite3_step(st);
+    if (rc == SQLITE_ROW) {
+        lease_result_from_row(st, out);
+        result = 0;
+    } else if (rc == SQLITE_DONE) {
+        result = 1; /* nothing available in this class */
+    } else {
+        fprintf(stderr, "db_lease: step: %s\n", sqlite3_errmsg(db->conn));
+        result = -1;
+    }
+    sqlite3_finalize(st);
+    return result;
+}
+
 int db_lease(ggnfs_db_t *db, const char *client_id,
              int64_t lease_seconds, int64_t now_unix,
-             int lease_desc,
+             int lease_desc, const char *class_want,
              db_lease_result_t *out)
 {
     memset(out, 0, sizeof(*out));
@@ -366,7 +586,7 @@ int db_lease(ggnfs_db_t *db, const char *client_id,
             "                AND leased_to = ?1 "
             "                AND lease_expires >= ?2 "
             "              ORDER BY leased_at DESC, id DESC LIMIT 1) "
-            "RETURNING id, q_start, q_range, side;",
+            "RETURNING id, q_start, q_range, side, class;",
             -1, &st, NULL) != SQLITE_OK) {
         fprintf(stderr, "db_lease existing: %s\n", sqlite3_errmsg(db->conn));
         return -1;
@@ -377,14 +597,11 @@ int db_lease(ggnfs_db_t *db, const char *client_id,
 
     int rc = sqlite3_step(st);
     if (rc == SQLITE_ROW) {
-        const unsigned char *id   = sqlite3_column_text (st, 0);
-        int64_t              qs   = sqlite3_column_int64(st, 1);
-        int64_t              qr   = sqlite3_column_int64(st, 2);
-        const unsigned char *side = sqlite3_column_text (st, 3);
-        snprintf(out->id, sizeof(out->id), "%s", id ? (const char *)id : "");
-        out->q_start = qs;
-        out->q_range = qr;
-        out->side    = side ? (char)side[0] : '?';
+        /* Deliberately class-agnostic: whatever this client already holds is
+         * what it gets back, even if it is now asking for a different class.
+         * Handing out a second workunit here is the failure this guard
+         * exists to prevent. */
+        lease_result_from_row(st, out);
         sqlite3_finalize(st);
         return 0;
     }
@@ -396,61 +613,36 @@ int db_lease(ggnfs_db_t *db, const char *client_id,
     sqlite3_finalize(st);
     st = NULL;
 
-    /* Atomic claim: pick the next available row, flip it to 'leased', return
-     * the columns the caller needs. SQLite RETURNING (3.35+) gives us the
-     * post-update row in a single statement. `lease_desc` selects the q_start
-     * ordering: ascending (default) or descending (useful when neighboring
-     * sieve work is going up from a higher q, so we want to close the gap
-     * downward and avoid stranding a small leftover band). */
-    const char *sql_asc =
-            "UPDATE workunits "
-            "  SET state = 'leased',"
-            "      leased_at = ?1,"
-            "      leased_to = ?2,"
-            "      lease_expires = ?3 "
-            "  WHERE id = (SELECT id FROM workunits "
-            "              WHERE state = 'available' "
-            "              ORDER BY q_start ASC LIMIT 1) "
-            "RETURNING id, q_start, q_range, side;";
-    const char *sql_desc =
-            "UPDATE workunits "
-            "  SET state = 'leased',"
-            "      leased_at = ?1,"
-            "      leased_to = ?2,"
-            "      lease_expires = ?3 "
-            "  WHERE id = (SELECT id FROM workunits "
-            "              WHERE state = 'available' "
-            "              ORDER BY q_start DESC LIMIT 1) "
-            "RETURNING id, q_start, q_range, side;";
-    if (sqlite3_prepare_v2(db->conn,
-            lease_desc ? sql_desc : sql_asc,
-            -1, &st, NULL) != SQLITE_OK) {
-        fprintf(stderr, "db_lease: %s\n", sqlite3_errmsg(db->conn));
-        return -1;
-    }
-    sqlite3_bind_int64(st, 1, now_unix);
-    sqlite3_bind_text (st, 2, client_id, -1, SQLITE_STATIC);
-    sqlite3_bind_int64(st, 3, now_unix + lease_seconds);
+    /* Class fallback. A GPU-class workunit is ~100x wider than a CPU-class
+     * one, so the two directions are not symmetric:
+     *
+     *   gpu -> cpu   fine. The card sieves a small band inefficiently —
+     *                it just pays lease/startup overhead more often.
+     *   cpu -> gpu   never. A single core needs ~43 h for a 100x band; the
+     *                lease expires, attempt_count climbs, and the workunit
+     *                is eventually poisoned having never been sieved.
+     *
+     * Any other class is tried alone: a future class must opt into a
+     * fallback explicitly rather than silently inheriting cpu's work. */
+    static const char *const chain_gpu[] = { "gpu", "cpu", NULL };
+    const char *chain_self[2];
+    const char *const *chain;
 
-    int result = -1;
-    rc = sqlite3_step(st);
-    if (rc == SQLITE_ROW) {
-        const unsigned char *id   = sqlite3_column_text (st, 0);
-        int64_t              qs   = sqlite3_column_int64(st, 1);
-        int64_t              qr   = sqlite3_column_int64(st, 2);
-        const unsigned char *side = sqlite3_column_text (st, 3);
-        snprintf(out->id, sizeof(out->id), "%s", id ? (const char *)id : "");
-        out->q_start = qs;
-        out->q_range = qr;
-        out->side    = side ? (char)side[0] : '?';
-        result = 0;
-    } else if (rc == SQLITE_DONE) {
-        result = 1; /* nothing available */
+    if (!class_want || !*class_want) class_want = "cpu";
+    if (strcmp(class_want, "gpu") == 0) {
+        chain = chain_gpu;
     } else {
-        fprintf(stderr, "db_lease: step: %s\n", sqlite3_errmsg(db->conn));
+        chain_self[0] = class_want;
+        chain_self[1] = NULL;
+        chain = chain_self;
     }
-    sqlite3_finalize(st);
-    return result;
+
+    for (int i = 0; chain[i]; i++) {
+        int r = lease_try_class(db, client_id, lease_seconds, now_unix,
+                                lease_desc, chain[i], out);
+        if (r != 1) return r;   /* claimed (0) or hard error (-1) */
+    }
+    return 1;   /* nothing available in any class this client accepts */
 }
 
 int db_submit(ggnfs_db_t *db,
@@ -510,6 +702,38 @@ done:
     return result;
 }
 
+int db_renew_lease(ggnfs_db_t *db, const char *workunit_id,
+                   const char *client_id, int64_t lease_seconds,
+                   int64_t now_unix)
+{
+    sqlite3_stmt *st = NULL;
+    /* `lease_expires >= now` is deliberate: once a lease has actually lapsed
+     * the sweep may already have requeued and reissued the workunit to
+     * somebody else, so a late heartbeat must not resurrect this client's
+     * claim on it. The client sees 409 and gives up the workunit. */
+    if (sqlite3_prepare_v2(db->conn,
+            "UPDATE workunits "
+            "  SET lease_expires = ?3 "
+            "  WHERE id = ?1 AND state = 'leased' AND leased_to = ?2 "
+            "    AND lease_expires >= ?4;",
+            -1, &st, NULL) != SQLITE_OK) {
+        fprintf(stderr, "db_renew_lease: %s\n", sqlite3_errmsg(db->conn));
+        return -1;
+    }
+    sqlite3_bind_text (st, 1, workunit_id, -1, SQLITE_STATIC);
+    sqlite3_bind_text (st, 2, client_id,   -1, SQLITE_STATIC);
+    sqlite3_bind_int64(st, 3, now_unix + lease_seconds);
+    sqlite3_bind_int64(st, 4, now_unix);
+    int rc = sqlite3_step(st);
+    int changed = sqlite3_changes(db->conn);
+    sqlite3_finalize(st);
+    if (rc != SQLITE_DONE) {
+        fprintf(stderr, "db_renew_lease: step: %s\n", sqlite3_errmsg(db->conn));
+        return -1;
+    }
+    return changed > 0 ? 0 : 1;
+}
+
 int db_release_lease(ggnfs_db_t *db, const char *workunit_id,
                      const char *client_id)
 {
@@ -537,16 +761,26 @@ int db_release_lease(ggnfs_db_t *db, const char *workunit_id,
     return changed > 0 ? 0 : 1;
 }
 
-int db_clients_seen(ggnfs_db_t *db, const char *client_id, int64_t now_unix)
+int db_clients_seen(ggnfs_db_t *db, const char *client_id, int64_t now_unix,
+                    const char *class)
 {
     sqlite3_stmt *st = NULL;
+    /* One statement, not two: an idle worker polling /lease on --idle-backoff
+     * is the highest-frequency request in the system and this runs on the same
+     * event-loop thread as /submit and /stats, so a second write transaction
+     * per poll is pure overhead. `class` may be NULL (every caller that is not
+     * /lease), in which case the stored value is left alone. */
     if (sqlite3_prepare_v2(db->conn,
-            "INSERT INTO clients(id, first_seen, last_seen) VALUES (?1, ?2, ?2) "
-            "ON CONFLICT(id) DO UPDATE SET last_seen = ?2;",
+            "INSERT INTO clients(id, first_seen, last_seen, last_class) "
+            "VALUES (?1, ?2, ?2, ?3) "
+            "ON CONFLICT(id) DO UPDATE SET last_seen = ?2, "
+            "  last_class = COALESCE(?3, last_class);",
             -1, &st, NULL) != SQLITE_OK)
         return -1;
     sqlite3_bind_text (st, 1, client_id, -1, SQLITE_STATIC);
     sqlite3_bind_int64(st, 2, now_unix);
+    if (class) sqlite3_bind_text(st, 3, class, -1, SQLITE_STATIC);
+    else       sqlite3_bind_null(st, 3);
     int rc = sqlite3_step(st);
     sqlite3_finalize(st);
     return (rc == SQLITE_DONE) ? 0 : -1;
@@ -784,6 +1018,92 @@ int db_stats_snapshot(ggnfs_db_t *db, int64_t now_unix, db_stats_t *out)
         }
     }
 
+    /* Q-width progress, per class and in total. One GROUP BY class,state scan
+     * feeds both: workunit counts answer "how many units", q_range sums answer
+     * "how much of the campaign", and only the latter is comparable across a
+     * cpu band and a gpu band 100x wider. */
+    {
+        sqlite3_stmt *st = NULL;
+        if (sqlite3_prepare_v2(db->conn,
+                "SELECT class, state, COUNT(*), COALESCE(SUM(q_range), 0) "
+                "FROM workunits GROUP BY class, state;",
+                -1, &st, NULL) == SQLITE_OK) {
+            while (sqlite3_step(st) == SQLITE_ROW) {
+                const unsigned char *cls = sqlite3_column_text(st, 0);
+                const unsigned char *stt = sqlite3_column_text(st, 1);
+                int64_t n  = sqlite3_column_int64(st, 2);
+                int64_t qw = sqlite3_column_int64(st, 3);
+                const char *cname = cls ? (const char *)cls : "cpu";
+                const char *sname = stt ? (const char *)stt : "";
+
+                out->q.total += qw;
+                if      (strcmp(sname, "available") == 0) out->q.available += qw;
+                else if (strcmp(sname, "leased")    == 0) out->q.leased    += qw;
+                else if (strcmp(sname, "submitted") == 0) out->q.submitted += qw;
+                else if (strcmp(sname, "verified")  == 0) out->q.verified  += qw;
+                else if (strcmp(sname, "failed")    == 0) out->q.failed    += qw;
+                else if (strcmp(sname, "poisoned")  == 0) out->q.poisoned  += qw;
+
+                /* Find or append this class's row. A jobdir should only ever
+                 * hold the classes init/extend accept, so overflowing
+                 * DB_STATS_MAX_CLASSES means someone hand-edited the DB;
+                 * fold the stragglers into the totals and skip the row
+                 * rather than scribbling past the array. */
+                db_stats_class_t *cc = NULL;
+                for (int i = 0; i < out->class_count; i++) {
+                    if (strcmp(out->classes[i].name, cname) == 0) {
+                        cc = &out->classes[i];
+                        break;
+                    }
+                }
+                if (!cc) {
+                    if (out->class_count >= DB_STATS_MAX_CLASSES) continue;
+                    cc = &out->classes[out->class_count++];
+                    memset(cc, 0, sizeof(*cc));
+                    snprintf(cc->name, sizeof(cc->name), "%s", cname);
+                }
+                cc->total   += n;
+                cc->q_total += qw;
+                if      (strcmp(sname, "available") == 0) cc->available += n;
+                else if (strcmp(sname, "leased")    == 0) cc->leased    += n;
+                else if (strcmp(sname, "submitted") == 0) {
+                    cc->submitted   += n;
+                    cc->q_submitted += qw;
+                }
+                else if (strcmp(sname, "verified")  == 0) {
+                    cc->verified   += n;
+                    cc->q_verified += qw;
+                }
+            }
+            sqlite3_finalize(st);
+        }
+    }
+
+    /* Q-width whose sieving finished in the last hour and has since passed
+     * verification — the numerator for a size-weighted ETA.
+     *
+     * Keyed on received_at (when the relations arrived) rather than on when
+     * the verifier got to them, because the quantity an ETA wants is sieving
+     * throughput, and submission is when the sieving actually finished. There
+     * is no verified-at column to key on in any case: `completed_at` is set on
+     * the submitted transition, not the verified one. The trade-off is at the
+     * window edge — a band submitted 70 minutes ago but verified 2 minutes ago
+     * counts zero here while still counting in q_verified — so during a
+     * verification backlog this reads low. */
+    {
+        sqlite3_stmt *st = NULL;
+        if (sqlite3_prepare_v2(db->conn,
+                "SELECT COALESCE(SUM(w.q_range), 0) "
+                "FROM submissions s JOIN workunits w ON w.id = s.workunit_id "
+                "WHERE s.verify_status = 'passed' AND s.received_at >= ?1;",
+                -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_int64(st, 1, now_unix - 3600);
+            if (sqlite3_step(st) == SQLITE_ROW)
+                out->q_passed_1h = sqlite3_column_int64(st, 0);
+            sqlite3_finalize(st);
+        }
+    }
+
     /* Submission rollups. CASE inside COUNT() gives us per-window throughput
      * in a single scan. */
     {
@@ -850,7 +1170,8 @@ int db_stats_snapshot(ggnfs_db_t *db, int64_t now_unix, db_stats_t *out)
             "  COALESCE(SUM(s.num_relations), 0), "
             "  COALESCE(AVG(s.sieve_seconds), 0.0), "
             "  COALESCE((SELECT id FROM workunits "
-            "            WHERE state='leased' AND leased_to=c.id LIMIT 1), '') "
+            "            WHERE state='leased' AND leased_to=c.id LIMIT 1), ''), "
+            "  COALESCE(c.last_class, '') "
             "FROM clients c "
             "LEFT JOIN submissions s ON s.client_id = c.id "
             "WHERE c.total_relations > 0 "
@@ -876,6 +1197,9 @@ int db_stats_snapshot(ggnfs_db_t *db, int64_t now_unix, db_stats_t *out)
                     if (cur)
                         snprintf(cc->current_workunit,
                                  sizeof(cc->current_workunit), "%s", cur);
+                    const unsigned char *lc = sqlite3_column_text(st, 8);
+                    if (lc)
+                        snprintf(cc->last_class, sizeof(cc->last_class), "%s", lc);
                 }
                 out->clients      = arr;
                 out->client_count = n;

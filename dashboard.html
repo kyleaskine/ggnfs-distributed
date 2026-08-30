@@ -53,7 +53,7 @@
     <div class="stat"><div class="num" id="wu-active">&mdash;</div><div class="lbl">in flight</div></div>
     <div class="stat"><div class="num" id="rels-total">&mdash;</div><div class="lbl">relations submitted</div></div>
     <div class="stat"><div class="num" id="rate-1h">&mdash;</div><div class="lbl">workunits / hr (last 1h)</div></div>
-    <div class="stat"><div class="num" id="eta">&mdash;</div><div class="lbl">ETA (last 1h rate)</div></div>
+    <div class="stat"><div class="num" id="eta">&mdash;</div><div class="lbl">ETA (q-width, last 1h)</div></div>
     <div class="stat"><div class="num" id="uptime">&mdash;</div><div class="lbl">server uptime</div></div>
   </div>
 
@@ -65,6 +65,7 @@
     <thead><tr>
       <th>id</th>
       <th class="num">workers</th>
+      <th>class</th>
       <th>last seen</th>
       <th class="num">workunits</th>
       <th class="num">relations</th>
@@ -158,7 +159,10 @@
   });
 
   function clientGroupId(id) {
-    return String(id || '').replace(/-w[0-9]+$/, '');
+    // Worker ids are "<box>-w<N>"; a pipelined worker's lease slots add
+    // "-s<K>" on top of that ("<box>-w0-s1"). Strip both so one machine is one
+    // row, however many slots it is prefetching with.
+    return String(id || '').replace(/-w[0-9]+(-s[0-9]+)?$/, '');
   }
 
   function weightedAvg(totalSeconds, count) {
@@ -190,6 +194,7 @@
           total_failures: 0,
           avg_total_seconds: 0,
           current_count: 0,
+          klass: '',
           workers: []
         };
         groupsById[id] = g;
@@ -204,6 +209,10 @@
       g.total_failures += c.total_failures || 0;
       g.avg_total_seconds += (c.avg_sieve_seconds || 0) * submissions;
       if (c.current_workunit) g.current_count++;
+      // A box whose workers disagree about class is worth seeing: it usually
+      // means one of them was started with the wrong --lease-class.
+      var wc = c["class"] || '';
+      if (wc) g.klass = (!g.klass || g.klass === wc) ? wc : 'mixed';
     }
     for (var j = 0; j < groups.length; j++) {
       groups[j].avg_sieve_seconds = weightedAvg(groups[j].avg_total_seconds, groups[j].submissions);
@@ -231,16 +240,27 @@
       ' / sweep ' + s.sweep_seconds + 's';
 
     var w    = s.workunits;
-    var done = (w.submitted || 0) + (w.verified || 0);
-    var pct  = w.total ? (100 * done / w.total) : 0;
+    // Progress is measured in q-width, not workunit count. A gpu-class band is
+    // ~100x a cpu-class one, so "10 of 20 done" can mean anything between 1%
+    // and 99% of the actual sieving. This page is embedded into the server
+    // binary at build time, so /stats always carries `q`; the ||{} is just so
+    // a stale tab left open across a downgrade renders zeros instead of
+    // throwing.
+    var q     = w.q || {};
+    var done  = (q.submitted || 0) + (q.verified || 0);
+    var total = q.total || 0;
+    var pct   = total ? (100 * done / total) : 0;
     document.getElementById('wu-pct').textContent     = pct.toFixed(1) + '%';
     document.getElementById('wu-active').textContent  = fmt(w.leased);
     document.getElementById('rels-total').textContent = fmt(s.submissions.total_relations);
     document.getElementById('rate-1h').textContent    = fmt(s.submissions.last_1h);
     document.getElementById('uptime').textContent     = fmtSec(s.uptime_seconds);
 
-    var remaining = (w.leased || 0) + (w.available || 0);
-    var hourlyRate = s.submissions.last_1h || 0;
+    // ETA in the same units as progress: q-width remaining over q-width
+    // completed per hour. Counting submissions per hour would mix a 6-minute
+    // GPU band with a 26-minute CPU one and read badly wrong on a mixed fleet.
+    var remaining  = (q.leased || 0) + (q.available || 0);
+    var hourlyRate = w.q_passed_1h || 0;
     var eta = document.getElementById('eta');
     eta.removeAttribute('title');
     if (remaining === 0) {
@@ -256,37 +276,57 @@
 
     var bar  = document.getElementById('bar');
     bar.innerHTML = '';
+    // Segment widths are q-width too, so the bar shows how much of the
+    // campaign each state covers rather than how many rows are in it.
     var segs = [
-      ['verified',  w.verified  || 0, 'b-verified'],
-      ['submitted', w.submitted || 0, 'b-submitted'],
-      ['leased',    w.leased    || 0, 'b-leased'],
-      ['failed',    w.failed    || 0, 'b-failed'],
-      ['poisoned',  w.poisoned  || 0, 'b-poisoned']
+      ['verified',  q.verified  || 0, 'b-verified'],
+      ['submitted', q.submitted || 0, 'b-submitted'],
+      ['leased',    q.leased    || 0, 'b-leased'],
+      ['failed',    q.failed    || 0, 'b-failed'],
+      ['poisoned',  q.poisoned  || 0, 'b-poisoned']
     ];
-    if (w.total > 0) {
+    if (total > 0) {
       for (var i = 0; i < segs.length; i++) {
         var name = segs[i][0], n = segs[i][1], cls = segs[i][2];
         if (!n) continue;
         var d = document.createElement('div');
         d.className = cls;
         d.style.flex = String(n);
-        d.title = name + ': ' + n;
+        d.title = name + ': ' + fmt(n) + ' q';
         bar.appendChild(d);
       }
-      var avail = w.available || 0;
+      var avail = q.available || 0;
       if (avail > 0) {
         var d2 = document.createElement('div');
         d2.style.flex = String(avail);
         d2.style.background = '#eee';
-        d2.title = 'available: ' + avail;
+        d2.title = 'available: ' + fmt(avail) + ' q';
         bar.appendChild(d2);
       }
     }
+    var classLine = '';
+    if (s.classes && s.classes.length > 1) {
+      var parts = [];
+      for (var ci = 0; ci < s.classes.length; ci++) {
+        var c = s.classes[ci];
+        // Same definition of "done" as the headline above — submitted counts,
+        // because the sieving for it is finished and only verification is
+        // outstanding. Reporting verified-only here made the class breakdown
+        // contradict the headline during any verifier backlog.
+        var cd  = (c.submitted || 0) + (c.verified || 0);
+        var cqd = (c.q_submitted || 0) + (c.q_verified || 0);
+        parts.push(escapeHtml(c.name) + ' ' + cd + '/' + c.total +
+                   ' (q ' + fmt(cqd) + '/' + fmt(c.q_total) + ')');
+      }
+      classLine = ' &middot; ' + parts.join(' &middot; ');
+    }
     document.getElementById('bar-legend').innerHTML =
-      done + ' / ' + w.total + ' workunits done &middot; ' +
-      (w.leased   || 0) + ' in flight &middot; ' +
-      (w.available|| 0) + ' pending &middot; ' +
-      'q range ' + fmt(w.q_min) + '&ndash;' + fmt(w.q_max) +
+      fmt(done) + ' / ' + fmt(total) + ' q-width done' +
+      ' &middot; ' + (w.verified || 0) + '/' + (w.total || 0) + ' workunits' +
+      ' &middot; ' + (w.leased || 0) + ' in flight' +
+      ' &middot; ' + (w.available || 0) + ' pending' +
+      ' &middot; q range ' + fmt(w.q_min) + '&ndash;' + fmt(w.q_max) +
+      classLine +
       '<br>' +
       '<span><span class="swatch b-verified"></span>verified</span>' +
       '<span><span class="swatch b-submitted"></span>submitted</span>' +
@@ -299,7 +339,7 @@
     var clients = s.clients || [];
     if (clients.length === 0) {
       var tr = document.createElement('tr');
-      tr.innerHTML = '<td colspan="9" class="warn">no clients have connected yet</td>';
+      tr.innerHTML = '<td colspan="10" class="warn">no clients have connected yet</td>';
       tbody.appendChild(tr);
     } else {
       var groups = groupClients(clients);
@@ -314,6 +354,7 @@
           '<span class="twisty">' + (isOpen ? '-' : '+') + '</span>' +
           escapeHtml(c.id) + '</button></td>' +
           '<td class="num">' + fmt(c.workers.length) + '</td>' +
+          '<td>' + escapeHtml(c.klass || '') + '</td>' +
           '<td>' + ageText(c.last_seen) + '</td>' +
           '<td class="num">' + fmt(c.submissions) + '</td>' +
           '<td class="num">' + fmt(c.relations) + '</td>' +
@@ -330,6 +371,7 @@
             wr.innerHTML =
               '<td>' + escapeHtml(wkr.id) + '</td>' +
               '<td class="num">1</td>' +
+              '<td>' + escapeHtml(wkr["class"] || '') + '</td>' +
               '<td>' + ageText(wkr.last_seen) + '</td>' +
               '<td class="num">' + fmt(wkr.submissions) + '</td>' +
               '<td class="num">' + fmt(wkr.relations) + '</td>' +

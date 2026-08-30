@@ -25,7 +25,22 @@ typedef struct ggnfs_db_s ggnfs_db_t;
  * small primes from sieving. In practice we see <10 per side; 32 is plenty
  * with room for pathological factor-base settings. If a line exceeds this
  * we return -1 (parse error) so the caller can flag the submission. */
-#define VERIFY_MAX_PRIMES_PER_SIDE 32
+/* Primes recorded per side, multiplicity included — a relation lists a prime
+ * once per division, so this is a bound on the factorisation length, not on
+ * distinct primes.
+ *
+ * 32 was too small. gnfs-lasieve4 never comes close (the C208 production
+ * corpus peaks at 13 on the algebraic side), but cuda-sieve regularly emits
+ * more: a 224-bit algebraic norm carrying a high power of a small prime
+ * records an entry per division, and real output reaches 35 — a line with
+ * thirteen factors of 2 is enough. 64 matches cuda-sieve's own TD_FMAX, which
+ * is a hard cap on its side: it fails the run rather than emit a truncated
+ * factorisation, so nothing it produces can exceed this.
+ *
+ * Overflow is reported as a parse error, never a silent truncation — a
+ * truncated factorisation would sail through the norm check as a residue that
+ * simply fails to reduce, which is much harder to diagnose. */
+#define VERIFY_MAX_PRIMES_PER_SIDE 64
 
 typedef struct {
     int64_t  a;                 /* decimal signed in the file */

@@ -13,12 +13,6 @@ without re-litigating.
   handler that flips a flag, exit the poll loop, stop the verifier,
   free mongoose.
 
-- **Legacy submission migration.** Submissions written before the
-  verifier landed have `verify_status='skipped'` and their workunits
-  are stuck in `'submitted'` because nothing transitions them. A one-
-  line `UPDATE` flips them to `'verified'` for any affected jobdir;
-  not worth code unless we discover a jobdir we care about.
-
 ## Operator convenience
 
 - **`--local-clients=N` on serve.** Auto-spawn N local
@@ -26,35 +20,22 @@ without re-litigating.
   becomes one command instead of two terminals. Was Phase 5 of the
   original design.
 
-- **Worker heartbeats / progress.** Lease timeout alone handles failure
-  today, but a slow client whose siever is still grinding gets its
-  workunit requeued at `lease_seconds`, double-issuing the work. A
-  periodic heartbeat that bumps `lease_expires` would let us tighten
-  the lease window without false requeues. The original design listed
-  this as a non-goal, but if jobs get long it starts mattering.
+- **Worker heartbeats / progress.** *Now scheduled as `POST /renew`, phase
+  2.1 of `GPU-CLIENT.md`* — GPU-sized workunits make a fixed lease window
+  untenable, so this stops being optional. Original context: lease timeout
+  alone handles failure today, but a slow client whose siever is still
+  grinding gets its workunit requeued at `lease_seconds`, double-issuing the
+  work. The original design listed this as a non-goal; long jobs changed
+  that.
 
 ## Performance / efficiency
-
-- **`.afb` pre-generation.** Run `gnfs-lasieve4* -k` once (that's the
-  write flag; `-F` forces a *recompute*) to generate the algebraic
-  factor base, ship the resulting `.afb.0` alongside the `.job`; the
-  siever auto-reads it whenever it exists. Measured on the C208: startup
-  24s -> 2s with byte-identical relations, i.e. 30-45s saved on every
-  workunit. Two requirements: (1) generate with `-f` *above* alim,
-  because the siever lowers the FB bound to first_spq-1 when q < alim
-  and would write a partial cache; (2) the siever needs the trim-on-read
-  patch in yafu's `factor/lasieve5_64/gnfs-lasieve4e.c` (June 2026),
-  since the stock read path uses the cached FB unmodified — unsafe for
-  q < alim workunits. Don't pass `-k` to fleet clients (concurrent
-  first-workunit writers race on the same file); generate server-side
-  or once per client at install. Regenerate if the poly or alim ever
-  changes — the file carries no consistency check.
 
 - **Client capability advertising.** Clients send the list of
   `gnfs-lasieve4I*` binaries they have installed; server matches each
   workunit to a client that can run it. Lets heterogeneous fleets
   self-target. Not needed if every client has the same siever, which
-  is the usual case.
+  is the usual case. `GPU-CLIENT.md` phase 1.3 adds a narrow special
+  case (cpu/gpu workunit classes); the general form is still open.
 
 ## Big swings (probably never)
 

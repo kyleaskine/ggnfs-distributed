@@ -7,7 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 A distributed coordinator for GGNFS lattice sieving (the special-q sieving phase of the General Number Field Sieve). Two binaries built from one Makefile:
 
 - `ggnfs-sieve-server` — HTTP coordinator: chops a Q-range into workunits, hands them out under lease, receives relation files back, persists state in SQLite, serves a dashboard.
-- `ggnfs-sieve-client` — polls the server, leases a workunit, fetches the `.job`, runs `gnfs-lasieve4*` in an isolated child process group, posts the relations back.
+- `ggnfs-sieve-client` — polls the server, leases a workunit, fetches the `.job`, runs a siever in an isolated child process group, posts the relations back. Two engines: `--engine=lasieve4` (default, `gnfs-lasieve4*` on a CPU core) and `--engine=cuda` (`../cuda-sieve`'s `bench` on an NVIDIA GPU). See `GPU-CLIENT.md`.
 
 Output is consumed by `finalize-nfs.sh`, which assembles `nfs.dat` and feeds YAFU's filter / LA / sqrt pipeline.
 
@@ -114,12 +114,77 @@ All JSON encode/decode lives here so `server.c` and `client.c` don't both link c
 ### Siever flags
 `--siever-args="..."` on `init` is stored in `meta.siever_args`, sent to every client in the `/lease` response, and appended verbatim to the siever command in `sieve_run_local`. Used for tunables every worker should share — e.g. `-J 16` for a larger I-sieve area. To change it on an existing jobdir without reinitializing, edit meta directly: `sqlite3 jobdir/job.db "UPDATE meta SET value='-J 16' WHERE key='siever_args'"` and restart `serve`.
 
+## GPU clients (cuda-sieve)
+
+Full design and rationale in `GPU-CLIENT.md`. The parts that span files:
+
+**Class is a property of the workunit; engine is a property of the client.**
+`class` (`cpu`/`gpu`) controls only *sizing*, and therefore lease safety.
+`--engine` decides which binary a client runs. They are independent, which is
+what lets a GPU client fall back to cpu-class bands when the GPU band runs dry
+without either side knowing about the other. `db_lease` encodes the asymmetry:
+**`gpu` falls back to `cpu`, `cpu` never takes `gpu`** — a single core needs
+~43 h for a 100x band, so it would time out and poison the workunit.
+
+**Sizing.** A GPU is order 400x a single core on this job, so a normal
+1000-wide workunit is only a few seconds of GPU time and per-workunit overhead
+dominates. Carve GPU bands ~100x wider:
+
+```
+./ggnfs-sieve-server extend --jobdir=... --class=gpu \
+    --qmin=... --qmax=... --qrange=100000 \
+    --gpu-args="--logI 17 --J 16384"
+```
+
+**`gpu_args` is not a translation of `siever_args`.** `-J 16` is lasieve4
+vocabulary; `--logI 17 --J 16384` is cuda-sieve's, and per cuda-sieve finding
+69 they describe *different sieve areas* (`2^17 x 2^15` vs `2^17 x 2^14`). The
+lease response ships both and the client picks by its own `--engine`. `serve`
+reads `gpu_args` from `meta` **once at startup**, so changing it needs a
+`serve` restart — `extend` says so when you set it.
+
+**Lease heartbeat.** `POST /renew` pushes `lease_expires` out; the client
+heartbeats at a third of the lease window, through the sieve *and* the upload,
+and a pipelined worker heartbeats every held lease, not just the one on the
+card. This is what makes one `--lease-seconds` safe across wildly different
+band sizes. A 409 means the workunit was reclaimed and reissued, so the client
+abandons the band immediately rather than sieving for hours into a certain
+rejection.
+
+**Keeping the card busy.** `--prefetch=N` (default 2 under `--engine=cuda`)
+gives a worker N lease slots and runs lease / sieve / submit on separate
+threads. Each slot needs its own `client_id` (`<base>-w0-s0`) because the
+server keeps at most one live lease per `client_id`. Measured against a 1.5 s
+latency proxy with 3 s bands: 44.9% card-busy serial, 78.8% at 2, 96.8% at 3.
+
+**Factor base.** `--fbgen-gpu=<path to cuda-sieve fbgen_gpu>` builds the
+`--fb1` cache once per `(job sha, logI)` instead of letting `bench` rebuild it
+every workunit (~230 MB on the C208). Keying the filename on `(sha, logI)` is
+why no content probe is needed. `--fb1=<path>` uses a prepared one directly.
+
+**Progress is q-width, not workunit count.** With a GPU band ~100x a CPU one,
+"400 of 404 rows done" can mean 50% of the actual sieving. `/stats` exposes
+`workunits.q.*` per state plus per-class rollups, and the dashboard reads
+those.
+
+**Screening a GPU box.** `ggnfs-sieve-client benchmark --engine=cuda
+--cuda-bench=... --fb1=...` times one fixed-width band on the card. Like the
+CPU benchmark it takes no lease and never submits, so it is safe against a
+live coordinator. `cuda-client.sh` bootstraps a GPU worker and writes both
+`run-cuda-client.sh` and `benchmark-gpu.sh` (all three generated/deployment
+scripts are gitignored; `cuda-client.sh` itself is tracked because it prompts
+for server and token rather than baking them in, unlike `ggnfs-client.sh`,
+which is untracked for exactly that reason).
+
 ## Things that have bitten people (load-bearing detail)
 
 - `mfbr`/`mfba` and `lpbr`/`lpba` in `input.job` must match what you use for filtering later — `finalize-nfs.sh` aborts if `<yafu-dir>/nfs.job` SHA differs from the `.job` the server distributed, because mismatched factor base settings silently corrupt filtering.
 - Clients submit relation files compressed with zstd level 1 (`X-Compression: zstd`). The server stores those as `<workunit>.dat.zst`; the verifier streams decompression while parsing. Raw uncompressed submissions are still accepted for compatibility.
 - `/submit` counts `\n` bytes in the submitted relation stream as a fast initial estimate (the JSON response carries that count). For zstd uploads the server counts while streaming decompression. The verifier replaces it with the actual parsed line count when the submission passes, so stats / dashboard reflect real counts only after verification.
 - `OUTPUT_MAX_BYTES = 500 MiB`. The server's `MG_MAX_RECV_SIZE` is set to allow that for compressed request bodies; the zstd submit path also rejects decoded relation streams above `OUTPUT_MAX_BYTES`. These limits need to stay in sync if either is bumped.
-- `sqlite3_busy_timeout=5s` in `db_open` is what lets the verifier and event-loop threads share a DB file without explicit locking. Dropping it would surface `SQLITE_BUSY` on the main thread under submit load.
+- `sqlite3_busy_timeout=5s` in `db_open` is what lets the verifier and event-loop threads share a DB file without explicit locking. Dropping it would surface `SQLITE_BUSY` on the main thread under submit load. It is set **before** the schema DDL on purpose: `db_migrate`'s `ALTER TABLE` and the index build in `SCHEMA_SQL_POST` are the most contended statements the process runs (a 430K-row index build against a live `serve`), and without the timeout already in effect they fail `db_open` outright.
 - The server has no graceful shutdown today (`for (;;) mg_mgr_poll(...)`); the cleanup code below the loop — including `verify_thread_stop` — is unreachable. SIGINT just kills it. The DB is in WAL mode so this is fine. (Tracked in `FUTURE.md`.)
+- **cuda-sieve's `--qrange MIN:MAX` is INCLUSIVE of MAX**, while a workunit is the half-open `[q_start, q_start+q_range)` and `verify.c` enforces that. `sieve_run_cuda` therefore passes `q_start + q_range - 1`. Get it wrong and every band whose top edge happens to be prime fails verification, requeues, and eventually poisons — while looking like a cuda-sieve bug. Pinned by `sqgen_create` in `cuda-sieve/bench/fbgen.c` and its `inclusive_single_prime` test.
+- `VERIFY_MAX_PRIMES_PER_SIDE` counts primes **with multiplicity** — a relation lists a prime once per division, so it bounds factorisation *length*, not distinct primes. It is 64, matching cuda-sieve's `TD_FMAX`. It was 32, and real cuda-sieve output reaches 35 (a 224-bit algebraic norm carrying thirteen factors of 2); gnfs-lasieve4 peaks at 13 on this job, which is why 32 survived so long. One over-length line fails the whole submission, so this presents as every GPU workunit failing.
+- The verifier's spot-check sample size scales with `q_range` against the job's **most common** band width, read live from the workunits table (`db_workunit_base_q_range`). It is derived rather than configured because the normal GPU rollout is `extend --class=gpu` onto a campaign whose `meta` predates all of this.
 - The siever's `-c` (in `sieve_run_local`, and `benchmark --qrange`) is a special-q interval **width**, not a count of special-q — the same unit as a workunit's `q_range`. The window `[f, f+c)` holds ~`c/ln(q)` prime special-q. A `-c` narrower than ~`ln(q)` contains no prime, so the siever does zero work and yields **0 relations in ~2s** (all `sieve:` counters 0) — a failure that mimics a broken job/siever/cache. This is why `benchmark --qrange` defaults to 65 (~3 special-q at q≈80M, ~1 min single-core), not a small number.
