@@ -124,17 +124,62 @@ Full design and rationale in `GPU-CLIENT.md`. The parts that span files:
 what lets a GPU client fall back to cpu-class bands when the GPU band runs dry
 without either side knowing about the other. `db_lease` encodes the asymmetry:
 **`gpu` falls back to `cpu`, `cpu` never takes `gpu`** — a single core needs
-~43 h for a 100x band, so it would time out and poison the workunit.
+tens of hours for a 10x-100x band, so it would time out and poison the
+workunit. The corollary bites in the endgame: gpu-class bands left over after
+the card leaves are unreachable by the entire CPU fleet. `recarve --class=cpu`
+is how you hand them back (below).
 
-**Sizing.** A GPU is order 400x a single core on this job, so a normal
-1000-wide workunit is only a few seconds of GPU time and per-workunit overhead
-dominates. Carve GPU bands ~100x wider:
+**Sizing: measure one band, don't multiply core counts.** `bench` costs a
+**fixed ~5.3 s per invocation** (CUDA init, `--fb1` load, teardown) on top of
+the sieve. What matters is that fixed cost against a band's sieve time, and
+that ratio is job-specific: a 1000-wide band is ~3.7 s of GPU time on AS276
+but 19.4 s on the C208 — 21.5% overhead there, not the 4% an earlier reading
+claimed (that reading compared against the client's `sieve_seconds`, which has
+startup *inside* it; see GPU-CLIENT.md).
+
+Efficiency by band width on the C208 / RTX 5070: 78.5% at 1000, 97.3% at
+10000, 98.7% at 20000, 99.7% at 100000. **Use 10000-20000.** Past that you buy
+a fraction of a point for 30-minute bands, and with no partial-submit concept
+a reclaimed band throws the whole thing away.
 
 ```
 ./ggnfs-sieve-server extend --jobdir=... --class=gpu \
-    --qmin=... --qmax=... --qrange=100000 \
-    --gpu-args="--logI 17 --J 16384"
+    --qmin=... --qmax=... --qrange=10000 \
+    --gpu-args="--logI 17 --J 32768"
 ```
+
+**`recarve` when there is no gap left to extend into.** `extend` refuses
+overlap, so on a campaign already tiled end to end in CPU-sized rows there is
+nowhere to put a GPU band. `recarve` re-tiles work that is *already queued*:
+
+```
+# widen 200 bands' worth of available cpu rows into gpu bands
+./ggnfs-sieve-server recarve --jobdir=... --class=gpu --qrange=10000 --max-bands=200
+
+# and the inverse, when the card goes away — unbounded is safe here
+./ggnfs-sieve-server recarve --jobdir=... --class=cpu --qrange=1000
+```
+
+It coalesces when `--qrange` is wider than what it finds and splits when it is
+narrower, so it is its own inverse. Only `available` rows with
+`attempt_count = 0` are touched — state, so a leased or submitted band cannot
+vanish under a client and a poisoned one stays poisoned; attempt_count, so
+merging never resets the failure history `--max-attempts` depends on.
+Ineligible rows are simply absent from the scan, which breaks the contiguous
+run around them and leaves their width alone. New bands never straddle a
+boundary of the rows they replace, so **q coverage stays exact even when
+`--max-bands` cuts the plan short**. The whole thing is one `BEGIN IMMEDIATE`
+on the caller's own connection, so it is safe against a live `serve` — the
+event thread's lease blocks on the write lock rather than racing it.
+
+An unbounded `--class=gpu` recarve is refused: it would re-tile every
+remaining workunit into bands no CPU client can lease. Scope it with
+`--max-bands`, `--qmin`, or `--qmax`. `--dry-run` is exempt and reports the
+full scale. Carving *down* to cpu has no such hazard and stays unbounded.
+
+Workunit IDs come from `db_workunit_next_seq` (highest suffix in use), not
+`COUNT(*)`: recarve deletes rows, so counting would recycle IDs that are still
+live. A split recarve reproduces that collision exactly — verified.
 
 **Geometry is derived from the job's own siever, so you usually set nothing.**
 `-J n` is lasieve4 vocabulary and `--logI/--J` is cuda-sieve's; they are not
@@ -188,7 +233,7 @@ sanitized copy and leaves the distributed file byte-exact.
 every workunit (~230 MB on the C208). Keying the filename on `(sha, logI)` is
 why no content probe is needed. `--fb1=<path>` uses a prepared one directly.
 
-**Progress is q-width, not workunit count.** With a GPU band ~100x a CPU one,
+**Progress is q-width, not workunit count.** With a GPU band 10x-100x a CPU one,
 "400 of 404 rows done" can mean 50% of the actual sieving. `/stats` exposes
 `workunits.q.*` per state plus per-class rollups, and the dashboard reads
 those.

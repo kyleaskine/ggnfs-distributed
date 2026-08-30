@@ -580,9 +580,13 @@ static int cmd_extend(int argc, char **argv)
     free(m_jobid);
 
     /* Find next sequence number. Sequence IDs are just unique handles; they
-     * don't need to track q-order, so extending below or into a gap is fine. */
-    int64_t existing_count = 0;
-    if (db_workunit_extent(db, &existing_count, NULL) != 0) {
+     * don't need to track q-order, so extending below or into a gap is fine.
+     * It comes from the highest suffix in use rather than from the row count:
+     * recarve deletes rows, and after one the count sits below suffixes that
+     * are still live, so counting would recycle an existing ID. */
+    int64_t existing_count = 0, next_seq = 0;
+    if (db_workunit_extent(db, &existing_count, NULL) != 0 ||
+        db_workunit_next_seq(db, job_id, &next_seq) != 0) {
         fprintf(stderr, "extend: cannot read existing workunits\n");
         db_close(db); free(db_path); return 1;
     }
@@ -609,7 +613,7 @@ static int cmd_extend(int argc, char **argv)
 
     /* Insert new workunits, continuing the sequence. */
     int64_t now = now_unix();
-    int64_t seq = existing_count;
+    int64_t seq = next_seq;
     int64_t added = 0;
     int64_t q;
     for (q = qmin; q < qmax; q += qrange) {
@@ -648,6 +652,145 @@ static int cmd_extend(int argc, char **argv)
     printf("  q range added : [%lld, %lld)\n",
            (long long)qmin, (long long)(qmin + added * qrange));
     printf("  total workunits now: %lld\n", (long long)(existing_count + added));
+    free(db_path);
+    return 0;
+}
+
+static void usage_recarve(void)
+{
+    fprintf(stderr,
+        "usage: ggnfs-sieve-server recarve \\\n"
+        "    --jobdir=<dir>          (required) existing initialized jobdir\n"
+        "    --qrange=<int>          (required) new per-workunit band width\n"
+        "    [--class=cpu|gpu]       class for the new bands (default gpu)\n"
+        "    [--qmin=<int>]          only consider workunits at or above this q\n"
+        "    [--qmax=<int>]          only consider workunits entirely below this q\n"
+        "    [--max-bands=<int>]     stop after creating this many bands\n"
+        "    [--gpu-args=<flags>]    set/replace the job-wide cuda-sieve flags\n"
+        "    [--dry-run]             report what would change, write nothing\n"
+        "\nRe-tiles work that is already queued to a different band width, without\n"
+        "reinitializing the job. This is how a GPU joins a campaign whose q range is\n"
+        "already fully tiled in CPU-sized workunits: there is no gap left for\n"
+        "`extend` to carve a wide band into, so widen existing rows instead.\n"
+        "\nCoalesces when --qrange is wider than what it finds and splits when it is\n"
+        "narrower, so it is its own inverse. Carving back down matters: a cpu client\n"
+        "never takes a gpu-class band, so wide bands left over when the card goes\n"
+        "away are unreachable by the CPU fleet until they are recarved to cpu.\n"
+        "\nOnly workunits that are 'available' with no failed attempts are touched;\n"
+        "leased, submitted, verified and poisoned rows are left exactly as they are\n"
+        "(and break the contiguous run around them). New bands never straddle the\n"
+        "boundaries of the rows they replace, so q coverage stays exact.\n"
+        "\nSafe to run against a live `serve`.\n");
+}
+
+static int cmd_recarve(int argc, char **argv)
+{
+    const char *jobdir     = flag(argc, argv, "--jobdir");
+    const char *qrange_s   = flag(argc, argv, "--qrange");
+    const char *class_s    = flag(argc, argv, "--class");
+    const char *qmin_s     = flag(argc, argv, "--qmin");
+    const char *qmax_s     = flag(argc, argv, "--qmax");
+    const char *maxb_s     = flag(argc, argv, "--max-bands");
+    const char *gpu_args   = flag(argc, argv, "--gpu-args");
+    int         dry_run    = flag_is_bare(argc, argv, "--dry-run");
+
+    if (flag_is_bare(argc, argv, "--gpu-args")) {
+        fprintf(stderr, "recarve: --gpu-args needs a value, e.g. "
+                        "--gpu-args=\"--logI 16 --J 32768\"\n"
+                        "  (to deliberately clear it, pass --gpu-args=)\n");
+        return 2;
+    }
+    if (!jobdir || !qrange_s) { usage_recarve(); return 2; }
+
+    const char *class_norm = (class_s && *class_s) ? class_s : "gpu";
+    if (!class_is_valid(class_norm)) {
+        fprintf(stderr, "recarve: --class must be 'cpu' or 'gpu'\n");
+        return 2;
+    }
+
+    int64_t qrange, qmin = 0, qmax = INT64_MAX, max_bands = 0;
+    if (parse_int64_arg(qrange_s, &qrange) != 0 || qrange <= 0) {
+        fprintf(stderr, "recarve: --qrange must be a positive integer\n");
+        return 2;
+    }
+    if (qmin_s && parse_int64_arg(qmin_s, &qmin) != 0) {
+        fprintf(stderr, "recarve: --qmin must be an integer\n"); return 2;
+    }
+    if (qmax_s && parse_int64_arg(qmax_s, &qmax) != 0) {
+        fprintf(stderr, "recarve: --qmax must be an integer\n"); return 2;
+    }
+    if (maxb_s && (parse_int64_arg(maxb_s, &max_bands) != 0 || max_bands < 0)) {
+        fprintf(stderr, "recarve: --max-bands must be a non-negative integer\n");
+        return 2;
+    }
+    if (qmax <= qmin) {
+        fprintf(stderr, "recarve: require qmax > qmin\n");
+        return 2;
+    }
+
+    /* Widening everything in one go is the one genuinely destructive way to
+     * use this: a gpu-class band is invisible to every cpu client, so an
+     * unbounded gpu recarve can hand the entire remaining campaign to a single
+     * card and idle the CPU fleet. Carving *down* to cpu has no such hazard —
+     * every client can take those — so it stays unbounded. */
+    if (strcmp(class_norm, "gpu") == 0 && !dry_run && !maxb_s && !qmin_s && !qmax_s) {
+        fprintf(stderr,
+            "recarve: refusing to recarve the whole job to gpu class.\n"
+            "  A cpu client never leases a gpu-class band, so this would make\n"
+            "  every remaining workunit reachable only by GPU clients.\n"
+            "  Scope it with --max-bands, --qmin, or --qmax (or --dry-run first).\n");
+        return 2;
+    }
+
+    char *db_path = path_join(jobdir, "job.db");
+    if (!db_path) return 1;
+    ggnfs_db_t *db = db_open(db_path);
+    if (!db) {
+        fprintf(stderr, "recarve: cannot open %s — did you run init?\n", db_path);
+        free(db_path);
+        return 1;
+    }
+
+    char *m_jobid = db_meta_get(db, "job_id");
+    if (!m_jobid || !*m_jobid) {
+        fprintf(stderr, "recarve: meta 'job_id' missing — db not initialized?\n");
+        free(m_jobid); db_close(db); free(db_path); return 1;
+    }
+    char job_id[16];
+    snprintf(job_id, sizeof(job_id), "%s", m_jobid);
+    free(m_jobid);
+
+    db_recarve_stats_t st;
+    if (db_recarve(db, job_id, qrange, qmin, qmax, class_norm,
+                   max_bands, dry_run, now_unix(), &st) != 0) {
+        fprintf(stderr, "recarve: failed — no changes were made\n");
+        db_close(db); free(db_path); return 1;
+    }
+
+    /* Before db_close, same as extend. */
+    if (gpu_args && !dry_run) db_meta_set(db, "gpu_args", gpu_args);
+    db_close(db);
+
+    printf("ggnfs-sieve-server: %s job %s\n",
+           dry_run ? "recarve --dry-run of" : "recarved", job_id);
+    printf("  band width    : %lld (class=%s)\n", (long long)qrange, class_norm);
+    printf("  runs examined : %lld\n", (long long)st.runs);
+    printf("  workunits     : %lld replaced by %lld\n",
+           (long long)st.rows_deleted, (long long)st.bands_created);
+    printf("  q re-tiled    : %lld\n", (long long)st.q_covered);
+    if (st.bands_created == 0 && st.runs > 0) {
+        /* A split needs budget for every band the row becomes, or it is backed
+         * out whole — so a --max-bands below that ratio silently does nothing.
+         * Say so, rather than let it read as "there was no work to do". */
+        printf("\n  Nothing changed. Every eligible run is already at this width,\n"
+               "  or --max-bands was too small to re-tile even one row\n"
+               "  (splitting a row into N bands needs a budget of N).\n");
+    }
+    if (gpu_args && !dry_run) {
+        printf("  gpu_args      : %s\n", *gpu_args ? gpu_args : "(cleared)");
+        printf("\n  NOTE: restart `serve` for the new gpu_args to reach clients.\n");
+    }
+    if (dry_run) printf("\n  (dry run — nothing was written)\n");
     free(db_path);
     return 0;
 }
@@ -1553,6 +1696,7 @@ static void usage_top(void)
         "usage:\n"
         "  ggnfs-sieve-server init         [args...]   create a new job\n"
         "  ggnfs-sieve-server extend       [args...]   add workunits to an existing job\n"
+        "  ggnfs-sieve-server recarve      [args...]   re-tile queued work to a new band width\n"
         "  ggnfs-sieve-server serve        [--bind=127.0.0.1] [--port=8080] [args...]\n"
         "  ggnfs-sieve-server verify-parse <file>      diagnostic: parse a relation file\n"
         "Run a subcommand without args to see its flags.\n");
@@ -1563,6 +1707,7 @@ int main(int argc, char **argv)
     if (argc < 2) { usage_top(); return 2; }
     if (strcmp(argv[1], "init")         == 0) return cmd_init        (argc - 1, argv + 1);
     if (strcmp(argv[1], "extend")       == 0) return cmd_extend      (argc - 1, argv + 1);
+    if (strcmp(argv[1], "recarve")      == 0) return cmd_recarve     (argc - 1, argv + 1);
     if (strcmp(argv[1], "serve")        == 0) return cmd_serve       (argc - 1, argv + 1);
     if (strcmp(argv[1], "verify-parse") == 0) return cmd_verify_parse(argc - 1, argv + 1);
     if (strcmp(argv[1], "-h") == 0 || strcmp(argv[1], "--help") == 0) {

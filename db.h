@@ -65,6 +65,57 @@ int db_workunit_base_q_range(ggnfs_db_t *db, int64_t *out);
 int db_workunit_overlap(ggnfs_db_t *db, int64_t qmin, int64_t qmax,
                         int64_t *out_q_start, int64_t *out_q_range);
 
+/* Next free workunit sequence number, derived from the numeric suffix of the
+ * existing `wu-<job_id>-NNNNNN` IDs rather than from COUNT(*).
+ *
+ * COUNT(*) was fine while rows were only ever appended, but db_recarve
+ * deletes them: after a recarve the row count is below the highest suffix in
+ * use, so a subsequent extend would recycle IDs that still exist and abort on
+ * the primary-key constraint. Returns 0 on success, -1 on error. */
+int db_workunit_next_seq(ggnfs_db_t *db, const char *job_id, int64_t *out);
+
+/* ---- recarve ---- */
+
+typedef struct {
+    int64_t runs;           /* maximal contiguous available spans considered */
+    int64_t bands_created;
+    int64_t rows_deleted;
+    int64_t q_covered;      /* total q-width re-tiled */
+} db_recarve_stats_t;
+
+/* Re-tile already-queued work to a different band width and class.
+ *
+ * Coalesces when `target_q_range` is wider than the rows it finds and splits
+ * when it is narrower, so it is its own inverse: recarve to gpu/10000 to give
+ * a card wide bands, recarve back to cpu/1000 to hand the remainder to the CPU
+ * fleet. That symmetry is load-bearing — `cpu` never falls back to `gpu`
+ * (see db_lease), so gpu-class bands left behind when the card goes away are
+ * unreachable by every other client until they are carved back down.
+ *
+ * Only rows that are `available` AND have attempt_count = 0 are touched:
+ *
+ *   - state, because a leased or submitted band must not vanish underneath a
+ *     client, and a poisoned one must stay poisoned. Rows in any other state
+ *     are simply absent from the scan, which breaks the contiguous run around
+ *     them and leaves their q-width alone.
+ *   - attempt_count, because merging a band that has already failed twice
+ *     into a fresh one resets the count that --max-attempts uses to give up.
+ *     A band that keeps failing has to keep its history.
+ *
+ * New bands never straddle a boundary of the rows they replace, so every
+ * q value stays covered exactly once no matter where the scan is cut short.
+ * `max_bands` (0 = unlimited) caps the number of bands created; [qmin, qmax)
+ * limits the q window considered, and only rows falling entirely inside it are
+ * eligible. `dry_run` computes and reports without committing.
+ *
+ * Runs entirely on the caller's connection inside one BEGIN IMMEDIATE, so it
+ * is safe against a live `serve`: the event thread's lease blocks on the write
+ * lock rather than racing it. Returns 0 on success, -1 on error. */
+int db_recarve(ggnfs_db_t *db, const char *job_id,
+               int64_t target_q_range, int64_t qmin, int64_t qmax,
+               const char *new_class, int64_t max_bands, int dry_run,
+               int64_t now_unix, db_recarve_stats_t *out);
+
 /* Re-queue any leased workunits whose lease has expired. If a workunit's
  * attempt_count would reach `max_attempts`, mark it 'poisoned' instead of
  * available so we stop re-issuing a workunit that keeps timing out.

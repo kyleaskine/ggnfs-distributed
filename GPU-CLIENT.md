@@ -40,7 +40,7 @@ That is `verify_parse_file_full` — the **full** GMP norm check on every line
 - cuda-sieve reads `rlim`/`alim`/`lpb*`/`mfb*`/poly straight from the `.job`,
   so `/file/<sha>` distribution needs no change at all.
 
-## Sizing: why 100x
+## Sizing: why wider bands (original estimate; corrected below)
 
 | quantity | value | source |
 |---|---|---|
@@ -57,9 +57,13 @@ Fixed per-workunit cost on the GPU side is CUDA init + a ~230 MB `--fb1` load
 + lease RTT + submit — call it 10–20 s, more over a throttled link. For that
 to be under 5% overhead you want 200–400 s of sieving.
 
-**Start GPU bands at `--qrange=100000`.** ~3000 special-q, ~6 min/WU,
-~456K relations, ~29 MB zstd — comfortably under the 500 MiB
-`OUTPUT_MAX_BYTES`. Re-tune from measured overhead once Phase 4 lands.
+**Superseded — see "Per-band overhead: measured" below.** This section's
+reasoning is sound but its inputs were AS276's, where a 1000-wide band is
+~3.7 s of GPU time. Measured startup is 5.3 s, not the 10-20 s guessed here,
+and on the production job a 1000-wide band is 19.4 s rather than 3.7 s. The
+answer that falls out is **`--qrange=10000` to `20000`**, not 100000.
+
+Do not size a band from a core-multiplier. Time one band on the card.
 
 ## Phase 1 — Server: workunit classes
 
@@ -498,14 +502,54 @@ Measured on that job (RTX 5070 vs a 9800X3D core): 4,266 relations in 23.4 s
 against ~3,530 in ~735 s — **~38x a core, ~3.2x the whole 12-worker box**, and
 21% more relations per band because GGNFS trims its factor-base bound to the
 special-q while cuda-sieve does not. That gap narrows as q climbs toward
-`alim`. Wall clock with `--prefetch=2` measured 24.6 s/band against 23.7 s of
-sieving: **96% card utilisation**.
+`alim`.
 
-Sizing note: the earlier `--qrange=100000` recommendation came from AS276,
-where a 1000-wide band is ~3.7 s of GPU time. On this job the same width is
-23.4 s, so 10,000-25,000 is the right range and 100,000 would mean 32-minute
-bands for no gain. Size GPU bands from a measured band time, not from a
-multiplier.
+### Per-band overhead: measured, and how it was first measured wrong
+
+An early reading compared 24.6 s of wall clock per band against the client's
+own reported 23.7 s of "sieving" and concluded 96% card utilisation. **That
+was wrong.** `sieve_seconds` (`client.c`) brackets the whole `sieve_run_cuda`
+call — fork, CUDA context init, factor-base load, sieve, teardown. Startup is
+*inside* the number, so the comparison could only ever see the lease/submit
+round trip, which `--prefetch` already hides. It was structurally blind to the
+cost it was trying to measure.
+
+The honest measurement is an A/B on identical q coverage, prod job at q=93M,
+RTX 5070, `--logI 16 --J 32768`, warm `--fb1`:
+
+```
+A  10 x 1000-wide : 247.36 s   48397 rels
+B   1 x 10000-wide: 199.54 s   48395 rels
+```
+
+`A - B = (n-1) * startup` gives **5.31 s of fixed startup per `bench`
+invocation**, and 19.42 s of sieving per 1000-wide band. Cross-checked
+directly: a band containing a single special-q wall-clocks 5.40 s, of which
+0.28 s is sieve. So a 1000-wide band on a GPU is **21.5% overhead, not 4%**.
+
+(The 2-relation difference between A and B is ECM cofactorisation
+nondeterminism, not a coverage gap.)
+
+Since startup is a fixed cost, the return on wider bands dies off fast:
+
+| `qrange` | band time | efficiency |
+|---|---|---|
+| 1000 | 0.41 min | 78.5% |
+| 2000 | 0.74 min | 88.0% |
+| 5000 | 1.71 min | 94.8% |
+| **10000** | **3.33 min** | **97.3%** |
+| **20000** | **6.56 min** | **98.7%** |
+| 50000 | 16.27 min | 99.5% |
+| 100000 | 32.46 min | 99.7% |
+
+**10,000-20,000 is the sweet spot.** 100,000 buys one further point while
+making each band 32 minutes — and with no partial-submit concept, a reclaimed
+or interrupted band throws all of that away. Recovering the 21.5% is worth
+~194 -> ~243 rel/s on a 5070.
+
+Size GPU bands from a measured band time, not from a multiplier: the earlier
+`--qrange=100000` figure came from AS276, where a 1000-wide band is ~3.7 s of
+GPU time rather than this job's 19.4 s.
 
 ## Expectations to set
 

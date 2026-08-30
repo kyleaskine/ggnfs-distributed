@@ -463,6 +463,311 @@ int db_workunit_overlap(ggnfs_db_t *db, int64_t qmin, int64_t qmax,
     return result;
 }
 
+int db_workunit_next_seq(ggnfs_db_t *db, const char *job_id, int64_t *out)
+{
+    if (!db || !job_id || !out) return -1;
+
+    char prefix[32];
+    int plen = snprintf(prefix, sizeof(prefix), "wu-%s-", job_id);
+    if (plen <= 0 || plen >= (int)sizeof(prefix)) return -1;
+
+    char like[40];
+    snprintf(like, sizeof(like), "%s%%", prefix);
+
+    /* substr() is 1-based, so the suffix starts at plen+1. CAST of a
+     * zero-padded suffix ('000123') yields the integer, which is what we
+     * want. A row whose ID does not end in digits casts to 0 and simply
+     * cannot raise the maximum, which is the safe direction. */
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db->conn,
+            "SELECT COALESCE(MAX(CAST(substr(id, ?1) AS INTEGER)), -1) + 1 "
+            "FROM workunits WHERE id LIKE ?2;",
+            -1, &st, NULL) != SQLITE_OK) {
+        fprintf(stderr, "db_workunit_next_seq: %s\n", sqlite3_errmsg(db->conn));
+        return -1;
+    }
+    sqlite3_bind_int (st, 1, plen + 1);
+    sqlite3_bind_text(st, 2, like, -1, SQLITE_TRANSIENT);
+
+    int rc = sqlite3_step(st);
+    if (rc == SQLITE_ROW) {
+        *out = sqlite3_column_int64(st, 0);
+        sqlite3_finalize(st);
+        return 0;
+    }
+    sqlite3_finalize(st);
+    return -1;
+}
+
+/* ---- recarve ---- */
+
+typedef struct {
+    int64_t q_start;
+    int64_t q_range;
+    char    side;
+} recarve_row_t;
+
+/* One output band, plus how many input rows it consumes. The rows are always
+ * a contiguous prefix of what remains, so `consumed` is all we need to delete
+ * them by q-range. */
+typedef struct {
+    int64_t q_start;
+    int64_t q_range;
+    int64_t consumed;       /* input rows replaced by this band */
+    char    side;
+} recarve_band_t;
+
+/* Load every eligible row, ordered by q_start. Only rows lying entirely
+ * within [qmin, qmax) are returned: a row straddling the window edge is left
+ * alone rather than half-recarved. */
+static int recarve_load(ggnfs_db_t *db, int64_t qmin, int64_t qmax,
+                        recarve_row_t **out_rows, size_t *out_n)
+{
+    *out_rows = NULL;
+    *out_n    = 0;
+
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db->conn,
+            "SELECT q_start, q_range, side FROM workunits "
+            " WHERE state = 'available' AND attempt_count = 0 "
+            "   AND q_start >= ?1 AND q_start + q_range <= ?2 "
+            " ORDER BY q_start;",
+            -1, &st, NULL) != SQLITE_OK) {
+        fprintf(stderr, "db_recarve load: %s\n", sqlite3_errmsg(db->conn));
+        return -1;
+    }
+    sqlite3_bind_int64(st, 1, qmin);
+    sqlite3_bind_int64(st, 2, qmax);
+
+    size_t cap = 0, n = 0;
+    recarve_row_t *rows = NULL;
+    int rc;
+    while ((rc = sqlite3_step(st)) == SQLITE_ROW) {
+        if (n == cap) {
+            size_t ncap = cap ? cap * 2 : 4096;
+            recarve_row_t *nr = realloc(rows, ncap * sizeof(*nr));
+            if (!nr) { free(rows); sqlite3_finalize(st); return -1; }
+            rows = nr; cap = ncap;
+        }
+        rows[n].q_start = sqlite3_column_int64(st, 0);
+        rows[n].q_range = sqlite3_column_int64(st, 1);
+        const unsigned char *sd = sqlite3_column_text(st, 2);
+        rows[n].side = (sd && sd[0]) ? (char)sd[0] : 'a';
+        n++;
+    }
+    sqlite3_finalize(st);
+    if (rc != SQLITE_DONE) { free(rows); return -1; }
+
+    *out_rows = rows;
+    *out_n    = n;
+    return 0;
+}
+
+/* Greedily turn the loaded rows into output bands.
+ *
+ * Every band starts on an input row's q_start and ends on an input row's
+ * q_start+q_range, which is what keeps coverage exact when max_bands cuts the
+ * plan short: whatever is not re-tiled is simply left as it was. */
+static size_t recarve_plan(const recarve_row_t *rows, size_t n,
+                           int64_t target, int64_t max_bands,
+                           recarve_band_t *bands, int64_t *out_runs)
+{
+    size_t nb = 0;
+    int64_t runs = 0;
+    size_t i = 0;
+
+    while (i < n) {
+        /* Extent of the maximal contiguous same-side run starting at i. */
+        size_t run_end = i + 1;
+        while (run_end < n &&
+               rows[run_end].q_start == rows[run_end - 1].q_start + rows[run_end - 1].q_range &&
+               rows[run_end].side    == rows[run_end - 1].side)
+            run_end++;
+        runs++;
+
+        size_t j = i;
+        while (j < run_end) {
+            if (max_bands > 0 && (int64_t)nb >= max_bands) break;
+
+            if (rows[j].q_range > target) {
+                /* Split: one input row becomes several bands. The last one
+                 * takes the remainder, so the row stays exactly covered. */
+                size_t  nb_row_start = nb;
+                int64_t off = 0;
+                while (off < rows[j].q_range) {
+                    if (max_bands > 0 && (int64_t)nb >= max_bands) break;
+                    int64_t w = rows[j].q_range - off;
+                    if (w > target) w = target;
+                    bands[nb].q_start  = rows[j].q_start + off;
+                    bands[nb].q_range  = w;
+                    /* Only the first band of the split deletes the input row;
+                     * the rest ride along on that same delete. */
+                    bands[nb].consumed = (off == 0) ? 1 : 0;
+                    bands[nb].side     = rows[j].side;
+                    nb++;
+                    off += w;
+                }
+                if (off < rows[j].q_range) {
+                    /* Budget ran out mid-row. A partial split would leave the
+                     * tail of this row uncovered, so drop the whole thing and
+                     * leave the row as it is. Rewinding to the mark keeps that
+                     * decision local — it cannot reach into bands emitted for
+                     * an earlier row however the budget checks are arranged. */
+                    nb = nb_row_start;
+                    break;
+                }
+                j++;
+                continue;
+            }
+
+            /* Coalesce: accumulate whole rows until the next one would
+             * overshoot `target`. */
+            int64_t w = 0;
+            size_t  k = j;
+            while (k < run_end && w + rows[k].q_range <= target) {
+                w += rows[k].q_range;
+                k++;
+            }
+            if (k == j) { w = rows[j].q_range; k = j + 1; }  /* exactly-target row */
+
+            bands[nb].q_start  = rows[j].q_start;
+            bands[nb].q_range  = w;
+            bands[nb].consumed = (int64_t)(k - j);
+            bands[nb].side     = rows[j].side;
+            nb++;
+            j = k;
+        }
+        if (max_bands > 0 && (int64_t)nb >= max_bands) break;
+        i = run_end;
+    }
+
+    if (out_runs) *out_runs = runs;
+    return nb;
+}
+
+int db_recarve(ggnfs_db_t *db, const char *job_id,
+               int64_t target_q_range, int64_t qmin, int64_t qmax,
+               const char *new_class, int64_t max_bands, int dry_run,
+               int64_t now_unix, db_recarve_stats_t *out)
+{
+    if (!db || !job_id || target_q_range <= 0 || qmax <= qmin) return -1;
+    if (out) memset(out, 0, sizeof(*out));
+
+    /* IMMEDIATE even for a dry run: it takes the write lock up front, so the
+     * plan we print is the plan that would have been applied rather than one
+     * computed against rows a concurrent lease was busy claiming. */
+    if (sqlite3_exec(db->conn, "BEGIN IMMEDIATE;", NULL, NULL, NULL) != SQLITE_OK) {
+        fprintf(stderr, "db_recarve: begin: %s\n", sqlite3_errmsg(db->conn));
+        return -1;
+    }
+
+    int            result = -1;
+    recarve_row_t *rows   = NULL;
+    recarve_band_t *bands = NULL;
+    size_t          n     = 0;
+    sqlite3_stmt   *del   = NULL;
+
+    if (recarve_load(db, qmin, qmax, &rows, &n) != 0) goto done;
+    if (n == 0) { result = 0; goto done; }
+
+    /* Upper bound on bands: splitting is the only case that produces more
+     * bands than input rows, and it produces at most ceil(q_range/target)
+     * each. Sum that bound rather than guessing. */
+    size_t band_cap = 0;
+    for (size_t i = 0; i < n; i++) {
+        int64_t parts = (rows[i].q_range + target_q_range - 1) / target_q_range;
+        if (parts < 1) parts = 1;
+        band_cap += (size_t)parts;
+    }
+    bands = calloc(band_cap ? band_cap : 1, sizeof(*bands));
+    if (!bands) goto done;
+
+    int64_t runs = 0;
+    size_t  nb   = recarve_plan(rows, n, target_q_range, max_bands, bands, &runs);
+
+    int64_t seq = 0;
+    if (db_workunit_next_seq(db, job_id, &seq) != 0) goto done;
+
+    if (sqlite3_prepare_v2(db->conn,
+            "DELETE FROM workunits "
+            " WHERE state = 'available' AND attempt_count = 0 "
+            "   AND q_start >= ?1 AND q_start + q_range <= ?2;",
+            -1, &del, NULL) != SQLITE_OK) {
+        fprintf(stderr, "db_recarve delete: %s\n", sqlite3_errmsg(db->conn));
+        goto done;
+    }
+
+    int64_t created = 0, deleted = 0, covered = 0;
+    for (size_t b = 0; b < nb; b++) {
+        if (bands[b].consumed > 0) {
+            /* Delete exactly the input rows this band replaces. The band's
+             * own extent covers them by construction, except in the split
+             * case where the deleted row spans several bands — hence the
+             * explicit end below rather than q_start+q_range. */
+            int64_t del_end = bands[b].q_start + bands[b].q_range;
+            for (size_t t = b + 1; t < nb && bands[t].consumed == 0; t++)
+                del_end = bands[t].q_start + bands[t].q_range;
+
+            sqlite3_reset(del);
+            sqlite3_bind_int64(del, 1, bands[b].q_start);
+            sqlite3_bind_int64(del, 2, del_end);
+            if (sqlite3_step(del) != SQLITE_DONE) {
+                fprintf(stderr, "db_recarve: delete step: %s\n",
+                        sqlite3_errmsg(db->conn));
+                goto done;
+            }
+            int changed = sqlite3_changes(db->conn);
+            if (changed != (int)bands[b].consumed) {
+                /* Nothing else can write inside BEGIN IMMEDIATE, so this can
+                 * only mean the plan and the table disagree. Abort rather
+                 * than leave a hole in q coverage. */
+                fprintf(stderr,
+                        "db_recarve: expected to delete %lld rows in [%lld, %lld), "
+                        "deleted %d — aborting\n",
+                        (long long)bands[b].consumed, (long long)bands[b].q_start,
+                        (long long)del_end, changed);
+                goto done;
+            }
+            deleted += changed;
+        }
+
+        char id[64];
+        snprintf(id, sizeof(id), "wu-%s-%06lld", job_id, (long long)seq);
+        if (db_workunit_insert(db, id, bands[b].q_start, bands[b].q_range,
+                               bands[b].side, new_class, now_unix) != 0) {
+            fprintf(stderr, "db_recarve: insert failed at seq=%lld\n",
+                    (long long)seq);
+            goto done;
+        }
+        seq++;
+        created++;
+        covered += bands[b].q_range;
+    }
+
+    if (out) {
+        out->runs          = runs;
+        out->bands_created = created;
+        out->rows_deleted  = deleted;
+        out->q_covered     = covered;
+    }
+    result = 0;
+
+done:
+    if (del) sqlite3_finalize(del);
+    free(bands);
+    free(rows);
+    if (result == 0 && !dry_run) {
+        if (sqlite3_exec(db->conn, "COMMIT;", NULL, NULL, NULL) != SQLITE_OK) {
+            fprintf(stderr, "db_recarve: commit: %s\n", sqlite3_errmsg(db->conn));
+            sqlite3_exec(db->conn, "ROLLBACK;", NULL, NULL, NULL);
+            return -1;
+        }
+    } else {
+        sqlite3_exec(db->conn, "ROLLBACK;", NULL, NULL, NULL);
+    }
+    return result;
+}
+
 int db_lease_expire_sweep(ggnfs_db_t *db,
                           int64_t now_unix, int64_t max_attempts,
                           int64_t *out_requeued, int64_t *out_poisoned)
