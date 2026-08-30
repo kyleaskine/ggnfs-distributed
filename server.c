@@ -8,6 +8,10 @@
  *                            [--lease-seconds=3600]
  *                            [--sweep-seconds=60] [--max-attempts=5]
  *                            [--spotcheck-k=50]   (0 disables norm spot-check)
+ *                            [--block-width-multiple=50]  (GPU block target =
+ *                                        this x the job's base q_range)
+ *                            [--block-max-members=256] [--block-min-q-width=0]
+ *                            [--block-attempt-ceiling=2]
  *
  * The server reuses the bearer token from <jobdir>/token (written at init).
  * One job per server. No verification, no .ranges write-back, no /stats.
@@ -225,7 +229,9 @@ static void usage_init(void)
         "    --qmax=<int>            (required) end (exclusive)\n"
         "    --qrange=<int>          (required) per-workunit range size\n"
         "    [--side=a|r]            default a\n"
-        "    [--class=cpu|gpu]       default cpu; sizes this band for CPU or GPU clients\n"
+        "    [--class=cpu]           default (and only) value; 'gpu' is refused —\n"
+        "                            GPU sizing is a lease property now (see\n"
+        "                            --block-width-multiple on serve), not a row one\n"
         "    [--siever-args=<flags>] extra args appended to the siever command, e.g. \"-J 16\"\n"
         "    [--gpu-args=<flags>]    geometry/tuning flags for cuda-sieve clients, e.g.\n"
         "                            \"--logI 17 --J 16384\". Not a translation of\n"
@@ -235,6 +241,46 @@ static void usage_init(void)
         "                            from a higher q and you want to close the gap from\n"
         "                            the top)\n"
         "    [--jobdir=<dir>]        default current dir\n");
+}
+
+/* Reject a .job carrying bytes cuda-sieve cannot parse, before its SHA becomes
+ * the job's identity.
+ *
+ * A live campaign was found distributing a file with a zero-width space
+ * (U+200B) after "alambda: 3.6". gnfs-lasieve4 ignores it; cuda-sieve refuses
+ * the file outright, so the GPU could not sieve that job at all. By then the
+ * SHA was load-bearing — workunit IDs derive from it and finalize-nfs.sh
+ * compares it — so it could only be worked around client-side.
+ *
+ * Catching it here fixes it once, for every engine and every future job.
+ * Tabs and newlines are legitimate separators. */
+static int job_bytes_are_clean(const char *path)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f) return 1;                    /* other code reports open failures */
+    int c, line = 1, bad = 0, bad_line = 0;
+    while ((c = fgetc(f)) != EOF) {
+        if (c == '\n') { line++; continue; }
+        /* CR is fine: .job files routinely have CRLF endings (AS276.job does)
+         * and cuda-sieve parses them without complaint. Only bytes it actually
+         * chokes on are worth refusing a campaign over. */
+        if (c == '\t' || c == '\r' || (c >= 0x20 && c <= 0x7e)) continue;
+        if (!bad) bad_line = line;
+        bad++;
+    }
+    fclose(f);
+    if (bad) {
+        fprintf(stderr,
+            "init: %s contains %d unparseable byte(s) (first on line %d).\n"
+            "  gnfs-lasieve4 tolerates these; cuda-sieve refuses the file, so a\n"
+            "  GPU client could never sieve this job. The .job's SHA becomes the\n"
+            "  job's identity here, so this cannot be fixed later without\n"
+            "  orphaning the campaign.\n"
+            "  Clean it first, e.g.:  perl -i -pe 's/[^\\x20-\\x7e\\t\\r\\n]//g' %s\n",
+            path, bad, bad_line, path);
+        return 0;
+    }
+    return 1;
 }
 
 static int cmd_init(int argc, char **argv)
@@ -287,6 +333,20 @@ static int cmd_init(int argc, char **argv)
         fprintf(stderr, "init: --class must be 'cpu' or 'gpu'\n");
         return 2;
     }
+    /* Same refusal as cmd_extend, and for the same reason — guarding only
+     * `extend` would leave the whole hazard reachable from the other end.
+     * Nothing sizes work around class any more, so a gpu-class campaign is
+     * just a campaign of enormous workunits that a single core will time out
+     * on and poison. */
+    if (strcmp(class_norm, "gpu") == 0) {
+        fprintf(stderr,
+            "init: --class=gpu is no longer supported.\n"
+            "  GPU sizing is a property of the LEASE now, not of the row: a\n"
+            "  client asking for a block gets one lease over N contiguous\n"
+            "  base-width workunits, sized by --block-width-multiple on serve.\n"
+            "  Initialise at your normal --qrange and let blocks do the widening.\n");
+        return 2;
+    }
     const char *lease_order_norm = "asc";
     if (lease_order && *lease_order) {
         if (strcmp(lease_order, "asc") == 0 || strcmp(lease_order, "desc") == 0) {
@@ -304,6 +364,12 @@ static int cmd_init(int argc, char **argv)
     if (!files_dir || !rels_dir) { free(files_dir); free(rels_dir); return 1; }
     if (mkdir_p(files_dir) != 0 || mkdir_p(rels_dir) != 0) {
         free(files_dir); free(rels_dir); return 1;
+    }
+
+    /* Check the bytes BEFORE hashing: once the SHA is taken it is the job's
+     * identity and the file can no longer be corrected. */
+    if (!job_bytes_are_clean(job_path)) {
+        free(files_dir); free(rels_dir); return 2;
     }
 
     /* Hash + copy the .job file into <jobdir>/files/<sha>.job. */
@@ -456,11 +522,11 @@ static void usage_extend(void)
         "    --qmax=<int>            (required) end (exclusive); [qmin, qmax) must not\n"
         "                            overlap any existing workunit\n"
         "    --qrange=<int>          (required) per-workunit range size\n"
-        "    [--class=cpu|gpu]       default cpu; 'gpu' carves a band sized for GPU\n"
-        "                            clients, which only they will be handed\n"
+        "    [--class=cpu]           default (and only) value; 'gpu' is refused —\n"
+        "                            GPU sizing is a lease property now (see\n"
+        "                            --block-width-multiple on serve), not a row one\n"
         "    [--gpu-args=<flags>]    set/replace the job-wide cuda-sieve flags, e.g.\n"
-        "                            \"--logI 17 --J 16384\"; usually given alongside\n"
-        "                            the first --class=gpu extend. Omit to leave as-is\n"
+        "                            \"--logI 17 --J 16384\". Omit to leave as-is\n"
         "\nAdds workunits to an existing job. The new range can sit above, below, or\n"
         "in a gap between existing workunits — any non-overlapping placement is OK.\n"
         "Token, .job file, siever, and side are inherited from init. Sequence\n"
@@ -490,6 +556,20 @@ static int cmd_extend(int argc, char **argv)
     const char *class_norm = (class_s && *class_s) ? class_s : "cpu";
     if (!class_is_valid(class_norm)) {
         fprintf(stderr, "extend: --class must be 'cpu' or 'gpu'\n");
+        return 2;
+    }
+    /* Carving wide gpu-class rows is how v1 fed a card, and it is exactly what
+     * blocks replaced. Accepting it now would create rows that nothing sizes
+     * work around and that no longer get any special treatment at lease time —
+     * a card would simply be handed one enormous workunit. Refuse rather than
+     * leave a documented flag that quietly does the wrong thing. */
+    if (strcmp(class_norm, "gpu") == 0) {
+        fprintf(stderr,
+            "extend: --class=gpu is no longer supported.\n"
+            "  GPU sizing is a property of the LEASE now, not of the row: a\n"
+            "  client asking for a block gets one lease over N contiguous\n"
+            "  base-width workunits, sized by --block-width-multiple on serve.\n"
+            "  Extend at your normal --qrange and let blocks do the widening.\n");
         return 2;
     }
 
@@ -534,9 +614,12 @@ static int cmd_extend(int argc, char **argv)
     free(m_jobid);
 
     /* Find next sequence number. Sequence IDs are just unique handles; they
-     * don't need to track q-order, so extending below or into a gap is fine. */
-    int64_t existing_count = 0;
-    if (db_workunit_extent(db, &existing_count, NULL) != 0) {
+     * don't need to track q-order, so extending below or into a gap is fine.
+     * It comes from the highest suffix in use rather than from the row count,
+     * so that an id is never reused even if rows are ever removed. */
+    int64_t existing_count = 0, next_seq = 0;
+    if (db_workunit_extent(db, &existing_count, NULL) != 0 ||
+        db_workunit_next_seq(db, job_id, &next_seq) != 0) {
         fprintf(stderr, "extend: cannot read existing workunits\n");
         db_close(db); free(db_path); return 1;
     }
@@ -563,7 +646,7 @@ static int cmd_extend(int argc, char **argv)
 
     /* Insert new workunits, continuing the sequence. */
     int64_t now = now_unix();
-    int64_t seq = existing_count;
+    int64_t seq = next_seq;
     int64_t added = 0;
     int64_t q;
     for (q = qmin; q < qmax; q += qrange) {
@@ -625,7 +708,32 @@ typedef struct {
     int64_t     max_attempts;       /* mark workunit poisoned after this many lease expiries */
     int         lease_desc;         /* 0 = hand out lowest-q_start first, 1 = highest first */
     verify_thread_t *verifier;      /* background parse-pass verifier; may be NULL */
+
+    /* ---- gpu blocks ----
+     * A block's target width is DERIVED, not configured: it is
+     * block_width_multiple times the job's own base q_range. Base q_range is
+     * already normalised to wall clock — an operator picks --qrange so one
+     * workunit is a sane slice of a CPU core — and a GPU is a roughly
+     * job-independent multiple of a core, so a fixed multiple holds the GPU
+     * band near a constant wall-clock target across jobs of any size. A
+     * hardcoded width would be a 3-minute band on one job and an hours-long
+     * one on the next. */
+    int64_t     block_width_multiple;
+    int64_t     block_max_members;    /* hard clamp; a client's ask is advice */
+    int64_t     block_min_q_width;    /* 0 = target/4 */
+    int64_t     block_attempt_ceiling;/* must stay < max_attempts */
+
+    /* db_workunit_base_q_range is a full covering-index scan plus two temp
+     * b-trees — 38 ms on a 390K-row jobdir, measured. The verifier can afford
+     * that once per drain pass; the lease path, on the mongoose thread next to
+     * /submit and /stats, cannot afford it per request. Cache it, and re-read
+     * on a timer so `extend` adding a differently-sized band under a running
+     * serve is still picked up. */
+    int64_t     base_q_range;
+    int64_t     base_q_range_at;
 } server_ctx_t;
+
+#define BASE_Q_RANGE_TTL_SECONDS 60
 
 #define COMMAND_TEMPLATE_DEFAULT \
     "{siever} -f {q_start} -c {q_range} -a {job_file} -o {output_file} -n 0"
@@ -689,6 +797,28 @@ deny:
     return 0;
 }
 
+/* The job's base band width, re-read at most once per TTL. Returns 0 if the
+ * workunits table is empty, which disables blocks rather than guessing. */
+static int64_t base_q_range_cached(server_ctx_t *ctx, int64_t now)
+{
+    if (ctx->base_q_range <= 0 ||
+        now - ctx->base_q_range_at >= BASE_Q_RANGE_TTL_SECONDS) {
+        int64_t base = 0;
+        if (db_workunit_base_q_range(ctx->db, &base) == 0 && base > 0) {
+            if (base != ctx->base_q_range) {
+                fprintf(stderr, "blocks: base q_range = %lld "
+                                "(target %lld x %lld = %lld)\n",
+                        (long long)base, (long long)ctx->block_width_multiple,
+                        (long long)base,
+                        (long long)(base * ctx->block_width_multiple));
+            }
+            ctx->base_q_range = base;
+        }
+        ctx->base_q_range_at = now;
+    }
+    return ctx->base_q_range;
+}
+
 /* ---- /lease ---- */
 
 static void handle_lease(struct mg_connection *c, struct mg_http_message *hm,
@@ -699,10 +829,13 @@ static void handle_lease(struct mg_connection *c, struct mg_http_message *hm,
     char client_id[64] = {0};
     char client_ver[32] = {0};
     char class_want[16] = {0};
+    int     want_block = 0;
+    int64_t want_members = 0;
     proto_decode_lease_request(hm->body.buf, hm->body.len,
                                client_id, sizeof(client_id),
                                client_ver, sizeof(client_ver),
-                               class_want, sizeof(class_want));
+                               class_want, sizeof(class_want),
+                               &want_block, &want_members);
     if (client_id[0] == '\0') {
         send_text(c, 400, "missing client_id\n");
         return;
@@ -717,7 +850,52 @@ static void handle_lease(struct mg_connection *c, struct mg_http_message *hm,
     db_clients_seen(ctx->db, client_id, now_unix(), class_want);
 
     db_lease_result_t r;
-    int rc = db_lease(ctx->db, client_id, ctx->lease_seconds, now_unix(),
+    int64_t block_members = 0;
+    int     rc            = 1;
+
+    /* Block path first, when the client asked for one. A block is returned
+     * through the ordinary lease fields — workunit_id is its anchor and
+     * [q_start, q_start+q_range) spans every member — so the client sieves it
+     * with the same code path as a single workunit. That is the whole point of
+     * anchored addressing: /submit, /renew, /release, the relation filename
+     * and finalize-nfs.sh's wu-* glob all keep working untouched. */
+    if (want_block) {
+        int64_t base   = base_q_range_cached(ctx, now_unix());
+        int64_t target = base > 0 ? base * ctx->block_width_multiple : 0;
+        int64_t maxm   = ctx->block_max_members;
+        /* The client's ask is advice: it flows into a LIMIT, so an unclamped
+         * value would let one request lease the rest of the campaign. */
+        if (want_members > 0 && want_members < maxm) maxm = want_members;
+
+        if (target > 0) {
+            int64_t minw = ctx->block_min_q_width > 0
+                         ? ctx->block_min_q_width : target / 4;
+            db_block_t b;
+            int brc = db_block_lease(ctx->db, ctx->job_id, client_id,
+                                     target, minw, maxm,
+                                     ctx->block_attempt_ceiling,
+                                     ctx->lease_seconds, now_unix(), &b);
+            if (brc == 0) {
+                snprintf(r.id, sizeof(r.id), "%s", b.anchor_wu_id);
+                r.q_start = b.q_start;
+                r.q_range = b.q_end - b.q_start;
+                r.side    = b.side;
+                snprintf(r.class, sizeof(r.class), "gpu");
+                block_members = b.member_count;
+                rc = 0;
+            } else if (brc < 0) {
+                send_text(c, 500, "internal error\n");
+                return;
+            }
+            /* brc == 1: no run wide enough. Fall through to an ordinary
+             * single-workunit lease — a card on a small band is merely
+             * inefficient, and this is what keeps a GPU working through the
+             * endgame when contiguous runs have run out. */
+        }
+    }
+
+    if (rc != 0)
+        rc = db_lease(ctx->db, client_id, ctx->lease_seconds, now_unix(),
                       ctx->lease_desc, class_want, &r);
     if (rc == 1) {
         /* No work right now. Job is still running. */
@@ -746,6 +924,7 @@ static void handle_lease(struct mg_connection *c, struct mg_http_message *hm,
         .file_url         = file_url,
         .output_name      = OUTPUT_NAME_DEFAULT,
         .output_max_bytes = OUTPUT_MAX_BYTES,
+        .block_members    = block_members,
     };
     send_json_take(c, 200, proto_encode_lease_response(&a));
 }
@@ -917,24 +1096,54 @@ static void handle_submit(struct mg_connection *c, struct mg_http_message *hm,
         }
     }
 
-    /* Persist body to <jobdir>/rels/<workunit_id>.dat[.zst]. */
+    /* Resolve the block BEFORE choosing a filename: a block's file must not be
+     * named after its anchor.
+     *
+     * The anchor is a real workunit, and a block that passes with its lowest-q
+     * member starved sends exactly that member back to 'available'. Re-leased
+     * on its own it would submit to <anchor>.dat.zst and overwrite the block's
+     * file — silently discarding the other members' relations, which are not
+     * recoverable and would not show up until filtering came out short. Naming
+     * a block's file after the block makes the collision impossible: block ids
+     * are server-generated and never reused. */
+    db_block_t blk;
+    int found = db_block_find_live(ctx->db, workunit_id, &blk);
+    if (found < 0) { send_text(c, 500, "internal error\n"); return; }
+
+    /* Persist body to <jobdir>/rels/<workunit_id|block_id>.dat[.zst]. Both are
+     * server-generated ids containing no path separators — workunit_id has
+     * already been through workunit_id_is_safe_for_job. */
     char rel_name[96];
-    snprintf(rel_name, sizeof(rel_name), "%s.dat%s", workunit_id,
-             is_zstd ? ".zst" : "");
+    snprintf(rel_name, sizeof(rel_name), "%s.dat%s",
+             found == 0 ? blk.id : workunit_id, is_zstd ? ".zst" : "");
     char *rel_path = path_join(ctx->rels_dir, rel_name);
     if (!rel_path) { send_text(c, 500, "oom\n"); return; }
+
+    /* Stage to a per-request temp file and rename only once the DB has
+     * ACCEPTED the submission.
+     *
+     * Writing straight to rel_path lets a client whose lease already lapsed
+     * clobber the file of whoever the sweep reissued the workunit to — and
+     * then the 409 path below would unlink() it, destroying a submission that
+     * was already recorded. rename(2) is atomic within a directory, so the
+     * final name only ever appears with content the DB agreed to. */
+    char tmp_name[128];
+    snprintf(tmp_name, sizeof(tmp_name), "%s.tmp.%ld.%p",
+             rel_name, (long)getpid(), (void *)c);
+    char *tmp_path = path_join(ctx->rels_dir, tmp_name);
+    if (!tmp_path) { free(rel_path); send_text(c, 500, "oom\n"); return; }
     {
-        FILE *f = fopen(rel_path, "wb");
+        FILE *f = fopen(tmp_path, "wb");
         if (!f) {
-            fprintf(stderr, "submit: open %s: %s\n", rel_path, strerror(errno));
-            free(rel_path);
+            fprintf(stderr, "submit: open %s: %s\n", tmp_path, strerror(errno));
+            free(tmp_path); free(rel_path);
             send_text(c, 500, "cannot write submission\n");
             return;
         }
         if (fwrite(hm->body.buf, 1, hm->body.len, f) != hm->body.len) {
             fclose(f);
-            unlink(rel_path);
-            free(rel_path);
+            unlink(tmp_path);
+            free(tmp_path); free(rel_path);
             send_text(c, 500, "short write\n");
             return;
         }
@@ -942,21 +1151,46 @@ static void handle_submit(struct mg_connection *c, struct mg_http_message *hm,
     }
 
     db_clients_seen(ctx->db, client_id, now_unix(), NULL);
-    int rc = db_submit(ctx->db, workunit_id, client_id, rel_path, body_sha,
+
+    /* Same anchor routing as /renew (the lookup happened above, before the
+     * filename was chosen). db_block_submit additionally proves ownership, so
+     * a client that is not the lease holder gets 409 rather than marking the
+     * anchor submitted underneath the block that owns it. */
+    int rc;
+    if (found == 0) {
+        rc = db_block_submit(ctx->db, workunit_id, client_id, rel_path,
+                             body_sha, num_relations, sieve_seconds, now_unix());
+    } else if (found == 1) {
+        rc = db_submit(ctx->db, workunit_id, client_id, rel_path, body_sha,
                        num_relations, sieve_seconds, now_unix());
+    } else {
+        rc = -1;
+    }
     if (rc == 1) {
-        /* Workunit not currently leased — re-issued or stale. */
-        unlink(rel_path);
-        free(rel_path);
-        send_text(c, 409, "workunit not leased\n");
+        /* Not leased to this client — re-issued, stale, or a late block whose
+         * members have moved on. Only the staging file is removed; whatever is
+         * at rel_path belongs to the current holder. */
+        unlink(tmp_path);
+        free(tmp_path); free(rel_path);
+        send_text(c, 409, "workunit not leased to client\n");
         return;
     }
     if (rc != 0) {
-        unlink(rel_path);
-        free(rel_path);
+        unlink(tmp_path);
+        free(tmp_path); free(rel_path);
         send_text(c, 500, "internal error\n");
         return;
     }
+    /* Accepted: publish the staged file under the name the submission row
+     * records. A failure here leaves the row pointing at a file that does not
+     * exist, which the verifier reports as an open error rather than silently
+     * passing, so it is loud either way. */
+    if (rename(tmp_path, rel_path) != 0) {
+        fprintf(stderr, "submit: rename %s -> %s: %s\n",
+                tmp_path, rel_path, strerror(errno));
+        unlink(tmp_path);
+    }
+    free(tmp_path);
     free(rel_path);
 
     /* Nudge the verifier so it processes this submission promptly instead of
@@ -995,8 +1229,35 @@ static void handle_renew(struct mg_connection *c, struct mg_http_message *hm,
     }
 
     db_clients_seen(ctx->db, client_id, now_unix(), NULL);
-    int rc = db_renew_lease(ctx->db, workunit_id, client_id,
+
+    /* An id that anchors a live block renews the whole block; anything else is
+     * an ordinary workunit. Routing on the anchor rather than on a client hint
+     * means a confused client cannot renew half a block. */
+    db_block_t blk;
+    int found = db_block_find_live(ctx->db, workunit_id, &blk);
+    int rc;
+    if (found == 0) {
+        int64_t renewed = 0;
+        rc = db_block_renew(ctx->db, workunit_id, client_id,
+                            ctx->lease_seconds, now_unix(), &renewed);
+        if (rc == 0 && renewed != blk.member_count) {
+            /* Part of the block is gone: the sweep reclaimed a member whose
+             * lease lapsed just before this heartbeat landed. db_block_submit
+             * requires every member, so this band can no longer be submitted —
+             * it is already dead, and answering 200 would leave the card
+             * sieving it for another quarter hour before finding out. 409 is
+             * the documented "abandon immediately" signal. */
+            fprintf(stderr, "renew: block %s renewed %lld of %lld members — "
+                            "telling the client to abandon it\n",
+                    blk.id, (long long)renewed, (long long)blk.member_count);
+            rc = 1;
+        }
+    } else if (found == 1) {
+        rc = db_renew_lease(ctx->db, workunit_id, client_id,
                             ctx->lease_seconds, now_unix());
+    } else {
+        rc = -1;
+    }
     if (rc == 0) {
         send_json_take(c, 200,
                        proto_encode_renew_response(1, ctx->lease_seconds));
@@ -1030,7 +1291,12 @@ static void handle_release(struct mg_connection *c, struct mg_http_message *hm,
     }
 
     db_clients_seen(ctx->db, client_id, now_unix(), NULL);
-    int rc = db_release_lease(ctx->db, workunit_id, client_id);
+    db_block_t blk;
+    int found = db_block_find_live(ctx->db, workunit_id, &blk);
+    int rc;
+    if (found == 0)      rc = db_block_release(ctx->db, workunit_id, client_id);
+    else if (found == 1) rc = db_release_lease(ctx->db, workunit_id, client_id);
+    else                 rc = -1;
     if (rc == 0) {
         send_json_take(c, 200, proto_encode_submit_response(1, "released", 0));
     } else if (rc == 1) {
@@ -1129,6 +1395,8 @@ static char *format_stats_json(server_ctx_t *ctx, const db_stats_t *s,
         cJSON_AddNumberToObject(o, "relations",          (double)cc->relations);
         cJSON_AddNumberToObject(o, "total_failures",     (double)cc->total_failures);
         cJSON_AddNumberToObject(o, "avg_sieve_seconds",  cc->avg_sieve_seconds);
+        cJSON_AddNumberToObject(o, "rel_per_sec",        cc->rel_per_sec);
+        cJSON_AddNumberToObject(o, "sieve_seconds_total", cc->sieve_seconds_total);
         cJSON_AddStringToObject(o, "current_workunit",   cc->current_workunit);
         cJSON_AddStringToObject(o, "class",              cc->last_class);
         cJSON_AddItemToArray(clients, o);
@@ -1271,6 +1539,29 @@ static void on_sweep_timer(void *arg)
 {
     server_ctx_t *ctx = (server_ctx_t *)arg;
     int64_t requeued = 0, poisoned = 0;
+    int64_t bblocks = 0, brequeued = 0, bpoisoned = 0;
+
+    /* BLOCKS FIRST. This ordering is what keeps the per-workunit sweep off
+     * block members without a predicate: the block sweep sets them back to
+     * 'available', and db_lease_expire_sweep's own state = 'leased' test then
+     * excludes them. Reverse the two and every member is incremented twice —
+     * once as a stray leased row, once as a block member. */
+    /* Log and carry on rather than returning: the row sweep is what reclaims
+     * every ordinary CPU lease, and letting a transient block-sweep error (a
+     * SQLITE_BUSY past the busy_timeout while the verifier drains) stop it
+     * would stall the whole fleet's lease expiry behind a one-line message.
+     * The ordering guarantee still holds — any block member this tick failed
+     * to requeue is still 'leased' with a lapsed expiry, so the row sweep
+     * charges it once, exactly as it would a stray workunit. */
+    if (db_block_expire_sweep(ctx->db, now_unix(), ctx->max_attempts,
+                              &bblocks, &brequeued, &bpoisoned) != 0)
+        fprintf(stderr, "sweep: db_block_expire_sweep failed; "
+                        "continuing with the per-workunit sweep\n");
+    if (bblocks > 0) {
+        fprintf(stderr, "sweep: blocks=%lld  members requeued=%lld  poisoned=%lld\n",
+                (long long)bblocks, (long long)brequeued, (long long)bpoisoned);
+    }
+
     if (db_lease_expire_sweep(ctx->db, now_unix(), ctx->max_attempts,
                               &requeued, &poisoned) != 0) {
         fprintf(stderr, "sweep: db_lease_expire_sweep failed\n");
@@ -1291,6 +1582,10 @@ static int cmd_serve(int argc, char **argv)
     const char *sweep_s   = flag(argc, argv, "--sweep-seconds");
     const char *attempt_s = flag(argc, argv, "--max-attempts");
     const char *spot_s    = flag(argc, argv, "--spotcheck-k");
+    const char *bmult_s   = flag(argc, argv, "--block-width-multiple");
+    const char *bmaxm_s   = flag(argc, argv, "--block-max-members");
+    const char *bminw_s   = flag(argc, argv, "--block-min-q-width");
+    const char *bceil_s   = flag(argc, argv, "--block-attempt-ceiling");
 
     int64_t port = 8080;
     if (port_s && *port_s && parse_int64_arg(port_s, &port) != 0) {
@@ -1331,10 +1626,63 @@ static int cmd_serve(int argc, char **argv)
     }
     if (spotcheck_k < 0) spotcheck_k = 0;
 
+    /* 50x base q_range. See the server_ctx_t comment for why the multiple is
+     * what gets configured rather than an absolute width. Measured on a 5070
+     * against 1,000-wide bands: 22% of every band is fixed cuda-sieve startup
+     * at 1x, 1.4% at 20x, 0.6% at 50x. Past ~20x the throughput curve is flat
+     * (+0.9% from 20 to 50); the reason to go further is fewer lease/submit
+     * transactions on the single event-loop thread as the GPU fleet grows,
+     * and the cost is reclaim granularity, since there is no partial submit. */
+    int64_t block_width_multiple = 50;
+    if (bmult_s && *bmult_s && parse_int64_arg(bmult_s, &block_width_multiple) != 0) {
+        fprintf(stderr, "serve: bad --block-width-multiple\n");
+        return 2;
+    }
+    if (block_width_multiple < 1) block_width_multiple = 1;
+
+    int64_t block_max_members = 256;
+    if (bmaxm_s && *bmaxm_s && parse_int64_arg(bmaxm_s, &block_max_members) != 0) {
+        fprintf(stderr, "serve: bad --block-max-members\n");
+        return 2;
+    }
+    if (block_max_members < 1) block_max_members = 1;
+
+    int64_t block_min_q_width = 0;   /* 0 = target/4 */
+    if (bminw_s && *bminw_s && parse_int64_arg(bminw_s, &block_min_q_width) != 0) {
+        fprintf(stderr, "serve: bad --block-min-q-width\n");
+        return 2;
+    }
+    if (block_min_q_width < 0) block_min_q_width = 0;
+
+    int64_t block_attempt_ceiling = 2;
+    if (bceil_s && *bceil_s && parse_int64_arg(bceil_s, &block_attempt_ceiling) != 0) {
+        fprintf(stderr, "serve: bad --block-attempt-ceiling\n");
+        return 2;
+    }
+    if (block_attempt_ceiling < 1) block_attempt_ceiling = 1;
+    /* The ceiling is what guarantees a workunit can never be poisoned by
+     * block-scale evidence alone: past it a range drops out of block
+     * eligibility and can only take further strikes one individual lease at a
+     * time. At or above --max-attempts that guarantee is gone and one flaky
+     * host can poison a contiguous region in a handful of lease windows. */
+    if (block_attempt_ceiling >= max_attempts) {
+        int64_t capped = max_attempts > 1 ? max_attempts - 1 : 1;
+        fprintf(stderr, "serve: --block-attempt-ceiling %lld >= --max-attempts "
+                        "%lld; capping to %lld so block failures alone cannot "
+                        "poison a workunit\n",
+                (long long)block_attempt_ceiling, (long long)max_attempts,
+                (long long)capped);
+        block_attempt_ceiling = capped;
+    }
+
     char *db_path = path_join(jobdir, "job.db");
     if (!db_path) return 1;
 
     server_ctx_t ctx = {0};
+    ctx.block_width_multiple  = block_width_multiple;
+    ctx.block_max_members     = block_max_members;
+    ctx.block_min_q_width     = block_min_q_width;
+    ctx.block_attempt_ceiling = block_attempt_ceiling;
     ctx.db = db_open(db_path);
     if (!ctx.db) { free(db_path); return 1; }
 

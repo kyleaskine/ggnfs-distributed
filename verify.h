@@ -81,6 +81,25 @@ typedef struct {
     int64_t            sampled_from; /* output: # accepted relations seen */
 } verify_reservoir_t;
 
+/* Optional per-member relation counting, for a block submission.
+ *
+ * `bounds` holds n_members+1 ascending values: every member's q_start, then
+ * the block's exclusive q_end. `counts` (n_members entries, caller-zeroed)
+ * receives how many ACCEPTED relations bucketed to each member.
+ *
+ * A relation is attributed to the member containing the SMALLEST of its
+ * sieved-side primes that falls in the block's range. That is a heuristic —
+ * lasieve4 does not mark which prime is the special-q, and a second prime can
+ * land in the window by chance — but it only ever has to answer "did this
+ * sub-range produce anything at all", and every member of a real block carries
+ * thousands of relations. A handful mis-attributed to a neighbour cannot empty
+ * one. */
+typedef struct {
+    const int64_t *bounds;
+    int            n_members;
+    int64_t       *counts;
+} verify_coverage_t;
+
 /* Stream a relation file from disk. Optionally check each parsed relation
  * against `check`, and optionally reservoir-sample fully-accepted relations
  * into `reservoir`. Returns 0 on success (file readable), -1 on I/O error.
@@ -102,6 +121,7 @@ typedef struct {
 int verify_parse_file_check(const char *path,
                             const verify_check_t *check,
                             verify_reservoir_t *reservoir,
+                            verify_coverage_t  *coverage,
                             int64_t *out_parsed,
                             int64_t *out_failed,
                             int64_t *out_q_violations,

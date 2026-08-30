@@ -165,9 +165,23 @@ int main(int argc, char **argv)
                     check_buf.side    = wu.side;
                     check_ptr = &check_buf;
                 } else if (rc == 1) {
-                    fprintf(stderr,
-                            "%s: workunit id '%s' not in jobdb; skipping q-range check for this file\n",
-                            path, wid);
+                    /* A GPU block's file is named after the BLOCK, so the id
+                     * derived from the filename is not a workunit. Without
+                     * this, every block file — the largest in the campaign —
+                     * quietly loses its q-range check and still prints PASS. */
+                    db_block_t blk;
+                    int brc = db_block_get(db, wid, &blk);
+                    if (brc == 0) {
+                        check_buf.q_start = blk.q_start;
+                        check_buf.q_range = blk.q_end - blk.q_start;
+                        check_buf.side    = blk.side;
+                        check_ptr = &check_buf;
+                    } else {
+                        fprintf(stderr,
+                                "%s: id '%s' is neither a workunit nor a block in "
+                                "jobdb; skipping q-range check for this file\n",
+                                path, wid);
+                    }
                 } else {
                     fprintf(stderr,
                             "%s: db error looking up '%s'; skipping q-range check for this file\n",

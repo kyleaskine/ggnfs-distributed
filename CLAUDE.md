@@ -40,6 +40,8 @@ Vendored sources are compiled with `-w` and a pile of `-DSQLITE_*` / `-DMG_*` fl
 
 # 2. Serve
 ./ggnfs-sieve-server serve --jobdir=/tmp/ggnfs-job --bind=127.0.0.1 --port=8080
+#    GPU block sizing (see "GPU clients"): --block-width-multiple=50
+#    --block-max-members=256 --block-attempt-ceiling=2
 
 # 3. Add more workunits later without restarting state. The new [qmin, qmax) can
 #    sit above, below, or in a gap between existing workunits — any non-overlapping
@@ -118,63 +120,177 @@ All JSON encode/decode lives here so `server.c` and `client.c` don't both link c
 
 Full design and rationale in `GPU-CLIENT.md`. The parts that span files:
 
-**Class is a property of the workunit; engine is a property of the client.**
-`class` (`cpu`/`gpu`) controls only *sizing*, and therefore lease safety.
-`--engine` decides which binary a client runs. They are independent, which is
-what lets a GPU client fall back to cpu-class bands when the GPU band runs dry
-without either side knowing about the other. `db_lease` encodes the asymmetry:
-**`gpu` falls back to `cpu`, `cpu` never takes `gpu`** — a single core needs
-~43 h for a 100x band, so it would time out and poison the workunit.
+**Sizing is a property of the LEASE, not of the workunit.** Workunits stay
+canonical at one base width forever. A GPU client asks for a **block**: one
+lease held over N contiguous `available` workunits. Nothing is merged, nothing
+is resized, and every member keeps its own row and its own `attempt_count`.
 
-**Sizing.** A GPU is order 400x a single core on this job, so a normal
-1000-wide workunit is only a few seconds of GPU time and per-workunit overhead
-dominates. Carve GPU bands ~100x wider:
+This replaced v1's `class`-sized rows, where `gpu` meant a workunit ~50x wider.
+That conflated the unit of *work* with the unit of *assignment* and every
+problem it had followed from that: a wide band left behind when a card
+disconnected was unreachable by the CPU fleet, and a lease expiry permanently
+demoted its q-range to un-mergeable. `recarve` and the gpu→cpu lease fallback
+existed to paper over both and are gone; `extend --class=gpu` now refuses.
+`workunits.class` survives as an unused column (removing it would be a
+migration against a live 430K-row DB) and `clients.last_class` is still what
+labels a row on the dashboard.
 
-```
-./ggnfs-sieve-server extend --jobdir=... --class=gpu \
-    --qmin=... --qmax=... --qrange=100000 \
-    --gpu-args="--logI 17 --J 16384"
-```
+**Blocks are addressed by their ANCHOR workunit** — the lowest-q member, a real
+workunit id. `gpu_blocks.id` (`blk-<jobhash>-NNNNNN`) is internal. This is why
+`/lease`, `/submit`, `/renew`, `/release`, `workunit_id_is_safe_for_job` and the
+client's whole sieve path needed no change: a block arrives through the ordinary
+`workunit_id` / `q_start` / `q_range` fields and just looks like a wider band.
 
-**`gpu_args` is not a translation of `siever_args`.** `-J 16` is lasieve4
-vocabulary; `--logI 17 --J 16384` is cuda-sieve's, and per cuda-sieve finding
-69 they describe *different sieve areas* (`2^17 x 2^15` vs `2^17 x 2^14`). The
-lease response ships both and the client picks by its own `--engine`. `serve`
-reads `gpu_args` from `meta` **once at startup**, so changing it needs a
-`serve` restart — `extend` says so when you set it.
+**Membership is derived, not stored.** There is deliberately no
+`workunits.block_id`. A block's members are exactly the rows with
+`q_start` in `[q_start, q_end)`, which is exact because a block is always a
+contiguous run and no second block can form over rows that are not `available`.
+A column would have to be cleared on five terminal paths and would silently
+strand rows if any were missed — the same one-way ratchet blocks exist to
+remove. `gpu_blocks.state` is the single source of truth for "is this block
+live".
 
-**Lease heartbeat.** `POST /renew` pushes `lease_expires` out; the client
-heartbeats at a third of the lease window, through the sieve *and* the upload,
-and a pipelined worker heartbeats every held lease, not just the one on the
-card. This is what makes one `--lease-seconds` safe across wildly different
-band sizes. A 409 means the workunit was reclaimed and reissued, so the client
-abandons the band immediately rather than sieving for hours into a certain
-rejection.
+**Block width is derived from the job, not configured absolutely:**
+
+> `target = --block-width-multiple (default 50) x db_workunit_base_q_range()`
+
+Base q_range is already normalised to wall clock — an operator picks `--qrange`
+so one workunit is a sane slice of a *core* — and a GPU is a roughly
+job-independent multiple of a core (~42x measured), so a fixed multiple holds
+the GPU band near a constant wall-clock target across jobs of any size. A
+hardcoded width would be a 3-minute band on one job and hours on the next.
+`db_workunit_base_q_range` is a 38 ms full index scan on a 390K-row jobdir, so
+`serve` caches it with a 60 s TTL (`base_q_range_cached`) — long enough to be
+free, short enough that `extend` under a running server is picked up.
+
+Measured on prod (RTX 5070 vs a 9800X3D core, same 1,000-wide work): 22% of
+every GPU band is fixed cuda-sieve startup, and the card sits 88% busy at
+`--prefetch=2`. At 50x both collapse — startup to 0.6%, latency hidden behind a
+~16 min band — taking the card from **176 to ~255 rel/sec**. 20x already gets
+252.9, so the last 30x buys under 1%; the reason to go further is 2.5x fewer
+lease/submit transactions on the single event-loop thread as the fleet grows,
+and the cost is reclaim granularity, since there is no partial submit.
+
+**Poisoning: failure state lives on the workunit, never on the block.**
+`gpu_blocks` has no `attempt_count`. A lease expiry or a verify failure charges
+every member one strike, which without a brake would let one flaky host poison a
+contiguous 50-workunit region in five lease windows. `--block-attempt-ceiling`
+(default 2, forced below `--max-attempts` at startup) breaks the *re-lease loop*
+instead: past the ceiling a range is no longer block-eligible and degrades to
+individual leases. **The invariant: at most `ceiling` of a workunit's strikes
+can come from block-scale evidence, so nothing is ever poisoned without
+`max_attempts - ceiling` failures that were specifically about that one
+base-width range.**
+
+**Sweep ordering is load-bearing.** `db_block_expire_sweep` MUST run before
+`db_lease_expire_sweep` in `on_sweep_timer`. The block sweep returns expired
+members to `available`, and the row sweep's own `state = 'leased'` test then
+excludes them. Reverse the two and every member is incremented twice.
+
+**`idx_wu_lease_v2(state, q_start, q_range)` is required.** The block scan
+cannot constrain `class`, and without a class equality the older
+`idx_wu_lease(state, class, q_start, q_range)` stops ordering usefully —
+`EXPLAIN QUERY PLAN` shows `USE TEMP B-TREE FOR ORDER BY` over all 356K
+available rows, on the mongoose thread, per lease.
+
+**Block relation files are named after the BLOCK, not the anchor:**
+`rels/blk-<jobhash>-NNNNNN.dat.zst`. A block that passes with its lowest-q
+member starved sends that member back to `available`; re-leased individually it
+would submit to `<anchor>.dat.zst` and overwrite the block's file, silently
+discarding the other members' relations. `finalize-nfs.sh` now selects files
+from `submissions WHERE verify_status='passed'` rather than globbing (which also
+stops failed submissions being assembled), and its no-DB fallback globs **both**
+`wu-*` and `blk-*` — dropping `blk-*` there would still find CPU files, so
+nothing would look wrong until filtering came up short. `move-rels.sh` reads
+verified ids from `workunits` *and* `gpu_blocks`.
+
+**Verification treats a block as one wide band.** `db_verify_next_pending` is a
+`UNION ALL`; the per-workunit arm needs `AND s.block_id IS NULL` because a block
+submission stores its anchor in `workunit_id` and would otherwise match both
+arms and be checked against the anchor's base-width q-range. Use `ORDER BY 1` —
+SQLite rejects a qualified column in a compound SELECT's ORDER BY.
+
+**Starved members are found by threshold, not by zero.** Relations are
+attributed to a member by the smallest sieved-side prime inside the block range;
+the file does not record which prime was the special-q, and a relation
+occasionally carries a second in-range prime below its own. Measured on a real
+6-member block with one member's output deliberately omitted, that member still
+attracted **1** stray against a median of 3383 — so a `== 0` test never fires
+and would silently verify a q-range that was never sieved. The rule is
+`count * 20 < median`, applied only when the block as a whole passed.
+Requeueing exactly the starved members is what keeps partial resolution safe:
+the stored file holds no relations for those ranges, so re-sieving cannot
+duplicate assembled work.
+
+**Client side is `--blocks=yes|no`** (default yes under `--engine=cuda`, no
+otherwise — a block is sized for a card and would blow the lease window on one
+core) plus `--block-max-members=N`, which the server clamps. A server that
+predates blocks ignores both and returns an ordinary workunit.
+
+**Lease heartbeat.** `POST /renew` on the anchor pushes every member's
+`lease_expires` out, under the same guards a single workunit gets
+(`state='leased' AND leased_to=? AND lease_expires >= now`). At the default
+`--lease-seconds=3600` a 50x block (~16 min) fits one window with 3.8x headroom
+and needs no renew at all in the common case; blocks only stop fitting past
+~190x.
 
 **Keeping the card busy.** `--prefetch=N` (default 2 under `--engine=cuda`)
-gives a worker N lease slots and runs lease / sieve / submit on separate
-threads. Each slot needs its own `client_id` (`<base>-w0-s0`) because the
-server keeps at most one live lease per `client_id`. Measured against a 1.5 s
-latency proxy with 3 s bands: 44.9% card-busy serial, 78.8% at 2, 96.8% at 3.
+gives a worker N lease slots on separate threads. Each slot needs its own
+`client_id` (`<base>-w0-s0`) because the server keeps at most one live lease per
+`client_id` — and one live *block* per `client_id`, which is what makes a lost
+`/lease` response retried return the same block instead of a second one.
 
-**Factor base.** `--fbgen-gpu=<path to cuda-sieve fbgen_gpu>` builds the
-`--fb1` cache once per `(job sha, logI)` instead of letting `bench` rebuild it
-every workunit (~230 MB on the C208). Keying the filename on `(sha, logI)` is
-why no content probe is needed. `--fb1=<path>` uses a prepared one directly.
+**Geometry is derived from the job's own siever, so you usually set nothing.**
+`-J n` is lasieve4 vocabulary and `--logI/--J` is cuda-sieve's; they are not the
+same words for the same thing, and the axis order differs. cuda-sieve finding 65
+measured the equivalence by inverting the q-lattice from emitted relations:
 
-**Progress is q-width, not workunit count.** With a GPU band ~100x a CPU one,
-"400 of 404 rows done" can mean 50% of the actual sieving. `/stats` exposes
-`workunits.q.*` per state plus per-class rollups, and the dashboard reads
-those.
+| GGNFS | rectangle | cuda-sieve |
+|---|---|---|
+| `I14e` | 2^14 x 2^13 | `--logI 14 --J 8192` |
+| `I14e -J 14` | 2^15 x 2^13 | `--logI 15 --J 8192` |
+| `I16e` | 2^16 x 2^15 | `--logI 16 --J 32768` |
+| `I16e -J 16` | 2^17 x 2^15 | `--logI 17 --J 32768` |
+
+One rule covers all of it, with GGNFS's J_bits defaulting to I-1:
+**`--logI` = J_bits + 1, `--J` = 2^(I-1)** (`derive_gpu_args` in `client.c`).
+
+Precedence: the client's `--gpu-args`, then `meta.gpu_args`, then the
+derivation. A configured value wins — that is operator intent — but the client
+warns when it disagrees with what the campaign's siever implies, because that
+combination is how a card quietly sieves a different area than the CPU fleet for
+a whole campaign. `serve` reads `gpu_args` from `meta` **once at startup**, so
+changing it needs a `serve` restart.
+
+**Non-ASCII in the `.job`.** `init` refuses a `.job` containing bytes cuda-sieve
+cannot parse (CRLF and tabs are fine). This matters because the `.job`'s SHA *is*
+the job's identity — workunit IDs derive from it and `finalize-nfs.sh` compares
+it — so it cannot be corrected afterwards without orphaning the campaign. A live
+job was found carrying a zero-width space after `alambda: 3.6`: lasieve4 ignored
+it for weeks while cuda-sieve refused the file outright. For campaigns already in
+that state the cuda client sieves from a sanitized copy and leaves the
+distributed file byte-exact.
+
+**Factor base.** `--fbgen-gpu=<path to cuda-sieve fbgen_gpu>` builds the `--fb1`
+cache once per `(job sha, logI)` instead of letting `bench` rebuild it every
+workunit (~230 MB on the C208). Keying the filename on `(sha, logI)` is why no
+content probe is needed. `--fb1=<path>` uses a prepared one directly.
+
+**Progress is q-width, not workunit count.** `/stats` exposes `workunits.q.*`
+per state plus per-class rollups, and the dashboard reads those. `q_passed_1h`
+sums `COALESCE(NULLIF(s.q_width,0), w.q_range)` so a block contributes its own
+width rather than its anchor's. Per-client stats use `SUM(s.member_count)` for
+the workunit count and expose **rel/sec** (`SUM(relations)/SUM(sieve_seconds)`),
+which is the only column that compares engines honestly — rel/wu puts a card and
+a core 35% apart, rel/sec shows the 42x.
 
 **Screening a GPU box.** `ggnfs-sieve-client benchmark --engine=cuda
---cuda-bench=... --fb1=...` times one fixed-width band on the card. Like the
-CPU benchmark it takes no lease and never submits, so it is safe against a
-live coordinator. `cuda-client.sh` bootstraps a GPU worker and writes both
-`run-cuda-client.sh` and `benchmark-gpu.sh` (all three generated/deployment
-scripts are gitignored; `cuda-client.sh` itself is tracked because it prompts
-for server and token rather than baking them in, unlike `ggnfs-client.sh`,
-which is untracked for exactly that reason).
+--cuda-bench=... --fb1=...` times one fixed-width band on the card. Like the CPU
+benchmark it takes no lease and never submits, so it is safe against a live
+coordinator. `cuda-client.sh` bootstraps a GPU worker and writes
+`run-cuda-client.sh` and `benchmark-gpu.sh`. Like `ggnfs-client.sh` it bakes in
+the live server and token, so all of them are gitignored and deployed by copying
+to the webserver rather than by being cloned.
 
 ## Things that have bitten people (load-bearing detail)
 
@@ -186,5 +302,15 @@ which is untracked for exactly that reason).
 - The server has no graceful shutdown today (`for (;;) mg_mgr_poll(...)`); the cleanup code below the loop — including `verify_thread_stop` — is unreachable. SIGINT just kills it. The DB is in WAL mode so this is fine. (Tracked in `FUTURE.md`.)
 - **cuda-sieve's `--qrange MIN:MAX` is INCLUSIVE of MAX**, while a workunit is the half-open `[q_start, q_start+q_range)` and `verify.c` enforces that. `sieve_run_cuda` therefore passes `q_start + q_range - 1`. Get it wrong and every band whose top edge happens to be prime fails verification, requeues, and eventually poisons — while looking like a cuda-sieve bug. Pinned by `sqgen_create` in `cuda-sieve/bench/fbgen.c` and its `inclusive_single_prime` test.
 - `VERIFY_MAX_PRIMES_PER_SIDE` counts primes **with multiplicity** — a relation lists a prime once per division, so it bounds factorisation *length*, not distinct primes. It is 64, matching cuda-sieve's `TD_FMAX`. It was 32, and real cuda-sieve output reaches 35 (a 224-bit algebraic norm carrying thirteen factors of 2); gnfs-lasieve4 peaks at 13 on this job, which is why 32 survived so long. One over-length line fails the whole submission, so this presents as every GPU workunit failing.
-- The verifier's spot-check sample size scales with `q_range` against the job's **most common** band width, read live from the workunits table (`db_workunit_base_q_range`). It is derived rather than configured because the normal GPU rollout is `extend --class=gpu` onto a campaign whose `meta` predates all of this.
+- The verifier's spot-check sample size scales with `q_range` against the job's **most common** band width, read live from the workunits table (`db_workunit_base_q_range`). It is derived rather than configured because a GPU block's width is many times the base and its `meta` may predate all of this.
+- **`db_block_expire_sweep` must run before `db_lease_expire_sweep`.** That ordering is the *only* thing keeping the per-workunit sweep off block members; reversing it double-increments every member's `attempt_count`.
+- **A block's relation file is named after the block, not its anchor.** Anchor naming looks fine until a block passes with its lowest-q member starved: that member is requeued, re-sieved on its own, and its submission overwrites the block's file — silently discarding the other members' relations, with nothing visibly wrong until filtering comes up short.
+- **Starved-member detection compares relation DENSITY, and falls back to the max when the median is 0.** Raw counts requeue a legitimately-sieved narrow member when a block mixes band widths (normal after an `extend --qrange=N` at a different N). And a `median > 0` guard turns the check off exactly when it matters most: if over half a block's members produced nothing — a truncated siever run — the median is 0, the check is skipped, and every unsieved sub-range is marked `verified` and lost for the rest of the campaign.
+- **`/submit` stages to a temp file and renames only after the DB accepts.** Writing straight to the final name lets a client whose lease has lapsed clobber the file of whoever the sweep reissued the workunit to, and the 409 path then `unlink()`s it — destroying a submission that was already recorded. `db_submit` also carries `AND leased_to = ?` for the same reason.
+- **A partial `/renew` on a block answers 409, not 200.** `db_block_submit` requires every member, so a block that lost one to the sweep can never be submitted; answering 200 leaves the card sieving a dead band for another quarter hour.
+- **`db_block_lease` refuses when the client already holds an ordinary workunit.** It runs before `db_lease`, so without that check a slot whose block scan found no run — then retried after a run appeared — ends up holding two concurrent leases, the single workunit never heartbeated and eventually charged an attempt.
+- **`init --class=gpu` is refused as well as `extend --class=gpu`.** Guarding one entry point leaves the hazard reachable from the other.
+- **`finalize-nfs.sh`'s fallback glob must match `blk-*` as well as `wu-*`.** Dropping `blk-*` still finds every CPU file, so `total` stays non-zero and no error fires while the whole GPU contribution is missing.
+- **The per-workunit arm of `db_verify_next_pending` needs `AND s.block_id IS NULL`.** A block submission stores its anchor in `workunit_id`, so without the guard it matches both `UNION ALL` arms, the per-workunit arm wins on equal `s.id`, and the block is verified against a base-width q-range — most relations count as `qviol`, only the anchor is requeued, and the other members sit in `submitted` forever because the sweep only touches `leased`.
+- **The Makefile has no header dependency tracking.** Only `server.o: dashboard_html.h` is declared, so editing `db.h`, `protocol.h` or `verify.h` does not rebuild dependents. Force a clean rebuild after touching a header or you will link stale objects against a changed struct layout.
 - The siever's `-c` (in `sieve_run_local`, and `benchmark --qrange`) is a special-q interval **width**, not a count of special-q — the same unit as a workunit's `q_range`. The window `[f, f+c)` holds ~`c/ln(q)` prime special-q. A `-c` narrower than ~`ln(q)` contains no prime, so the siever does zero work and yields **0 relations in ~2s** (all `sieve:` counters 0) — a failure that mimics a broken job/siever/cache. This is why `benchmark --qrange` defaults to 65 (~3 special-q at q≈80M, ~1 min single-core), not a small number.

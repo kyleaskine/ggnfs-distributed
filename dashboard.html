@@ -67,10 +67,9 @@
       <th class="num">workers</th>
       <th>class</th>
       <th>last seen</th>
-      <th class="num">workunits</th>
       <th class="num">relations</th>
+      <th class="num">rel/sec</th>
       <th class="num">rel/wu</th>
-      <th class="num">avg sec</th>
       <th class="num">fail</th>
       <th>current</th>
     </tr></thead>
@@ -165,8 +164,13 @@
     return String(id || '').replace(/-w[0-9]+(-s[0-9]+)?$/, '');
   }
 
-  function weightedAvg(totalSeconds, count) {
-    return count > 0 ? totalSeconds / count : 0;
+  // rel/sec is the only column that compares engines honestly. rel/wu makes a
+  // GPU look 35% better than a core; rel/sec shows the 42x it actually is,
+  // because it does not care how wide a band is.
+  function relPerSec(v) {
+    if (!v) return '&mdash;';
+    return v >= 100 ? Math.round(v).toLocaleString()
+                    : v.toFixed(v >= 10 ? 1 : 2);
   }
 
   function relationsPerWorkunit(relations, workunits) {
@@ -192,7 +196,7 @@
           submissions: 0,
           relations: 0,
           total_failures: 0,
-          avg_total_seconds: 0,
+          rel_per_sec: 0,
           current_count: 0,
           klass: '',
           workers: []
@@ -207,7 +211,18 @@
       g.submissions += submissions;
       g.relations += c.relations || 0;
       g.total_failures += c.total_failures || 0;
-      g.avg_total_seconds += (c.avg_sieve_seconds || 0) * submissions;
+      // Box throughput is the SUM of its workers' rates, not relations divided
+      // by summed seconds. Workers run in parallel, so their sieve_seconds
+      // overlap in wall clock: 8 cores each doing R relations in T seconds is
+      // 8R/8T = R/T that way — an 8-core box reading the same as one core, and
+      // the collapsed row showing exactly what each expanded worker row shows.
+      // Summing rates gives the 8x that is actually true.
+      //
+      // The exception is GPU prefetch slots, which are separate client ids on
+      // ONE card and really do serialise: measured on prod, two slots at
+      // ~200 rel/s each delivered 176 from the card. A box row there reads
+      // high. Per-worker rows are exact in both cases.
+      g.rel_per_sec += c.rel_per_sec || 0;
       if (c.current_workunit) g.current_count++;
       // A box whose workers disagree about class is worth seeing: it usually
       // means one of them was started with the wrong --lease-class.
@@ -215,7 +230,7 @@
       if (wc) g.klass = (!g.klass || g.klass === wc) ? wc : 'mixed';
     }
     for (var j = 0; j < groups.length; j++) {
-      groups[j].avg_sieve_seconds = weightedAvg(groups[j].avg_total_seconds, groups[j].submissions);
+      // rel_per_sec was accumulated as a sum of worker rates above.
       groups[j].workers.sort(function (a, b) {
         return String(a.id).localeCompare(String(b.id), undefined, { numeric: true });
       });
@@ -339,7 +354,7 @@
     var clients = s.clients || [];
     if (clients.length === 0) {
       var tr = document.createElement('tr');
-      tr.innerHTML = '<td colspan="10" class="warn">no clients have connected yet</td>';
+      tr.innerHTML = '<td colspan="9" class="warn">no clients have connected yet</td>';
       tbody.appendChild(tr);
     } else {
       var groups = groupClients(clients);
@@ -356,10 +371,9 @@
           '<td class="num">' + fmt(c.workers.length) + '</td>' +
           '<td>' + escapeHtml(c.klass || '') + '</td>' +
           '<td>' + ageText(c.last_seen) + '</td>' +
-          '<td class="num">' + fmt(c.submissions) + '</td>' +
           '<td class="num">' + fmt(c.relations) + '</td>' +
+          '<td class="num">' + relPerSec(c.rel_per_sec) + '</td>' +
           '<td class="num">' + relationsPerWorkunit(c.relations, c.submissions) + '</td>' +
-          '<td class="num">' + (c.avg_sieve_seconds || 0).toFixed(1) + '</td>' +
           '<td class="num">' + (c.total_failures ? c.total_failures : '') + '</td>' +
           '<td>' + escapeHtml(current) + '</td>';
         tbody.appendChild(tr);
@@ -373,10 +387,9 @@
               '<td class="num">1</td>' +
               '<td>' + escapeHtml(wkr["class"] || '') + '</td>' +
               '<td>' + ageText(wkr.last_seen) + '</td>' +
-              '<td class="num">' + fmt(wkr.submissions) + '</td>' +
               '<td class="num">' + fmt(wkr.relations) + '</td>' +
+              '<td class="num">' + relPerSec(wkr.rel_per_sec) + '</td>' +
               '<td class="num">' + relationsPerWorkunit(wkr.relations, wkr.submissions) + '</td>' +
-              '<td class="num">' + (wkr.avg_sieve_seconds || 0).toFixed(1) + '</td>' +
               '<td class="num">' + (wkr.total_failures ? wkr.total_failures : '') + '</td>' +
               '<td>' + escapeHtml(wkr.current_workunit || '') + '</td>';
             tbody.appendChild(wr);

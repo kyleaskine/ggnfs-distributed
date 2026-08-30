@@ -18,6 +18,7 @@ rels/
 /.agents
 *.job
 C191-ggnfs-client.sh
+cuda-client.sh
 ggnfs-client.sh
 run-client.sh
 run-cuda-client.sh
