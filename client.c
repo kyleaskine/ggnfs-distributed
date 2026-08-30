@@ -588,6 +588,7 @@ typedef struct client_cfg_s {
     char        cuda_bench[256];        /* cuda-sieve `bench` binary */
     char        fb1_path[256];          /* explicit --fb1 cache; "" = none */
     char        fbgen_gpu[256];         /* fbgen_gpu binary to build one with */
+    char        gpu_args_override[192]; /* --gpu-args: beats the server's */
     int         cuda_device;            /* -1 = let bench choose */
     /* Lease slots per worker. >1 runs the pipelined worker, which keeps the
      * card sieving across lease round trips and uploads. */
@@ -619,6 +620,10 @@ static void usage(void)
         "                                   cache once per job. Without either, bench\n"
         "                                   rebuilds the factor base every workunit\n"
         "    [--device=N]                   CUDA device index (default: bench chooses)\n"
+        "    [--gpu-args=<flags>]           override the geometry for this client, e.g.\n"
+        "                                   \"--logI 16 --J 32768\". Without it the server's\n"
+        "                                   gpu_args is used, and failing that the\n"
+        "                                   rectangle is derived from the job's siever\n"
         "    [--prefetch=N]                 lease slots per worker (default: 2 under\n"
         "                                   --engine=cuda, else 1). >1 overlaps leasing\n"
         "                                   and uploading with sieving\n"
@@ -684,6 +689,10 @@ static int parse_config(int argc, char **argv, client_cfg_t *cfg)
     const char *fb1 = flag(argc, argv, "--fb1");
     if (fb1 && *fb1)
         snprintf(cfg->fb1_path, sizeof(cfg->fb1_path), "%s", fb1);
+
+    const char *gargs = flag(argc, argv, "--gpu-args");
+    if (gargs)
+        snprintf(cfg->gpu_args_override, sizeof(cfg->gpu_args_override), "%s", gargs);
 
     const char *fbgen = flag(argc, argv, "--fbgen-gpu");
     if (fbgen && *fbgen)
@@ -1153,6 +1162,77 @@ static void ensure_afb_cached(const client_cfg_t *cfg,
  *   -1  - 410 Gone (job complete, caller should exit)
  *   -2  - other error (caller should backoff)
  */
+/* ---- cuda-sieve geometry ------------------------------------------------
+ *
+ * Derive cuda-sieve's rectangle from the gnfs-lasieve4 settings the campaign
+ * already runs, so a GPU joining an existing job sieves the same area the CPU
+ * fleet does without anyone having to hand-translate it.
+ *
+ * The mapping is measured, not inferred: cuda-sieve finding 65 recovered the
+ * rectangle each siever actually covers by inverting the q-lattice from the
+ * emitted relations, and confirmed it on two binaries. GGNFS's `-J n` sets
+ * J_bits exactly as its help text says, but the axis order is swapped
+ * relative to ours, so in OUR coordinates it widens i and leaves j alone:
+ *
+ *     I14e          2^14 x 2^13      I14e -J 14    2^15 x 2^13
+ *     I15e          2^15 x 2^14      I15e -J 15    2^16 x 2^14
+ *
+ * Both rows fit one rule, with J_bits defaulting to I-1 when -J is absent:
+ *
+ *     --logI = J_bits + 1        --J = 2^(I-1)
+ *
+ * which also reproduces I16e -> 2^16 x 2^15 and I16e -J 16 -> 2^17 x 2^15.
+ *
+ * Returns 0 and fills `out` on success; -1 if the siever name is not
+ * gnfs-lasieve4I<N>e, in which case the caller should not guess.
+ */
+static int derive_gpu_args(const char *siever, const char *siever_args,
+                           char *out, size_t out_n)
+{
+    if (!siever) return -1;
+    const char *p = strstr(siever, "lasieve4I");
+    if (!p) return -1;
+    p += strlen("lasieve4I");
+    char *end = NULL;
+    long I = strtol(p, &end, 10);
+    /* The suffix letter (the 'e' of I16e) selects the implementation, not the
+     * geometry, so anything from I11e to I20e maps the same way. */
+    if (end == p || I < 11 || I > 20) return -1;
+
+    long jbits = I - 1;                       /* GGNFS's default */
+    if (siever_args) {
+        const char *j = strstr(siever_args, "-J");
+        if (j) {
+            j += 2;
+            while (*j == ' ' || *j == '\t' || *j == '=') j++;
+            char *jend = NULL;
+            long v = strtol(j, &jend, 10);
+            if (jend != j && v >= 8 && v <= 24) jbits = v;
+        }
+    }
+
+    snprintf(out, out_n, "--logI %ld --J %ld", jbits + 1, 1L << (I - 1));
+    return 0;
+}
+
+/* The geometry a lease should actually be sieved with, in precedence order:
+ * an explicit client-side --gpu-args, then the server's meta.gpu_args, then
+ * the rectangle derived from the campaign's own siever settings. Returns ""
+ * only when the siever name is unrecognised and nothing was configured. */
+static const char *effective_gpu_args(const client_cfg_t *cfg,
+                                      const proto_lease_response_t *lease,
+                                      char *buf, size_t buf_n)
+{
+    if (cfg->gpu_args_override[0]) return cfg->gpu_args_override;
+    if (lease->gpu_args[0])        return lease->gpu_args;
+
+    if (derive_gpu_args(lease->siever, lease->siever_args, buf, buf_n) == 0)
+        return buf;
+
+    buf[0] = '\0';
+    return buf;
+}
+
 /* ---- cuda-sieve poly input --------------------------------------------
  *
  * cuda-sieve parses the .job more strictly than gnfs-lasieve4 does, and a
@@ -1276,6 +1356,7 @@ static int64_t job_alim(const char *job_path)
 static const char *ensure_gpu_fb_cached(const client_cfg_t *cfg,
                                         const proto_lease_response_t *lease,
                                         const char *job_local,
+                                        const char *gpu_args,
                                         struct mg_mgr *mgr)
 {
     /* An explicit --fb1 is the operator's call and is used as given. */
@@ -1289,7 +1370,7 @@ static const char *ensure_gpu_fb_cached(const client_cfg_t *cfg,
      * restart, which does not restart the clients. Short-circuiting on
      * g_fb1_ready before computing the key would keep feeding bench an
      * --fb1 built at the old maxbits alongside the new --logI. */
-    int logI = gpu_args_logI(lease->gpu_args);
+    int logI = gpu_args_logI(gpu_args);
 
     char cache[320];
     snprintf(cache, sizeof(cache), "%s/%.16s.roots1.m%d",
@@ -1690,6 +1771,7 @@ typedef struct {
     char                    job_local[256];
     char                    job_poly[300];   /* what bench gets; == job_local
                                               * unless sanitising was needed */
+    char                    gpu_args[192];   /* resolved geometry for this band */
     const char             *fb1;         /* cuda only; owned by the FB cache */
     char                   *outfile;     /* malloc'd */
     double                  sieve_seconds;
@@ -1732,7 +1814,7 @@ static int stage_acquire(struct mg_mgr *mgr, pipe_slot_t *slot)
            (long long)slot->lease.q_range,
            slot->lease.side, engine_name(cfg->engine),
            (cfg->engine == ENGINE_CUDA)
-               ? (slot->lease.gpu_args[0]    ? slot->lease.gpu_args    : "(none)")
+               ? "(cuda; geometry resolved below)"
                : (slot->lease.siever_args[0] ? slot->lease.siever_args : "(none)"));
     active_lease_set(slot->active_idx, slot->lease.workunit_id, cfg->client_id);
 
@@ -1749,10 +1831,18 @@ static int stage_acquire(struct mg_mgr *mgr, pipe_slot_t *slot)
      * takes the equivalent as --fb1. Both the factor-base generator and bench
      * share the strict poly parser, so both get the sanitized path. */
     if (cfg->engine == ENGINE_CUDA) {
-        char poly[300];
+        char poly[300], derived[192];
         snprintf(slot->job_poly, sizeof(slot->job_poly), "%s",
                  cuda_job_file(slot->job_local, poly, sizeof(poly)));
-        slot->fb1 = ensure_gpu_fb_cached(cfg, &slot->lease, slot->job_poly, mgr);
+        snprintf(slot->gpu_args, sizeof(slot->gpu_args), "%s",
+                 effective_gpu_args(cfg, &slot->lease, derived, sizeof(derived)));
+        if (slot->gpu_args[0] == '\0') {
+            fprintf(stderr, "client: no gpu_args and cannot derive a rectangle "
+                    "from siever '%s'; bench will use its own default geometry, "
+                    "which is NOT this job's\n", slot->lease.siever);
+        }
+        slot->fb1 = ensure_gpu_fb_cached(cfg, &slot->lease, slot->job_poly,
+                                         slot->gpu_args, mgr);
     } else {
         snprintf(slot->job_poly, sizeof(slot->job_poly), "%s", slot->job_local);
         ensure_afb_cached(cfg, &slot->lease, slot->job_local);
@@ -1821,7 +1911,7 @@ static int stage_sieve(struct mg_mgr *mgr, pipe_slot_t *slot)
                                   (uint32_t)slot->lease.q_start,
                                   (uint32_t)slot->lease.q_range,
                                   slot->lease.side,
-                                  slot->lease.gpu_args,
+                                  slot->gpu_args,
                                   slot->fb1,
                                   cfg->cuda_device,
                                   should_cancel_siever,
@@ -2710,8 +2800,15 @@ static int run_benchmark_cuda(client_cfg_t *cfg, struct mg_mgr *mgr,
     char card[256];
     gpu_describe(card, sizeof(card));
     printf("card       : %s\n", card[0] ? card : "(nvidia-smi unavailable)");
-    printf("gpu args   : %s\n", lease->gpu_args[0] ? lease->gpu_args : "(none)");
-    if (!lease->gpu_args[0]) {
+
+    char derived[192];
+    const char *gargs = effective_gpu_args(cfg, lease, derived, sizeof(derived));
+    const char *gsrc  = cfg->gpu_args_override[0] ? "--gpu-args"
+                      : lease->gpu_args[0]        ? "server meta.gpu_args"
+                      : gargs[0]                  ? "derived from the job's siever"
+                                                  : "none";
+    printf("gpu args   : %s   [%s]\n", gargs[0] ? gargs : "(none)", gsrc);
+    if (!gargs[0]) {
         /* Without the job's geometry bench falls back to its own default
          * (logI 15), which sieves a different area than the campaign does —
          * so the relation count is not the job's and the number is not
@@ -2719,10 +2816,11 @@ static int run_benchmark_cuda(client_cfg_t *cfg, struct mg_mgr *mgr,
          * we think we are using, so it would be built for the wrong maxbits.
          * This corrupts the measurement rather than merely slowing it. */
         fprintf(stderr,
-                "benchmark: WARNING — the server publishes no gpu_args, so "
-                "bench will run at its OWN default geometry, not this job's. "
-                "The result is not comparable across boxes. Set it with "
-                "`extend --gpu-args=\"...\"` and restart serve.\n");
+                "benchmark: WARNING — no gpu_args, and the rectangle could not "
+                "be derived from siever '%s', so bench will run at its OWN "
+                "default geometry rather than this job's. The result is not "
+                "comparable across boxes. Pass --gpu-args=\"...\".\n",
+                lease->siever);
     }
     fflush(stdout);
 
@@ -2735,7 +2833,7 @@ static int run_benchmark_cuda(client_cfg_t *cfg, struct mg_mgr *mgr,
     fflush(stdout);
     struct timeval f0, f1;
     gettimeofday(&f0, NULL);
-    const char *fb1 = ensure_gpu_fb_cached(cfg, lease, job_local, mgr);
+    const char *fb1 = ensure_gpu_fb_cached(cfg, lease, job_local, gargs, mgr);
     gettimeofday(&f1, NULL);
     printf("factor base: %.1fs (%s)\n", elapsed_seconds(f0, f1),
            fb1 ? "cache ready" : "none — bench will build it in-process");
@@ -2760,7 +2858,7 @@ static int run_benchmark_cuda(client_cfg_t *cfg, struct mg_mgr *mgr,
     bench_cancel_t cc = { .deadline_ms = monotonic_ms() + cap_ms };
     int rc = sieve_run_cuda(cfg->cuda_bench, job_local, outfile,
                             base_q, qwidth, lease->side,
-                            lease->gpu_args, fb1, cfg->cuda_device,
+                            gargs, fb1, cfg->cuda_device,
                             bench_should_cancel, &cc);
     gettimeofday(&t1, NULL);
     double secs = elapsed_seconds(t0, t1);
@@ -2932,9 +3030,15 @@ static int run_benchmark(int argc, char **argv, client_cfg_t *cfg)
                     "results reflect the binary you gave.\n", lease.siever, siever_basename);
         }
     }
-    printf("anchor q   : %u%s  side=%c  args=\"%s\"\n",
-           base_q, q_override ? " (--q)" : " (q_min)", side,
-           cfg->engine == ENGINE_CUDA ? lease.gpu_args : siever_args);
+    /* Under cuda the geometry is resolved inside run_benchmark_cuda (which
+     * prints it with its source), so don't pre-announce a possibly-empty
+     * meta value here. */
+    if (cfg->engine == ENGINE_CUDA)
+        printf("anchor q   : %u%s  side=%c\n",
+               base_q, q_override ? " (--q)" : " (q_min)", side);
+    else
+        printf("anchor q   : %u%s  side=%c  args=\"%s\"\n",
+               base_q, q_override ? " (--q)" : " (q_min)", side, siever_args);
     fflush(stdout);
 
     char job_local[256];
