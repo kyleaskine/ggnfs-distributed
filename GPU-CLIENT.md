@@ -783,14 +783,39 @@ block-aware or a reconnecting client gets one member back instead of its block.
 request lease the entire remaining campaign; `members: 0` inserts a block row
 with `member_count = 0` and undefined `q_start`/`q_end`.
 
-**Scan direction is per lease kind, not global.** `ctx.lease_desc` is read once
-from `meta.lease_order` into a single job-wide flag (server.c:1583), so setting
-it to `desc` flips the *CPU* fleet too and the "start at opposite ends"
-property never materialises. Block leases descend; workunit leases keep
-following `meta.lease_order`. Note that under DESC the contiguous prefix runs
-downward, so the block's `q_start` is the **last** row scanned — an
-implementer following an ascending sketch literally will invert
-`q_start`/`q_end`.
+**Scan direction follows `meta.lease_order`, so blocks are carved ALONGSIDE the
+workunit fleet.** This was originally the opposite — blocks descended from the
+top while workunits ascended from the bottom — on the theory that opposite ends
+keep the two out of each other's way. Two things overturned it:
+
+- **Campaigns are stopped, not exhausted.** The last one ran 80M-510M and was
+  halted around 425M. With the fleets at opposite ends, any early stop leaves a
+  hole in the middle. Converging only looks tidy if you sieve to the top.
+- **There is no churn zone to avoid.** `db_lease` consumes strictly in order
+  from whichever end `meta.lease_order` names, so in-flight workunit leases form
+  a solid block just *behind* the frontier and everything ahead stays one
+  unbroken run. Measured on the live 390K-row jobdir under the default `asc`:
+  highest leased 94,309,000, lowest available 94,310,000 — adjacent, zero
+  interleaving, one run of 355,690 ahead. Under `desc` the geometry mirrors and
+  the argument is unchanged.
+
+Working next to the fleet is also **better for reclaiming failures**: holes only
+ever appear behind the frontier (a failed workunit requeues at its own q, which
+the fleet has already passed), so the next lease from either fleet picks them
+up, instead of a failed block sitting stranded at the far end until the CPU
+fleet arrives weeks later.
+
+`--block-lease-order=asc|desc` overrides it for the rare case where separating
+the two is genuinely wanted.
+
+**The direction is the one thing in this function that can silently invert.**
+The run array is stored in scan order, so an index naming the low end going down
+names the *high* end going up. Pick the ends explicitly rather than by index
+convention — `lo = desc ? &run[len-1] : &run[0]` — because a block reporting
+`q_start`/`q_end` backwards passes a smoke test and then fails verification on
+every band. Both mutations (unmirrored ends, unmirrored contiguity test) were introduced
+deliberately and each produced 71 failures in `tests/block_test.c`, which runs
+every geometry case in both directions (`make test`).
 
 ## Renew / release / sweep
 
@@ -986,11 +1011,9 @@ No `gpu_blocks` join anywhere. Per-client stats stay on
 - **rel/sec** = `SUM(num_relations) / SUM(sieve_seconds)` — change the existing
   `AVG` to `SUM`; needs no new data and is the metric that actually compares
   engines
-- rel/wu = `SUM(num_relations) / SUM(member_count)` — now comparable across
-  engines. Measured on prod: **CPU 3,540, GPU 4,780 over the same 1,000-wide
-  range** (+35%, cuda-sieve does not trim `lim` to q). It becomes a geometry
-  health check rather than noise — the two engines should stay in that ratio,
-  and a drift means one of them is sieving a different rectangle.
+- rel/wu = `SUM(num_relations) / SUM(member_count)` — **raw, and NOT comparable
+  across engines.** See "Raw is not unique" below. Useful as a
+  same-engine-over-time health check; useless as an engine comparison.
 
 Dashboard columns: **relations, rel/sec, rel/wu**. Drop `workunits` (derivable)
 and `avg sec` (rel/sec says it better, unit-independent).
@@ -1014,13 +1037,51 @@ next to 34,000 CPU submissions on identical work — a clean A/B.
 
 | | CPU (9800X3D, best core) | GPU (RTX 5070, 2 slots) |
 |---|---|---|
-| rel/sec per worker | 4.8 | 199.7 |
+| rel/sec per worker (raw) | 4.8 | 199.7 |
 | sec per 1,000-wide unit | 735.7 | 23.94 |
-| rel/unit | 3,540 | 4,780 |
+| rel/unit (raw) | 3,540 | 4,780 |
+| rel/unit (unique, est.) | 3,540 | ~3,567 |
 
-**The GPU is ~42x one core.** rel/wu says +35%. This is the case for the
-dashboard change on its own: the column that is currently there understates the
-card by a factor of 30.
+**The GPU is ~42x one core in throughput.** The rel/wu column reads +35%, but
+that is an artefact — see below. The speed figure is the real one, and it is the
+case for the dashboard change on its own: the column that was there understated
+the card by a factor of 30.
+
+### Raw is not unique
+
+**Corrected 2026-08-30, from cuda-sieve's own RUNBOOK.** The +35% rel/wu edge is
+not extra relations. lasieve4 truncates its special-q-side factor base at q, so
+it finds each relation exactly once, at its largest sq-side prime. cuda-sieve
+does not truncate, so it re-finds the same relation at several special-q, and
+its **raw counts are inflated ~1.34x** for the same unique yield. The RUNBOOK is
+explicit: *"Quote unique relations, or quote raw and say so … at matched factor
+bases GGNFS collects more unique relations per special-q than we do."*
+
+The arithmetic closes: 4,780 / 1.34 = **3,567 unique**, against the CPU's 3,616
+in the same 5M q-bucket. Slightly behind, exactly as the RUNBOOK predicts — not
+35% ahead.
+
+The genuine advantage from cuda-sieve's looser survivor gate is measured
+separately, against AS276's real 1.5B-relation GGNFS corpus (RUNBOOK finding
+69): it recovers 3,044 of their 3,045 relations over identical special-q and
+emits 64 of 4,089 — **1.6%** — that exist nowhere in their output. That 1.6% is
+the real figure; the other ~33 points were re-finds.
+
+Consequences, all of which apply to what is built here:
+
+- `/stats` `relations`, `rel/wu` and `rel/sec` all count **raw submitted lines**.
+  A GPU row therefore reads ~1.34x high against a CPU row, on top of any other
+  effect. The dashboard labels both rate columns `(raw)`.
+- Unique yield is only known after msieve dedups at filter time. There is no
+  cheap server-side way to get it: dedup is global across the campaign, not
+  per-submission.
+- `q_passed_1h` and the q-width progress numbers are unaffected — they measure
+  q-width sieved, not relations, which is one more reason progress is reported
+  in q-width rather than relation counts.
+- It weakens the case for moving blocks to low q. cuda-sieve's low-q edge is
+  largely re-finds of relations lasieve4 collects anyway once it reaches those
+  special-q, and *"truncation is yield-neutral only over a band reaching lim"* —
+  which this campaign's does (lim 225M, band 80M-510M).
 
 Three numbers that size v2:
 
@@ -1052,8 +1113,10 @@ conservative end:
 The contiguity number is the one that could have gone wrong and did not: prod
 is a *single* unbroken run of available rows, because the CPU fleet leases
 ascending and consumes from the bottom. Descending block leases therefore carve
-from a pristine top edge, and the `min_members` short-run search is insurance
-against future fragmentation rather than a day-one necessity.
+from a pristine edge, and the `min_members` short-run search is insurance
+against future fragmentation rather than a day-one necessity. (Blocks now scan
+*ascending*, alongside the workunit fleet — see the Lease section — but the
+measurement is the same either way: the run is unbroken.)
 
 The multiple only stops fitting one lease window past ~190x, so 3600 s is not
 the constraint people will assume it is.

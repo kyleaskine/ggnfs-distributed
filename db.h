@@ -107,11 +107,19 @@ typedef struct {
  *
  * Sizing is by accumulated q-WIDTH, not member count: `extend --qrange=N` at a
  * different width is normal operation, so a fixed member count could hand a
- * card 50x more work than intended. The scan walks descending from the top of
- * the q-range, takes maximal contiguous same-side runs, and accepts the first
- * that reaches `min_q_width`, cut at `target_q_width`. Runs shorter than that
- * are skipped rather than accepted — a one-member "block" would put the card
- * back at the ~22% per-band startup overhead blocks exist to remove.
+ * card 50x more work than intended. The scan takes maximal contiguous same-side
+ * runs and accepts the first that reaches `min_q_width`, cut at
+ * `target_q_width`. Runs shorter than that are skipped rather than accepted — a
+ * one-member "block" would put the card back at the ~22% per-band startup
+ * overhead blocks exist to remove.
+ *
+ * `scan_desc` picks the direction — 0 = ascending q_start, 1 = descending, the
+ * same encoding as db_lease's `lease_desc` — and normally matches the workunit
+ * lease order so blocks are carved alongside the CPU fleet instead of at the
+ * far end of the job. Opposite ends looks tidier but leaves a hole in the middle
+ * whenever a campaign is stopped before the range is exhausted, which is the
+ * normal way they end. See the scan comment in db.c for why working next to the
+ * CPU fleet costs nothing.
  *
  * Rows with attempt_count >= `attempt_ceiling` are excluded, which breaks the
  * run around them. That caps how much of a workunit's --max-attempts budget
@@ -122,12 +130,19 @@ typedef struct {
  * `max_members` is a hard clamp on run length; a client-supplied value must be
  * bounded by the caller before it gets here.
  *
- * Returns 0 on claim (out filled), 1 if no run qualifies (caller should fall
- * back to an ordinary single-workunit lease), -1 on error. */
+ * Returns 0 on claim (out filled), 1 if no block was produced, -1 on a genuine
+ * internal error. On 1 the caller should fall back to an ordinary
+ * single-workunit lease; *out is zeroed.
+ *
+ * 1 covers both "nothing qualifies" and the data-integrity refusals, on
+ * purpose. Those refusals are deterministic functions of table content, so
+ * returning -1 would make a caller that maps it to HTTP 500 do so on every
+ * retry — bricking /lease for the whole GPU fleet instead of letting it take
+ * ordinary workunits. -1 is reserved for transient faults. */
 int db_block_lease(ggnfs_db_t *db, const char *job_id, const char *client_id,
                    int64_t target_q_width, int64_t min_q_width,
                    int64_t max_members, int64_t attempt_ceiling,
-                   int64_t lease_seconds, int64_t now_unix,
+                   int scan_desc, int64_t lease_seconds, int64_t now_unix,
                    db_block_t *out);
 
 /* Look up a block by its own id, in any state. Used by the standalone
@@ -372,10 +387,14 @@ typedef struct {
      * slot against 4.8 for a 9800X3D core, where rel/wu had them only 35%
      * apart. Unit-independent, so it does not care how wide a band is. */
     double  rel_per_sec;
-    double  sieve_seconds_total;      /* SUM(sieve_seconds) — needed so a
-                                       * caller can aggregate rel/sec across
-                                       * a box's workers exactly, rather than
-                                       * averaging averages. */
+    /* SUM(sieve_seconds). Aggregate rel/sec as relations / SUM(seconds) WITHIN
+     * one device, then sum ACROSS devices — client ids are
+     * "<box>-w<N>[-s<K>]", and lease slots (-sK) of one worker share a card
+     * while workers (-wN) do not. Doing it at the box level instead reports one
+     * core's rate for a 32-core machine; summing per-slot rates instead
+     * multiplies a card by its slot count (measured: 582 for a card delivering
+     * 176). Note it is throughput while sieving — idle gaps are excluded. */
+    double  sieve_seconds_total;
     int64_t total_failures;
     char    current_workunit[64];     /* "" if no active lease            */
     char    last_class[16];           /* class it last asked /lease for   */

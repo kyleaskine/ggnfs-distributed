@@ -70,6 +70,14 @@ typedef struct {
     char    side;           /* 'a' or 'r'; 0 = skip q-range check */
 } verify_check_t;
 
+/* Ceiling on how far the norm spot-check scales K up for a wider-than-base
+ * band. It exists to stop a pathological q_range asking for an unbounded
+ * reservoir — but it must stay ABOVE serve's --block-width-multiple, or it
+ * stops being a guard and starts clipping normal operation, under-sampling
+ * precisely the submissions that carry the most work. cmd_serve warns when the
+ * two are set such that this binds. */
+#define VERIFY_SPOTCHECK_MAX_SCALE 64
+
 /* Reservoir buffer for Algorithm-R sampling of K accepted relations during
  * the parse pass. Caller allocates `buf` (cap entries) and seeds `seed` once.
  * The streamer fills `count` and `sampled_from` as it goes. */

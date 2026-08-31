@@ -12,6 +12,9 @@
  *                                        this x the job's base q_range)
  *                            [--block-max-members=256] [--block-min-q-width=0]
  *                            [--block-attempt-ceiling=2]
+ *                            [--block-lease-order=asc|desc]  (default: follow
+ *                                        the job's lease_order, so blocks are
+ *                                        carved alongside the CPU fleet)
  *
  * The server reuses the bearer token from <jobdir>/token (written at init).
  * One job per server. No verification, no .ranges write-back, no /stats.
@@ -722,6 +725,11 @@ typedef struct {
     int64_t     block_max_members;    /* hard clamp; a client's ask is advice */
     int64_t     block_min_q_width;    /* 0 = target/4 */
     int64_t     block_attempt_ceiling;/* must stay < max_attempts */
+    /* Direction the block scan walks. Defaults to lease_desc, i.e. blocks are
+     * carved alongside the CPU fleet rather than at the opposite end — see
+     * db_block_lease. --block-lease-order overrides it for the rare case where
+     * separating the two is actually wanted. */
+    int         block_lease_desc;
 
     /* db_workunit_base_q_range is a full covering-index scan plus two temp
      * b-trees — 38 ms on a 390K-row jobdir, measured. The verifier can afford
@@ -874,6 +882,7 @@ static void handle_lease(struct mg_connection *c, struct mg_http_message *hm,
             int brc = db_block_lease(ctx->db, ctx->job_id, client_id,
                                      target, minw, maxm,
                                      ctx->block_attempt_ceiling,
+                                     ctx->block_lease_desc,
                                      ctx->lease_seconds, now_unix(), &b);
             if (brc == 0) {
                 snprintf(r.id, sizeof(r.id), "%s", b.anchor_wu_id);
@@ -1573,8 +1582,52 @@ static void on_sweep_timer(void *arg)
     }
 }
 
+static void usage_serve(void)
+{
+    fprintf(stderr,
+        "usage: ggnfs-sieve-server serve [options]\n"
+        "    [--jobdir=<dir>]        default .\n"
+        "    [--bind=<addr>]         default 127.0.0.1; use 0.0.0.0 to expose\n"
+        "                            the coordinator to other machines\n"
+        "    [--port=<int>]          default 8080\n"
+        "    [--lease-seconds=<int>] default 3600\n"
+        "    [--sweep-seconds=<int>] default 60; how often expired leases are\n"
+        "                            reclaimed (blocks first, then workunits)\n"
+        "    [--max-attempts=<int>]  default 5; poison a workunit after this\n"
+        "                            many failed attempts\n"
+        "    [--spotcheck-k=<int>]   default 50; norm spot-check sample per\n"
+        "                            base-width band, 0 disables\n"
+        "\n"
+        "  GPU blocks — one lease held over N contiguous workunits:\n"
+        "    [--block-width-multiple=<int>]  default 50. Target block width is\n"
+        "                            this times the job's own base q_range, so\n"
+        "                            a band stays the same wall-clock size on\n"
+        "                            jobs carved at different --qrange.\n"
+        "    [--block-max-members=<int>]     default 256; hard clamp on how\n"
+        "                            many workunits one block may span.\n"
+        "    [--block-min-q-width=<int>]     default 0 = target/4; runs\n"
+        "                            narrower than this are skipped rather\n"
+        "                            than handed out as a stunted block.\n"
+        "    [--block-attempt-ceiling=<int>] default 2, forced below\n"
+        "                            --max-attempts. Past it a q-range drops\n"
+        "                            out of block eligibility, so block-scale\n"
+        "                            failures alone can never poison a row.\n"
+        "    [--block-lease-order=asc|desc]  default: follow the job's\n"
+        "                            lease_order, i.e. carve blocks alongside\n"
+        "                            the workunit fleet so coverage stays\n"
+        "                            contiguous. Set it to the opposite value\n"
+        "                            to work the two ends independently.\n");
+}
+
 static int cmd_serve(int argc, char **argv)
 {
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
+            usage_serve();
+            return 0;
+        }
+    }
+
     const char *bind      = flag(argc, argv, "--bind");
     const char *port_s    = flag(argc, argv, "--port");
     const char *jobdir    = flag(argc, argv, "--jobdir");
@@ -1586,6 +1639,7 @@ static int cmd_serve(int argc, char **argv)
     const char *bmaxm_s   = flag(argc, argv, "--block-max-members");
     const char *bminw_s   = flag(argc, argv, "--block-min-q-width");
     const char *bceil_s   = flag(argc, argv, "--block-attempt-ceiling");
+    const char *border_s  = flag(argc, argv, "--block-lease-order");
 
     int64_t port = 8080;
     if (port_s && *port_s && parse_int64_arg(port_s, &port) != 0) {
@@ -1625,6 +1679,14 @@ static int cmd_serve(int argc, char **argv)
         return 2;
     }
     if (spotcheck_k < 0) spotcheck_k = 0;
+    /* Bounded so base_k * scale stays well inside an int; the verifier clamps
+     * the product too, but a nonsense value should be rejected where it is
+     * typed rather than silently reinterpreted. */
+    if (spotcheck_k > 100000) {
+        fprintf(stderr, "serve: --spotcheck-k capped at 100000 (asked %lld)\n",
+                (long long)spotcheck_k);
+        spotcheck_k = 100000;
+    }
 
     /* 50x base q_range. See the server_ctx_t comment for why the multiple is
      * what gets configured rather than an absolute width. Measured on a 5070
@@ -1673,6 +1735,36 @@ static int cmd_serve(int argc, char **argv)
                 (long long)block_attempt_ceiling, (long long)max_attempts,
                 (long long)capped);
         block_attempt_ceiling = capped;
+    }
+
+    /* -1 = follow the job's lease_order, which is not known until meta is read
+     * further down. Validated here so a typo fails before the DB is opened. */
+    int block_lease_desc = -1;
+    if (border_s && *border_s) {
+        if      (strcmp(border_s, "asc")  == 0) block_lease_desc = 0;
+        else if (strcmp(border_s, "desc") == 0) block_lease_desc = 1;
+        else {
+            fprintf(stderr, "serve: --block-lease-order must be 'asc' or 'desc'\n");
+            return 2;
+        }
+    }
+
+    /* The spot-check scales K with band width but stops at a fixed multiple.
+     * Blocks are block_width_multiple x base, so once that exceeds the cap the
+     * widest submissions in the job are sampled at a LOWER density than an
+     * ordinary workunit — silently, and on exactly the work that matters most.
+     * The two constants live in different translation units, so this is the
+     * only place the coupling can be noticed. */
+    if (spotcheck_k > 0 && block_width_multiple > VERIFY_SPOTCHECK_MAX_SCALE) {
+        fprintf(stderr,
+            "serve: warning: --block-width-multiple=%lld exceeds the spot-check "
+            "scale cap of %d.\n"
+            "  Blocks will be norm-sampled at %d/%lld of an ordinary "
+            "workunit's density.\n"
+            "  Raise VERIFY_SPOTCHECK_MAX_SCALE in verify.h or lower the "
+            "multiple.\n",
+            (long long)block_width_multiple, VERIFY_SPOTCHECK_MAX_SCALE,
+            VERIFY_SPOTCHECK_MAX_SCALE, (long long)block_width_multiple);
     }
 
     char *db_path = path_join(jobdir, "job.db");
@@ -1746,6 +1838,14 @@ static int cmd_serve(int argc, char **argv)
         free(m_order);
     }
 
+    /* Blocks follow the workunit lease order unless told otherwise, so the two
+     * fleets work the same edge of the q-range and coverage stays contiguous.
+     * Opposite ends is the thing you have to ask for, not the default: it only
+     * looks tidy if the campaign runs to exhaustion, and they normally stop
+     * once there are enough relations. */
+    ctx.block_lease_desc =
+        (block_lease_desc < 0) ? ctx.lease_desc : block_lease_desc;
+
     ctx.jobdir        = strdup(jobdir);
     ctx.rels_dir      = path_join(jobdir, "rels");
     ctx.lease_seconds = lease_seconds;
@@ -1804,6 +1904,8 @@ static int cmd_serve(int argc, char **argv)
         "  siever_args  : %s\n"
         "  gpu_args     : %s\n"
         "  lease_order  : %s\n"
+        "  blocks       : %s (%s the workunit fleet)   %lldx base q_range,"
+        " <=%lld members, ceiling %lld\n"
         "  sweep        : every %llds   max_attempts=%lld\n"
         "  job .job sha : %s\n"
         "  token        : %.8s... (read from <jobdir>/token)\n"
@@ -1813,6 +1915,11 @@ static int cmd_serve(int argc, char **argv)
         ctx.siever_args[0] ? ctx.siever_args : "(none)",
         ctx.gpu_args[0]    ? ctx.gpu_args    : "(none)",
         ctx.lease_desc ? "desc (highest q first)" : "asc (lowest q first)",
+        ctx.block_lease_desc ? "desc" : "asc",
+        ctx.block_lease_desc == ctx.lease_desc ? "alongside" : "OPPOSITE",
+        (long long)ctx.block_width_multiple,
+        (long long)ctx.block_max_members,
+        (long long)ctx.block_attempt_ceiling,
         (long long)sweep_seconds, (long long)ctx.max_attempts,
         ctx.job_sha256, ctx.token,
         listen_url, ctx.token);
@@ -1857,7 +1964,7 @@ static void usage_top(void)
         "  ggnfs-sieve-server extend       [args...]   add workunits to an existing job\n"
         "  ggnfs-sieve-server serve        [--bind=127.0.0.1] [--port=8080] [args...]\n"
         "  ggnfs-sieve-server verify-parse <file>      diagnostic: parse a relation file\n"
-        "Run a subcommand without args to see its flags.\n");
+        "Run a subcommand with no args (or --help) to see its flags.\n");
 }
 
 int main(int argc, char **argv)

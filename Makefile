@@ -85,8 +85,31 @@ $(DASHBOARD_HEADER): dashboard.html
 vendor/%.o: vendor/%.c
 	$(CC) $(VENDOR_CFLAGS) $(INC) -c -o $@ $<
 
+# ---- tests -------------------------------------------------------------
+# There is no CI; these are here to be run by hand before a change to the
+# block layer or the dashboard rollup, both of which have had defects that
+# only a direct check would have caught.
+#
+#   make test
+#
+# block_test links db.o directly (no server, no network) and runs every
+# geometry case in both scan directions. dashboard_test reads the rollup
+# functions out of dashboard.html so it cannot drift from what ships; it needs
+# node, and is skipped with a notice when node is absent.
+TEST_BIN := tests/block_test
+
+$(TEST_BIN): tests/block_test.c db.o vendor/sqlite3.o
+	$(CC) $(CFLAGS) -I. -Ivendor -o $@ $^ -lpthread -lm -ldl
+
+.PHONY: test
+test: $(TEST_BIN)
+	./$(TEST_BIN)
+	@command -v node >/dev/null 2>&1 \
+	  && node tests/dashboard_test.js \
+	  || echo "note: node not found; skipping tests/dashboard_test.js"
+
 clean:
-	rm -f $(ALL_OWN_OBJS) $(ALL_VENDOR_OBJS) $(SERVER_BIN) $(CLIENT_BIN) $(VERIFY_BIN) $(DASHBOARD_HEADER)
+	rm -f $(ALL_OWN_OBJS) $(ALL_VENDOR_OBJS) $(SERVER_BIN) $(CLIENT_BIN) $(VERIFY_BIN) $(DASHBOARD_HEADER) $(TEST_BIN)
 
 # ---------- vendor refresh helpers (manually invoked) ----------
 

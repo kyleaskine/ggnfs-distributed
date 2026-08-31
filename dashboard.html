@@ -68,8 +68,8 @@
       <th>class</th>
       <th>last seen</th>
       <th class="num">relations</th>
-      <th class="num">rel/sec</th>
-      <th class="num">rel/wu</th>
+      <th class="num">rel/sec (raw)</th>
+      <th class="num">rel/wu (raw)</th>
       <th class="num">fail</th>
       <th>current</th>
     </tr></thead>
@@ -164,9 +164,18 @@
     return String(id || '').replace(/-w[0-9]+(-s[0-9]+)?$/, '');
   }
 
-  // rel/sec is the only column that compares engines honestly. rel/wu makes a
-  // GPU look 35% better than a core; rel/sec shows the 42x it actually is,
-  // because it does not care how wide a band is.
+  // One rung up from the box: "<box>-w<N>", i.e. one CPU core or one GPU.
+  // Lease slots of the same worker share a device; different workers do not.
+  // That distinction is what makes the box rate below correct for both.
+  function clientDeviceId(id) {
+    return String(id || '').replace(/-s[0-9]+$/, '');
+  }
+
+  // Both rate columns count RAW submitted relations. lasieve4 truncates its
+  // special-q-side factor base at q, so it finds each relation once; cuda-sieve
+  // does not, and re-finds inflate its raw counts by ~1.34x (cuda-sieve
+  // RUNBOOK). Unique yield is only known after msieve dedups at filter time, so
+  // a GPU row here reads high against a CPU row by roughly that factor.
   function relPerSec(v) {
     if (!v) return '&mdash;';
     return v >= 100 ? Math.round(v).toLocaleString()
@@ -182,7 +191,11 @@
   }
 
   function groupClients(clients) {
-    var groupsById = {};
+    // Object.create(null): these are keyed by client-chosen ids. A client
+    // registering as "__proto__" or "constructor" would otherwise make the
+    // lookup truthy on first sight and write onto Object.prototype, after
+    // which every for...in on the page enumerates the injected keys.
+    var groupsById = Object.create(null);
     var groups = [];
     for (var i = 0; i < clients.length; i++) {
       var c = clients[i];
@@ -197,32 +210,54 @@
           relations: 0,
           total_failures: 0,
           rel_per_sec: 0,
+          devices: Object.create(null),   // device id -> rolled-up row
           current_count: 0,
-          klass: '',
-          workers: []
+          klass: ''
         };
         groupsById[id] = g;
         groups.push(g);
       }
       var submissions = c.submissions || 0;
-      g.workers.push(c);
       if (!g.first_seen || (c.first_seen && c.first_seen < g.first_seen)) g.first_seen = c.first_seen;
       if ((c.last_seen || 0) > g.last_seen) g.last_seen = c.last_seen || 0;
       g.submissions += submissions;
       g.relations += c.relations || 0;
       g.total_failures += c.total_failures || 0;
-      // Box throughput is the SUM of its workers' rates, not relations divided
-      // by summed seconds. Workers run in parallel, so their sieve_seconds
-      // overlap in wall clock: 8 cores each doing R relations in T seconds is
-      // 8R/8T = R/T that way — an 8-core box reading the same as one core, and
-      // the collapsed row showing exactly what each expanded worker row shows.
-      // Summing rates gives the 8x that is actually true.
+      // Box throughput, aggregated at the right level for each kind of worker.
       //
-      // The exception is GPU prefetch slots, which are separate client ids on
-      // ONE card and really do serialise: measured on prod, two slots at
-      // ~200 rel/s each delivered 176 from the card. A box row there reads
-      // high. Per-worker rows are exact in both cases.
-      g.rel_per_sec += c.rel_per_sec || 0;
+      // Workers run in PARALLEL, so their sieve_seconds overlap in wall clock
+      // and relations/SUM(seconds) would report one core's rate for a 32-core
+      // box. Lease slots of the SAME worker are the opposite: separate client
+      // ids on one device, and they serialise on it — summing their rates
+      // multiplies the card by the slot count. Measured on prod: three slots
+      // reading ~194 rel/s each summed to 582 for a card that actually
+      // delivered 176 (344,160 relations over a 1,956 s span).
+      //
+      // So: relations / SUM(seconds) WITHIN a device, then sum ACROSS devices.
+      // Correct for a 32-core box, a 2-slot card, and a box holding two GPUs.
+      //
+      // Note this is throughput WHILE SIEVING, not over wall clock: idle gaps
+      // between bands are excluded for CPU and GPU alike. On the prod card that
+      // is 199.6 here against 176.0 measured over its full span, the difference
+      // being the 12% the card spent waiting on lease/submit round trips.
+      var dev = clientDeviceId(c.id);
+      var d = g.devices[dev];
+      if (!d) {
+        d = g.devices[dev] = {
+          id: dev, relations: 0, seconds: 0, submissions: 0,
+          total_failures: 0, last_seen: 0, current_workunit: '', "class": ''
+        };
+      }
+      d.relations   += c.relations || 0;
+      d.seconds     += c.sieve_seconds_total || 0;
+      // The expanded rows are DEVICES too, not lease slots. Rendering a slot's
+      // own rate under a device-aggregated box row gives three ~194 rows under
+      // a 199.6 box row with nothing on screen explaining the discrepancy.
+      d.submissions += submissions;
+      d.total_failures += c.total_failures || 0;
+      if ((c.last_seen || 0) > d.last_seen) d.last_seen = c.last_seen || 0;
+      if (c.current_workunit) d.current_workunit = c.current_workunit;
+      if (c["class"]) d["class"] = c["class"];
       if (c.current_workunit) g.current_count++;
       // A box whose workers disagree about class is worth seeing: it usually
       // means one of them was started with the wrong --lease-class.
@@ -230,10 +265,21 @@
       if (wc) g.klass = (!g.klass || g.klass === wc) ? wc : 'mixed';
     }
     for (var j = 0; j < groups.length; j++) {
-      // rel_per_sec was accumulated as a sum of worker rates above.
-      groups[j].workers.sort(function (a, b) {
+      var rate = 0, list = [];
+      for (var devId in groups[j].devices) {
+        var dd = groups[j].devices[devId];
+        dd.rel_per_sec = dd.seconds > 0 ? dd.relations / dd.seconds : 0;
+        rate += dd.rel_per_sec;
+        list.push(dd);
+      }
+      groups[j].rel_per_sec = rate;
+      // `workers` is the device count: one CPU core, or one GPU however many
+      // lease slots it is prefetching with. Counting slots reports three
+      // workers for a single card.
+      list.sort(function (a, b) {
         return String(a.id).localeCompare(String(b.id), undefined, { numeric: true });
       });
+      groups[j].workers = list;
     }
     groups.sort(function (a, b) { return (b.last_seen || 0) - (a.last_seen || 0); });
     return groups;

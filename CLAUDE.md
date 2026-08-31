@@ -22,7 +22,14 @@ make client    # just ggnfs-sieve-client
 make clean
 ```
 
-There is no test suite, no linter config, and no CI. `dashboard_html.h` is generated from `dashboard.html` by `xxd -i` and gets regenerated automatically because `server.o` depends on it.
+There is no linter config and no CI. There is a small hand-run test suite under `tests/`, built and run by `make test`:
+
+- `tests/block_test.c` — links `db.o` directly (no server, no network) and exercises the GPU block layer: lease/renew/submit/release, contiguity, the attempt ceiling, expiry accounting, id sequencing. **Every geometry case runs in both scan directions**, because `db_block_lease` stores its candidate run in scan order and an index naming one end descending names the other end ascending. Both plausible sign errors were introduced deliberately during development; each produced 71 failures here.
+- `tests/dashboard_test.js` — checks the client rollup arithmetic, reading the functions straight out of `dashboard.html` so it cannot drift from what ships. Needs `node`; skipped with a notice if absent. That column has been wrong twice in opposite directions, so it is worth a check.
+
+Neither covers the HTTP layer or the verifier end to end; those were tested by hand against real archived relations.
+
+`dashboard_html.h` is generated from `dashboard.html` by `xxd -i` and gets regenerated automatically because `server.o` depends on it.
 
 Vendored deps under `vendor/` (mongoose, cJSON, sqlite3 amalgamation) are checked in so a clean clone builds offline. **Never edit `vendor/*.c|*.h`.** To bump a version: `make update-mongoose` / `update-cjson` / `update-sqlite`, then update `vendor/VENDOR.md`. These targets are manual and not part of the default build by design.
 
@@ -182,6 +189,27 @@ can come from block-scale evidence, so nothing is ever poisoned without
 `max_attempts - ceiling` failures that were specifically about that one
 base-width range.**
 
+**Blocks are carved alongside the workunit fleet, not at the opposite end.**
+The block scan follows `meta.lease_order` (override with
+`--block-lease-order=asc|desc`). Opposite ends was the original design and it is
+wrong for how campaigns actually end: they are stopped once there are enough
+relations rather than run to exhaustion, so two fleets converging from opposite
+ends leave a hole in the middle. Working adjacent costs nothing because there is
+no churn zone — `db_lease` consumes strictly in order from whichever end
+`meta.lease_order` names, so in-flight leases sit in a solid block just *behind*
+the frontier and everything ahead is one unbroken run (measured live under the
+default `asc`: highest leased 94,309,000, lowest available 94,310,000, one run
+of 355,690 ahead; under `desc` the picture mirrors). It also reclaims failures
+sooner, since requeued rows land behind the frontier where the next lease from
+either fleet finds them.
+
+**`db_block_lease`'s run array is in SCAN order, so the ends must be picked by
+direction, not by index.** `lo = scan_desc ? &run[len-1] : &run[0]`. An index
+that names the low end descending names the high end ascending; get it wrong and
+every block reports `q_start`/`q_end` inverted, which passes a smoke test and
+then fails verification on every band. `tests/block_test.c` runs both directions
+for this reason.
+
 **Sweep ordering is load-bearing.** `db_block_expire_sweep` MUST run before
 `db_lease_expire_sweep` in `on_sweep_timer`. The block sweep returns expired
 members to `available`, and the row sweep's own `state = 'leased'` test then
@@ -280,9 +308,30 @@ content probe is needed. `--fb1=<path>` uses a prepared one directly.
 per state plus per-class rollups, and the dashboard reads those. `q_passed_1h`
 sums `COALESCE(NULLIF(s.q_width,0), w.q_range)` so a block contributes its own
 width rather than its anchor's. Per-client stats use `SUM(s.member_count)` for
-the workunit count and expose **rel/sec** (`SUM(relations)/SUM(sieve_seconds)`),
-which is the only column that compares engines honestly — rel/wu puts a card and
-a core 35% apart, rel/sec shows the 42x.
+the workunit count and expose **rel/sec**.
+
+**Every relation count in this system is RAW, not unique — and the two engines
+differ.** lasieve4 truncates its special-q-side factor base at q and so finds
+each relation once; cuda-sieve does not truncate and re-finds the same relation
+at several special-q, inflating its raw counts **~1.34x** for the same unique
+yield (cuda-sieve `RUNBOOK.md`). The prod +35% rel/wu gap is therefore an
+artefact: 4,780 / 1.34 = 3,567 unique against the CPU's 3,616 — slightly
+*behind*, which is what the RUNBOOK says happens at matched factor bases.
+cuda-sieve's genuine edge, from its looser survivor gate, is **1.6%** measured
+against AS276's real corpus (RUNBOOK finding 69). So `rel/wu` is a same-engine
+health check only, never an engine comparison; the dashboard labels the rate
+columns `(raw)`; and unique yield is knowable only after msieve dedups at
+filter time. q-width progress is unaffected, which is one more reason progress
+is reported in q-width rather than relations.
+
+**Dashboard rel/sec aggregates at the device, not the worker or the box.**
+Workers run in parallel so their `sieve_seconds` overlap in wall clock, but
+lease slots of one worker (`-w0-s0`, `-w0-s1`) share a card and serialise on it.
+Summing worker rates read 582 rel/s for a card that delivered 176. The rule is
+`relations / SUM(seconds)` **within** a device, then summed **across** devices —
+correct for a 32-core box, a 2-slot card, and a box holding two GPUs. It is
+throughput while sieving; idle gaps between bands are excluded for both
+engines.
 
 **Screening a GPU box.** `ggnfs-sieve-client benchmark --engine=cuda
 --cuda-bench=... --fb1=...` times one fixed-width band on the card. Like the CPU
@@ -312,5 +361,7 @@ to the webserver rather than by being cloned.
 - **`init --class=gpu` is refused as well as `extend --class=gpu`.** Guarding one entry point leaves the hazard reachable from the other.
 - **`finalize-nfs.sh`'s fallback glob must match `blk-*` as well as `wu-*`.** Dropping `blk-*` still finds every CPU file, so `total` stays non-zero and no error fires while the whole GPU contribution is missing.
 - **The per-workunit arm of `db_verify_next_pending` needs `AND s.block_id IS NULL`.** A block submission stores its anchor in `workunit_id`, so without the guard it matches both `UNION ALL` arms, the per-workunit arm wins on equal `s.id`, and the block is verified against a base-width q-range — most relations count as `qviol`, only the anchor is requeued, and the other members sit in `submitted` forever because the sweep only touches `leased`.
+- **`db_block_lease` returns 1, not -1, for its data-integrity refusals.** Both are deterministic functions of table content, so they recur on every retry; `handle_lease` maps -1 to HTTP 500 with no fallback, which would brick `/lease` for the whole GPU fleet rather than letting it take ordinary workunits. -1 is reserved for transient faults.
+- **`--block-width-multiple` must stay at or below `VERIFY_SPOTCHECK_MAX_SCALE`** (verify.h). Past it the spot-check clips, and the widest submissions in the job get sampled at a *lower* density than an ordinary workunit — silently, on the work that matters most. `cmd_serve` warns, since the two constants live in different translation units and nothing else can notice.
 - **The Makefile has no header dependency tracking.** Only `server.o: dashboard_html.h` is declared, so editing `db.h`, `protocol.h` or `verify.h` does not rebuild dependents. Force a clean rebuild after touching a header or you will link stale objects against a changed struct layout.
 - The siever's `-c` (in `sieve_run_local`, and `benchmark --qrange`) is a special-q interval **width**, not a count of special-q — the same unit as a workunit's `q_range`. The window `[f, f+c)` holds ~`c/ln(q)` prime special-q. A `-c` narrower than ~`ln(q)` contains no prime, so the siever does zero work and yields **0 relations in ~2s** (all `sieve:` counters 0) — a failure that mimics a broken job/siever/cache. This is why `benchmark --qrange` defaults to 65 (~3 special-q at q≈80M, ~1 min single-core), not a small number.

@@ -955,7 +955,7 @@ static int64_t block_touch_members(ggnfs_db_t *db, const db_block_t *b,
     return (rc == SQLITE_DONE) ? changed : -1;
 }
 
-/* One candidate row from the descending availability scan. */
+/* One candidate row from the availability scan, in scan order. */
 typedef struct {
     char    id[64];
     int64_t q_start;
@@ -966,7 +966,7 @@ typedef struct {
 int db_block_lease(ggnfs_db_t *db, const char *job_id, const char *client_id,
                    int64_t target_q_width, int64_t min_q_width,
                    int64_t max_members, int64_t attempt_ceiling,
-                   int64_t lease_seconds, int64_t now_unix,
+                   int scan_desc, int64_t lease_seconds, int64_t now_unix,
                    db_block_t *out)
 {
     if (!db || !job_id || !client_id || !out) return -1;
@@ -1034,14 +1034,32 @@ int db_block_lease(ggnfs_db_t *db, const char *job_id, const char *client_id,
     if (rc != SQLITE_DONE) goto done;
     sqlite3_finalize(st); st = NULL;
 
-    /* --- 2. Scan descending for a contiguous run. -----------------------
-     * Descending because the CPU fleet leases ascending: starting the two at
-     * opposite ends of the q-range keeps them out of each other's way and
-     * leaves the block scan a pristine, unfragmented top edge.
+    /* --- 2. Scan for a contiguous run. ----------------------------------
+     * `scan_desc` normally matches the workunit lease order, so blocks are
+     * carved right alongside the CPU fleet rather than at the far end of the
+     * job. That keeps coverage contiguous, which matters because a campaign is
+     * usually stopped once it has enough relations rather than run to the top
+     * — with the two fleets at opposite ends, stopping early leaves a hole in
+     * the middle.
      *
-     * The window is wider than one block so a short run near the top can be
-     * skipped past rather than accepted. Bounded so a fragmented job cannot
-     * turn one lease into an unbounded scan on the event-loop thread. */
+     * Working next to the CPU fleet is safe because there is no churn zone to
+     * fight. db_lease consumes strictly in order from whichever end
+     * meta.lease_order names, so in-flight workunit leases form a solid block
+     * just BEHIND the frontier and everything ahead of it stays one unbroken
+     * run. Measured on a live 390K-row jobdir running the default `asc`:
+     * highest leased q = 94,309,000, lowest available = 94,310,000 — adjacent,
+     * zero available rows interleaved, one run of 355,690 ahead. Under `desc`
+     * the whole picture mirrors: the frontier descends and the solid block sits
+     * above it. Either way the leading edge is clean.
+     *
+     * Holes only ever appear BEHIND the frontier — a failed workunit requeues
+     * at its own q, which the fleet has already passed — so both fleets
+     * scanning the same direction pick them up on the next lease, reclaiming a
+     * failed block far sooner than parking it at the opposite end ever did.
+     *
+     * The window is wider than one block so a short run can be skipped past
+     * rather than accepted. Bounded so a fragmented job cannot turn one lease
+     * into an unbounded scan on the event-loop thread. */
     int64_t scan_limit = max_members * 4;
     if (scan_limit > 8192) scan_limit = 8192;
     if (scan_limit < max_members) scan_limit = max_members;
@@ -1049,11 +1067,16 @@ int db_block_lease(ggnfs_db_t *db, const char *job_id, const char *client_id,
     run = calloc((size_t)max_members, sizeof(*run));
     if (!run) goto done;
 
-    if (sqlite3_prepare_v2(db->conn,
+    static const char *const scan_asc =
             "SELECT id, q_start, q_range, side FROM workunits "
             " WHERE state = 'available' AND attempt_count < ?1 "
-            " ORDER BY q_start DESC LIMIT ?2;",
-            -1, &st, NULL) != SQLITE_OK)
+            " ORDER BY q_start ASC LIMIT ?2;";
+    static const char *const scan_dsc =
+            "SELECT id, q_start, q_range, side FROM workunits "
+            " WHERE state = 'available' AND attempt_count < ?1 "
+            " ORDER BY q_start DESC LIMIT ?2;";
+    if (sqlite3_prepare_v2(db->conn, scan_desc ? scan_dsc : scan_asc,
+                           -1, &st, NULL) != SQLITE_OK)
         goto done;
     sqlite3_bind_int64(st, 1, attempt_ceiling);
     sqlite3_bind_int64(st, 2, scan_limit);
@@ -1067,19 +1090,29 @@ int db_block_lease(ggnfs_db_t *db, const char *job_id, const char *client_id,
         r.q_start = sqlite3_column_int64(st, 1);
         r.q_range = sqlite3_column_int64(st, 2);
         r.side    = side ? (char)side[0] : '?';
-        if (r.q_range <= 0) continue;               /* defensive; never valid */
 
         if (run_len > 0) {
-            /* Descending, so this row sits directly below the run's low edge
-             * exactly when its top touches the run's bottom. Same side, too:
-             * a block is sieved by one command with one --sq-side. */
-            int contiguous = (r.q_start + r.q_range == run[run_len - 1].q_start)
+            /* The new row must abut the run on the scan's leading edge — which
+             * is the run's BOTTOM going down and its TOP going up. Same side
+             * too: a block is sieved by one command with one --sq-side. */
+            const blk_scan_row_t *edge = &run[run_len - 1];
+            /* A zero/negative-width row counts as a break, not as something to
+             * skip past. Skipping it would leave it INSIDE [q_start, q_end) —
+             * every other exclusion in this scan (state, attempt_ceiling) drops
+             * out of the result set and so breaks the run naturally, but this
+             * one would not, and the member UPDATE selects by range. The count
+             * check would then see member_count + 1 and roll the block back. */
+            int contiguous = r.q_range > 0
+                          && (scan_desc
+                                ? (r.q_start + r.q_range == edge->q_start)
+                                : (edge->q_start + edge->q_range == r.q_start))
                           && (r.side == run[0].side);
             if (!contiguous) {
                 if (run_width >= min_q_width) break;  /* good enough; take it */
                 run_len = 0; run_width = 0;           /* too short; start over */
             }
         }
+        if (r.q_range <= 0) continue;   /* never starts a run either */
         if (run_len >= max_members) break;
         run[run_len++] = r;
         run_width     += r.q_range;
@@ -1096,23 +1129,38 @@ int db_block_lease(ggnfs_db_t *db, const char *job_id, const char *client_id,
         goto done;
     }
 
-    /* run[0] is the highest-q member, run[run_len-1] the lowest. The anchor is
-     * the lowest — deterministic regardless of scan direction, which matters
-     * because it is the id the whole protocol keys on. */
-    out->q_start      = run[run_len - 1].q_start;
-    out->q_end        = run[0].q_start + run[0].q_range;
+    /* The run is stored in SCAN order, so which end is which depends on the
+     * direction. Pick lo/hi explicitly rather than by index convention: an
+     * index that is right for one direction is silently inverted for the
+     * other, and a block reporting q_start/q_end backwards would sieve the
+     * wrong range and fail verification on every single band.
+     *
+     * The anchor is always the LOWEST-q member — deterministic regardless of
+     * direction, which matters because it is the id the whole protocol keys
+     * on. */
+    const blk_scan_row_t *lo = scan_desc ? &run[run_len - 1] : &run[0];
+    const blk_scan_row_t *hi = scan_desc ? &run[0] : &run[run_len - 1];
+    out->q_start      = lo->q_start;
+    out->q_end        = hi->q_start + hi->q_range;
     out->member_count = run_len;
     out->side         = run[0].side;
-    snprintf(out->anchor_wu_id, sizeof(out->anchor_wu_id), "%s",
-             run[run_len - 1].id);
+    snprintf(out->anchor_wu_id, sizeof(out->anchor_wu_id), "%s", lo->id);
 
     if (out->q_end - out->q_start != run_width) {
         /* Contiguity is the invariant every member query depends on. If it
          * ever fails, deriving membership from the range would touch rows that
-         * are not members, so refuse rather than proceed. */
+         * are not members, so refuse this block.
+         *
+         * result = 1, not -1: this is a deterministic function of table
+         * content, so it would recur on every retry, and the caller turns -1
+         * into a hard 500 with no fallback — bricking /lease for the whole GPU
+         * fleet rather than letting it take ordinary workunits. Degrade, log,
+         * and let the card keep working. */
         fprintf(stderr, "db_block_lease: non-contiguous run "
-                        "(width %lld != span %lld) — refusing\n",
+                        "(width %lld != span %lld) — falling back to a "
+                        "single-workunit lease\n",
                 (long long)run_width, (long long)(out->q_end - out->q_start));
+        result = 1;
         goto done;
     }
 
@@ -1167,10 +1215,14 @@ int db_block_lease(ggnfs_db_t *db, const char *job_id, const char *client_id,
     sqlite3_bind_int64(st, 6, attempt_ceiling);
     if (sqlite3_step(st) != SQLITE_DONE) goto done;
     if (sqlite3_changes(db->conn) != (int)out->member_count) {
+        /* Same reasoning as the contiguity refusal above: degrade to a plain
+         * lease rather than 500 the fleet forever. */
         fprintf(stderr, "db_block_lease: expected %lld members in [%lld,%lld), "
-                        "updated %d — rolling back\n",
+                        "updated %d — rolling back and falling back to a "
+                        "single-workunit lease\n",
                 (long long)out->member_count, (long long)out->q_start,
                 (long long)out->q_end, sqlite3_changes(db->conn));
+        result = 1;
         goto done;
     }
     result = 0;
@@ -1188,7 +1240,10 @@ done:
         if (result == -1)
             fprintf(stderr, "db_block_lease: %s\n", sqlite3_errmsg(db->conn));
         sqlite3_exec(db->conn, "ROLLBACK;", NULL, NULL, NULL);
-        if (result != 1) memset(out, 0, sizeof(*out));
+        /* Always, including result == 1: the integrity refusals above degrade
+         * to 1 after partially filling *out, and a caller that reads it on a
+         * non-zero return must see zeroes rather than a half-built block. */
+        memset(out, 0, sizeof(*out));
     }
     return result;
 }

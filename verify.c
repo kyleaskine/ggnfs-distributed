@@ -1041,11 +1041,22 @@ struct verify_thread_s {
  * unbounded reservoir.
  *
  * base_q_range is the job's most common band width, read off the workunits table
- * at the top of every drain pass rather than from a config value. That is what
- * makes it right for the normal GPU rollout — `extend --class=gpu` onto a
- * campaign whose meta predates all of this — and it keeps working when a later
- * extend introduces a narrower band. */
-#define SPOTCHECK_MAX_SCALE 32
+ * at the top of every drain pass rather than from a config value. That keeps it
+ * right on a campaign whose meta predates all of this, and it keeps working
+ * when a later extend introduces a narrower band.
+ *
+ * The cap must stay ABOVE --block-width-multiple (default 50) or it stops being
+ * a guard against a pathological q_range and starts clipping normal operation.
+ * At 32 it did exactly that: the first production block was 50x base and got
+ * k=1600 instead of 2500, sampling 1.16% of its 138,411 relations where a CPU
+ * workunit samples 1.81% — 64% of the density, the 32/50 ratio, on precisely
+ * the submissions carrying the most work. 64 restores parity at 50x and leaves
+ * headroom; the cost is ~900 more GMP norm checks against a ~14 minute band. */
+#define SPOTCHECK_MAX_SCALE VERIFY_SPOTCHECK_MAX_SCALE
+/* Hard ceiling on the reservoir itself. Bounds both memory and the GMP work
+ * per submission regardless of what --spotcheck-k and the scale multiply out
+ * to; 1e6 relations is far past any useful sample. */
+#define SPOTCHECK_K_MAX 1000000
 
 static int spotcheck_k_for(int base_k, int64_t base_q_range, int64_t q_range)
 {
@@ -1053,7 +1064,15 @@ static int spotcheck_k_for(int base_k, int64_t base_q_range, int64_t q_range)
     if (base_q_range <= 0 || q_range <= base_q_range) return base_k;
     int64_t scale = q_range / base_q_range;
     if (scale > SPOTCHECK_MAX_SCALE) scale = SPOTCHECK_MAX_SCALE;
-    return (int)(base_k * scale);
+    /* int64 product, then clamp: (int)(base_k * scale) can overflow for a
+     * large --spotcheck-k, and the overflow is silent in the worst possible
+     * way — a negative rescap makes both `rescap > resalloc` and `rescap > 0`
+     * false, so the reservoir is never allocated, the spot-check is skipped
+     * entirely, and every submission passes on parse + q-range alone with
+     * nothing in the log saying verification was weakened. */
+    int64_t k = (int64_t)base_k * scale;
+    if (k > SPOTCHECK_K_MAX) k = SPOTCHECK_K_MAX;
+    return (int)k;
 }
 
 /* Drain every pending submission; returns when the queue is empty (or on
