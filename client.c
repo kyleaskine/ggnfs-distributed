@@ -2238,6 +2238,51 @@ static int pipe_find(pipeline_t *p, slot_state_t want)
     return -1;
 }
 
+/* Hand one prefetched (READY) slot's lease back to the server and free the
+ * slot. Returns 1 if it was returned, 0 if the slot was not READY, -1 if the
+ * `/release` failed -- in which case the slot is left READY on purpose so the
+ * next pass retries it, because the reason to press Ctrl-C is often that the
+ * coordinator is unreachable and it may come back before we exit. Caller must
+ * not hold p->mu (the HTTP happens outside it, as everywhere else here).
+ *
+ * Both the drain path and pipeline_run's tail call this. They used to be two
+ * transcriptions of the same one-way transition and had already drifted --
+ * only one of them knew about lease_lost. */
+static int pipe_return_ready_slot(pipeline_t *p, int i, struct mg_mgr *mgr)
+{
+    char wu[64];
+    int lost = 0;
+
+    pthread_mutex_lock(&p->mu);
+    if (p->state[i] != SLOT_READY) {
+        pthread_mutex_unlock(&p->mu);
+        return 0;
+    }
+    snprintf(wu, sizeof(wu), "%s", p->slots[i].lease.workunit_id);
+    lost = p->slots[i].lease_lost;
+    pthread_mutex_unlock(&p->mu);
+
+    /* cfg and active_idx are written once at setup and never mutated, so
+     * reading them outside the lock is safe. active_lease_claim_release is
+     * what actually serialises this against any other releaser. */
+    if (lost) {
+        /* The server already took it back; /release would 409. */
+        active_lease_clear(p->slots[i].active_idx);
+    } else {
+        fprintf(stderr, "client: returning unstarted workunit %s\n", wu);
+        if (release_active_lease(mgr, &p->slots[i].cfg,
+                                 p->slots[i].active_idx) != 0)
+            return -1;
+    }
+
+    pthread_mutex_lock(&p->mu);
+    slot_reset(&p->slots[i]);
+    p->state[i] = SLOT_EMPTY;
+    pthread_cond_broadcast(&p->cv);
+    pthread_mutex_unlock(&p->mu);
+    return 1;
+}
+
 static void *pipe_lease_thread(void *arg)
 {
     pipeline_t *p = (pipeline_t *)arg;
@@ -2316,11 +2361,39 @@ static void *pipe_heartbeat_thread(void *arg)
     mg_mgr_init(&mgr);
 
     int64_t next_ms = 0;
+    int woke_on_drain = 0;
     for (;;) {
         pthread_mutex_lock(&p->mu);
         int done = p->finished;
         pthread_mutex_unlock(&p->mu);
         if (done || shutdown_phase() >= SHUTDOWN_CANCELLING) break;
+
+        /* First Ctrl-C: give back every prefetched lease the card has not
+         * started. Waiting until the current band finishes would hold them
+         * for another quarter hour for no reason -- nothing has been sieved,
+         * so another client can take them right now. This runs before the
+         * renew gate below so it happens within a second of the signal, and
+         * it is the only writer of READY slots once we are draining, because
+         * the sieve loop stops promoting READY -> SIEVING at that point. */
+        if (shutdown_phase() >= SHUTDOWN_DRAINING) {
+            if (!woke_on_drain) {
+                woke_on_drain = 1;
+                /* Nothing broadcasts p->cv when the signal handler flips the
+                 * phase -- on_signal only sets g_shutdown. Both the sieve loop
+                 * and the lease thread park on conditions that include
+                 * `shutdown_phase() < SHUTDOWN_DRAINING`, so with every slot
+                 * uploading (nothing READY, nothing EMPTY) they would both
+                 * stay parked until a submit happened to finish and broadcast
+                 * -- minutes on a slow link, with the card idle. This is the
+                 * only thread that reliably runs on a timer, so it is the one
+                 * that has to deliver the news. */
+                pthread_mutex_lock(&p->mu);
+                pthread_cond_broadcast(&p->cv);
+                pthread_mutex_unlock(&p->mu);
+            }
+            for (int i = 0; i < p->n; i++)
+                (void)pipe_return_ready_slot(p, i, &mgr);
+        }
 
         int64_t now = monotonic_ms();
         if (next_ms == 0 || now < next_ms) {
@@ -2480,10 +2553,19 @@ static void pipeline_run(const client_cfg_t *base_cfg, int worker_idx)
         pthread_mutex_lock(&p.mu);
         int idx;
         while ((idx = pipe_find(&p, SLOT_READY)) < 0 && !p.no_more_work &&
-               shutdown_phase() < SHUTDOWN_CANCELLING) {
+               shutdown_phase() < SHUTDOWN_DRAINING) {
             pthread_cond_wait(&p.cv, &p.mu);
         }
-        if (idx < 0) { pthread_mutex_unlock(&p.mu); break; }
+        /* Draining finishes the band already on the card and starts no other.
+         * A prefetched slot is a lease we have not spent a second of GPU time
+         * on, so it goes back to the pool instead of adding another band's
+         * worth of wall clock to the shutdown -- with --prefetch=2 that was
+         * the difference between one more band and two. The heartbeat thread
+         * hands it back; the tail of this function catches any it missed. */
+        if (idx < 0 || shutdown_phase() >= SHUTDOWN_DRAINING) {
+            pthread_mutex_unlock(&p.mu);
+            break;
+        }
         int lost = p.slots[idx].lease_lost;
         if (lost) {
             /* Reclaimed while it sat in the queue — never start the card on it. */
@@ -2551,10 +2633,7 @@ static void pipeline_run(const client_cfg_t *base_cfg, int worker_idx)
     /* Any slot still holding a lease we never sieved goes back to the pool
      * rather than waiting out its expiry. */
     for (int i = 0; i < n; i++) {
-        if (p.state[i] == SLOT_READY) {
-            release_active_lease(&mgr, &p.slots[i].cfg, p.slots[i].active_idx);
-            slot_reset(&p.slots[i]);
-        }
+        (void)pipe_return_ready_slot(&p, i, &mgr);
     }
 
     printf("[w%d] pipeline finished: %d workunits submitted\n",

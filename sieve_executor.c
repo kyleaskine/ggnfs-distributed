@@ -35,6 +35,58 @@ static void signal_child_group(pid_t pid, int sig)
     }
 }
 
+/* Grace between SIGTERM and SIGKILL when a run is cancelled. cuda-sieve
+ * answers SIGTERM by stopping at the next special-q and draining its cofactor
+ * queue rather than dying, so this is how long that clean stop gets. */
+#define CANCEL_TERM_GRACE_MS 2000
+
+/* Hard cap on how long we wait for a SIGKILL'd group to disappear, so a member
+ * left unreapable (a zombie under a pid 1 that does not reap, in a container)
+ * cannot hang shutdown for ever. */
+#define CANCEL_GROUP_REAP_CAP_MS 10000
+
+/* Wait out the rest of the child's process GROUP after the leader is reaped.
+ *
+ * Reaping the leader is not the same as the run being over. `/bin/sh -c CMD`
+ * on Debian and Ubuntu is dash, which does not exec CMD in place -- the shell
+ * stays as the parent -- so the process we wait on above is the shell and the
+ * siever is its child. On cancel the shell takes the default action for
+ * SIGTERM and dies at once, while cuda-sieve catches SIGTERM and answers it
+ * with a graceful drain (bench_stop_hook_install, cuda-sieve/bench/platform.c)
+ * instead of dying. We would then reap the shell, report its 143 as the
+ * siever's exit status, and return -- leaving the card sieving and printing
+ * its band summary over the shell prompt after the client had exited, and
+ * never sending the SIGKILL that was supposed to follow. The `exec` prefix in
+ * run_child_cancelable removes the shell from the picture; this covers
+ * anything the siever itself spawns. */
+static void wait_group_gone(pid_t pgid, int64_t kill_deadline_ms)
+{
+    int64_t give_up_ms = 0;
+
+    for (;;) {
+        int64_t now = monotonic_ms();
+        int past_grace = (now >= kill_deadline_ms);
+
+        /* Probe and kill in the SAME syscall rather than testing liveness and
+         * then signalling: POSIX keeps the pid reserved while the group has
+         * members, so `-pgid` is unambiguous right up to the moment the group
+         * empties, but a separate check-then-kill would still leave a window
+         * where the group drains between the two calls and the SIGKILL lands
+         * on whatever recycled the pid. One call has no such window -- either
+         * the group was there and got the signal, or it was already gone.
+         * Only ESRCH means gone; EPERM means alive and not ours to signal. */
+        if (kill(-pgid, past_grace ? SIGKILL : 0) != 0 && errno == ESRCH)
+            return;
+
+        if (past_grace) {
+            if (give_up_ms == 0) give_up_ms = now + CANCEL_GROUP_REAP_CAP_MS;
+            else if (now >= give_up_ms) return;
+        }
+
+        usleep(100000);
+    }
+}
+
 static int wait_child_cancelable(pid_t pid, sieve_cancel_fn should_cancel,
                                  void *cancel_ctx)
 {
@@ -45,7 +97,14 @@ static int wait_child_cancelable(pid_t pid, sieve_cancel_fn should_cancel,
 
     for (;;) {
         pid_t r = waitpid(pid, &status, WNOHANG);
-        if (r == pid) return wait_status_to_rc(status);
+        if (r == pid) {
+            int rc = wait_status_to_rc(status);
+            /* Only after a cancel: on the normal path the leader exiting is
+             * the run finishing, and a lingering member would be something
+             * the siever deliberately backgrounded, not ours to wait on. */
+            if (cancelling) wait_group_gone(pid, term_deadline_ms);
+            return rc;
+        }
         if (r < 0) {
             if (errno == EINTR) continue;
             return -1;
@@ -53,7 +112,7 @@ static int wait_child_cancelable(pid_t pid, sieve_cancel_fn should_cancel,
 
         if (!cancelling && should_cancel && should_cancel(cancel_ctx)) {
             cancelling = 1;
-            term_deadline_ms = monotonic_ms() + 2000;
+            term_deadline_ms = monotonic_ms() + CANCEL_TERM_GRACE_MS;
             signal_child_group(pid, SIGTERM);
         } else if (cancelling && !sent_kill &&
                    monotonic_ms() >= term_deadline_ms) {
@@ -83,8 +142,22 @@ static int run_child_cancelable(const char *syscmd,
         return -1;
     }
 
+    /* Prefix `exec` here, before the fork, so a long command line is a clean
+     * allocation failure rather than a silent truncation that would degrade
+     * back to running under a shell -- the exact bug this exists to prevent.
+     * (malloc after fork() in a threaded process is not safe; before it is.) */
+    size_t execlen = strlen(syscmd) + sizeof("exec ");
+    char *execcmd = malloc(execlen);
+    if (!execcmd) {
+        pthread_sigmask(SIG_SETMASK, &oldmask, NULL);
+        errno = ENOMEM;
+        return -1;
+    }
+    snprintf(execcmd, execlen, "exec %s", syscmd);
+
     pid_t pid = fork();
     if (pid < 0) {
+        free(execcmd);
         int saved_errno = errno;
         pthread_sigmask(SIG_SETMASK, &oldmask, NULL);
         errno = saved_errno;
@@ -111,12 +184,24 @@ static int run_child_cancelable(const char *syscmd,
         sigaction(SIGINT, &dfl, NULL);
         sigaction(SIGTERM, &dfl, NULL);
 
-        execl("/bin/sh", "sh", "-c", syscmd, (char *)NULL);
+        /* `exec` so the siever replaces the shell instead of running as its
+         * child: dash does not do this on its own for `-c`. Without it the
+         * pid we wait on is the shell's, so the status we report is the
+         * shell's rather than the siever's, and on cancel the shell dies of
+         * the SIGTERM while the siever -- which may catch it -- carries on
+         * unattended.
+         *
+         * This does narrow what a command line may be: `exec` takes a command
+         * word, so an assignment prefix (`VAR=v prog`) or a second command
+         * after `&&` no longer works. Every caller here formats a plain
+         * `program args...`, which is unaffected. */
+        execl("/bin/sh", "sh", "-c", execcmd, (char *)NULL);
         _exit(127);
     }
 
     (void)setpgid(pid, pid);
     pthread_sigmask(SIG_SETMASK, &oldmask, NULL);
+    free(execcmd);
 
     return wait_child_cancelable(pid, should_cancel, cancel_ctx);
 }
