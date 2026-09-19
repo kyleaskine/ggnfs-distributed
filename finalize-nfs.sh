@@ -1,168 +1,272 @@
 #!/usr/bin/env bash
-# finalize-nfs.sh — assemble nfs.dat from a distributed sieving jobdir
+# finalize-nfs.sh — assemble nfs.dat from a server jobdir or pull-rels archive
 # and (optionally) invoke YAFU's filter -> LA -> sqrt pipeline.
 #
 # Usage:
-#   finalize-nfs.sh --jobdir=/tmp/yafu-job-real --yafu-dir=/home/kylea/yafu
-#                   [--threads=8] [--run] [--phase=nc|nc1|nc2|nc3|ncr]
+#   finalize-nfs.sh --jobdir=./snfs301 --yafu-dir=/path/to/yafu
+#                   [--job-file=PATH] [--jobdb=PATH] [--threads=8]
+#                   [--run] [--phase=nc|nc1|nc2|nc3|ncr] [--check]
 #
-# Without --run: writes <yafu-dir>/nfs.dat and prints the yafu command.
-# With    --run: also invokes ./yafu "factor(N)" -<phase>.
+# Reads archive/ and rels/, using job.db or the newest usable incoming snapshot.
+# --check validates inputs and reports selected files without writing output.
+# nc/nc1 assemble relations; nc2/nc3/ncr reuse the existing nfs.dat because
+# filtering artifacts and LA checkpoints depend on its exact relation order.
+# Without --run, prints the YAFU command; --phase=nc1 runs only filtering.
 
 set -euo pipefail
+export LC_ALL=C
 
 jobdir=""
 yafu_dir=""
+server_job=""
+db=""
 threads=1
 do_run=0
+check=0
 phase="nc"
 
 for arg in "$@"; do
     case "$arg" in
         --jobdir=*)   jobdir="${arg#*=}" ;;
         --yafu-dir=*) yafu_dir="${arg#*=}" ;;
+        --job-file=*) server_job="${arg#*=}" ;;
+        --jobdb=*)    db="${arg#*=}" ;;
         --threads=*)  threads="${arg#*=}" ;;
         --phase=*)    phase="${arg#*=}" ;;
         --run)        do_run=1 ;;
-        -h|--help)
-            sed -n '2,12p' "$0"; exit 0 ;;
-        *)
-            echo "unknown arg: $arg" >&2; exit 2 ;;
+        --check)      check=1 ;;
+        -h|--help)    sed -n '2,14p' "$0"; exit 0 ;;
+        *) echo "unknown arg: $arg" >&2; exit 2 ;;
     esac
 done
 
-[ -n "$jobdir" ]   || { echo "missing --jobdir"   >&2; exit 2; }
-[ -n "$yafu_dir" ] || { echo "missing --yafu-dir" >&2; exit 2; }
+fail() { echo "$*" >&2; exit 1; }
+[ -n "$jobdir" ]   || fail "missing --jobdir"
+[ -n "$yafu_dir" ] || fail "missing --yafu-dir"
+[[ "$threads" =~ ^[1-9][0-9]*$ ]] || fail "--threads must be a positive integer"
+case "$phase" in nc|nc1|nc2|nc3|ncr) ;; *) fail "invalid --phase: $phase" ;; esac
 
-# bash doesn't expand ~ inside --foo=~/bar; handle it ourselves.
+# bash doesn't expand ~ inside a quoted --foo=~/bar.
 jobdir="${jobdir/#\~/$HOME}"
 yafu_dir="${yafu_dir/#\~/$HOME}"
+server_job="${server_job/#\~/$HOME}"
+db="${db/#\~/$HOME}"
+[ -d "$jobdir" ] || fail "jobdir $jobdir does not exist"
+[ -d "$yafu_dir" ] || fail "yafu dir $yafu_dir does not exist"
+shopt -s nullglob
+sqlite_read() { sqlite3 -init /dev/null -readonly -batch -noheader -list "$@"; }
+tmp_dat=""
+passed_list=""
+cleanup() {
+    [ -z "$tmp_dat" ] || rm -f -- "$tmp_dat"
+    [ -z "$passed_list" ] || rm -f -- "$passed_list"
+    return 0
+}
+trap cleanup EXIT
 
-[ -d "$jobdir/rels" ] || { echo "no $jobdir/rels — did sieving run?" >&2; exit 1; }
-[ -d "$yafu_dir" ] || { echo "yafu dir $yafu_dir does not exist" >&2; exit 1; }
+snapshot_usable() {
+    local result
+    result=$(sqlite_read "$1" "PRAGMA quick_check;
+        SELECT value FROM meta WHERE key='job_sha256';
+        SELECT file_path, verify_status FROM submissions LIMIT 0;" 2>/dev/null) || return 1
+    [[ "$result" =~ ^ok$'\n'[0-9a-f]{64}$ ]]
+}
 
-server_job=$(ls "$jobdir"/files/*.job 2>/dev/null | head -1 || true)
-[ -n "$server_job" ] || { echo "no .job under $jobdir/files" >&2; exit 1; }
+# Pulls retain cumulative DB snapshots, named with sortable UTC timestamps.
+# Never select relations from incoming/: validation may have failed there.
+if [ -z "$db" ]; then
+    if [ -f "$jobdir/job.db" ]; then
+        db="$jobdir/job.db"
+    else
+        snapshots=( "$jobdir"/incoming/*/job.db )
+        if [ ${#snapshots[@]} -gt 0 ]; then
+            command -v sqlite3 >/dev/null || fail "sqlite3 is required to read snapshots"
+            for ((i=${#snapshots[@]}-1; i>=0; i--)); do
+                if snapshot_usable "${snapshots[i]}"; then
+                    db="${snapshots[i]}"
+                    break
+                fi
+                echo "warning: skipping unusable snapshot: ${snapshots[i]}" >&2
+            done
+            [ -n "$db" ] || fail "no usable database snapshot found; refusing unverified directory fallback"
+        fi
+    fi
+fi
+job_sha=""
+if [ -n "$db" ]; then
+    [ -f "$db" ] || fail "database does not exist: $db"
+    command -v sqlite3 >/dev/null || fail "sqlite3 is required to read $db"
+    # Capture query status directly: process substitution hides sqlite errors.
+    job_sha=$(sqlite_read "$db" \
+        "SELECT value FROM meta WHERE key='job_sha256';") || fail "cannot read job identity from $db"
+    [[ "$job_sha" =~ ^[0-9a-f]{64}$ ]] || fail "missing or invalid job_sha256 in $db"
+    echo "using database: $db"
+fi
 
-# Seed yafu's nfs.job from the server's job. If one's already there and matches,
-# leave it alone (re-running finalize is fine). If it differs, bail — we don't
-# want to clobber an unrelated yafu run.
+# New pulls include the original .job next to their snapshot. Older archives
+# can use --job-file, a sibling <jobdir>.job, or an existing matching nfs.job.
+if [ -z "$server_job" ]; then
+    candidates=( "$jobdir"/files/*.job )
+    if [ -n "$db" ]; then
+        candidates+=( "${db%/*}"/files/*.job )
+    fi
+    candidates+=( "${jobdir%/}.job" )
+    # An output job is a source only when the database independently proves
+    # its identity. Without that, comparing nfs.job to itself proves nothing.
+    [ -z "$job_sha" ] || candidates+=( "$yafu_dir/nfs.job" )
+    for candidate in "${candidates[@]}"; do
+        [ -f "$candidate" ] || continue
+        candidate_sha=$(sha256sum "$candidate" | awk '{print $1}')
+        if [ -z "$job_sha" ] || [ "$candidate_sha" = "$job_sha" ]; then
+            server_job="$candidate"
+            break
+        fi
+    done
+fi
+[ -f "$server_job" ] || fail "no matching .job found; pass --job-file=PATH or run an updated pull-rels.sh (expected SHA-256: ${job_sha:-unknown})"
+serv_sha=$(sha256sum "$server_job" | awk '{print $1}')
+if [ -n "$job_sha" ] && [ "$serv_sha" != "$job_sha" ]; then
+    fail "$server_job does not match the job in $db (expected $job_sha, got $serv_sha)"
+fi
 if [ -f "$yafu_dir/nfs.job" ]; then
     yafu_sha=$(sha256sum "$yafu_dir/nfs.job" | awk '{print $1}')
-    serv_sha=$(sha256sum "$server_job"       | awk '{print $1}')
-    if [ "$yafu_sha" = "$serv_sha" ]; then
-        echo "$yafu_dir/nfs.job already matches $server_job — keeping it"
+    if [ "$yafu_sha" != "$serv_sha" ]; then
+        echo "$yafu_dir/nfs.job differs from $server_job — refusing to overwrite" >&2
+        echo "  yafu:   $yafu_sha" >&2
+        echo "  source: $serv_sha" >&2
+        fail "use a separate YAFU directory, or move the existing run aside before retrying"
+    fi
+fi
+N=$(awk '/^n:/ { print $2 }' "$server_job" | tr -d '\r')
+[[ "$N" =~ ^[0-9]+$ ]] || fail "could not parse one integer n: from $server_job"
+echo "using job file: $server_job"
+
+if [ "$do_run" -eq 1 ] && [ "$check" -eq 0 ]; then
+    [ -x "$yafu_dir/yafu" ] || fail "no executable at $yafu_dir/yafu"
+fi
+
+if [[ "$phase" = nc || "$phase" = nc1 ]]; then
+    dat_files=()
+    zst_files=()
+    declare -A seen=()
+    add_file() {
+        local f="$1" base="${1##*/}"
+        [ -z "${seen[$base]:-}" ] || return 0
+        seen["$base"]=1
+        case "$f" in
+            *.dat.zst) zst_files+=( "$f" ) ;;
+            *.dat)     dat_files+=( "$f" ) ;;
+            *) echo "warning: skipping unsupported relation file: $f" >&2 ;;
+        esac
+    }
+
+    if [ -n "$db" ]; then
+        # Spool once, checking sqlite's status before consuming any rows.
+        # This avoids both a large shell string and hidden producer failures.
+        passed_list=$(mktemp)
+        sqlite_read "$db" \
+            "SELECT DISTINCT file_path FROM submissions WHERE verify_status='passed' ORDER BY file_path;" > "$passed_list" \
+            || fail "cannot select passed submissions from $db"
+        missing=0
+        while IFS= read -r fp; do
+            [ -n "$fp" ] || continue
+            base="${fp##*/}"
+            # Archived files have passed pull's validation gate. Prefer them
+            # over a duplicate copy still present in rels/.
+            if [ -f "$jobdir/archive/$base" ]; then
+                add_file "$jobdir/archive/$base"
+            elif [ -f "$jobdir/rels/$base" ]; then
+                add_file "$jobdir/rels/$base"
+            else
+                missing=$((missing + 1))
+            fi
+        done < "$passed_list"
+        rm -f -- "$passed_list"
+        passed_list=""
+        if [ "$missing" -gt 0 ]; then
+            echo "warning: $missing passed submission file(s) are absent from archive/ and rels/; assembling only locally available files" >&2
+        fi
+        echo "selecting relation files from: passed submissions in database"
     else
-        echo "$yafu_dir/nfs.job exists and differs from $server_job — refusing to overwrite" >&2
-        echo "  yafu : $yafu_sha" >&2
-        echo "  serv : $serv_sha" >&2
-        echo "  move it aside if you want finalize-nfs to copy a fresh one." >&2
-        exit 1
+        echo "warning: no database; selecting directory files without verification status" >&2
+        for f in "$jobdir"/{archive,rels}/{wu,blk}-*.dat{,.zst}; do
+            [ -f "$f" ] && add_file "$f"
+        done
+    fi
+    total=$(( ${#dat_files[@]} + ${#zst_files[@]} ))
+    [ "$total" -gt 0 ] || fail "no eligible relation files under $jobdir/archive or $jobdir/rels"
+    echo "selected $total submission files: ${#dat_files[@]} raw + ${#zst_files[@]} zstd"
+    if [ ${#zst_files[@]} -gt 0 ]; then
+        command -v zstd >/dev/null || fail "zstd not found in PATH"
+    fi
+
+    if [ "$check" -eq 0 ]; then
+        # Publish only a complete assembly. In particular a corrupt compressed
+        # file must not replace a previously usable nfs.dat with a partial one.
+        tmp_dat=$(mktemp "$yafu_dir/.nfs.dat.XXXXXX")
+        {
+            echo "N $N"
+            if [ ${#dat_files[@]} -gt 0 ]; then
+                printf '%s\0' "${dat_files[@]}" | xargs -0 cat -- || exit 1
+            fi
+            if [ ${#zst_files[@]} -gt 0 ]; then
+                printf '%s\0' "${zst_files[@]}" | xargs -0 zstd -dcq -- || exit 1
+            fi
+        } | awk '
+            # The target YAFU reader stores b in uint32_t. Other consumers can
+            # use wider b: do not impose this limit in sieving or verification.
+            # GPU output can contain larger
+            # values; passing those through can hit YAFU\047s 10,000-error
+            # abort threshold. Keep the archives intact, omit only these
+            # unusable relations from the assembled filtering input.
+            /^-?[0-9]+,[0-9]+:/ {
+                comma = index($0, ",")
+                colon = index($0, ":")
+                b = substr($0, comma + 1, colon - comma - 1) + 0
+                if (b > 4294967295) { dropped++; next }
+            }
+            { print }
+            END {
+                if (dropped)
+                    printf "YAFU compatibility: omitted %.0f relations with b > 4294967295 (originals retained in source files)\n", dropped > "/dev/stderr"
+            }
+        ' > "$tmp_dat"
+        if [ -f "$yafu_dir/nfs.dat" ]; then
+            chmod --reference="$yafu_dir/nfs.dat" "$tmp_dat"
+            backup=$(mktemp "$yafu_dir/nfs.dat.prev.XXXXXX")
+            # Same filesystem: preserve the old file without copying its bytes.
+            ln -f -- "$yafu_dir/nfs.dat" "$backup"
+            echo "preserved previous relations: $backup"
+        else
+            file_umask=$(umask)
+            printf -v output_mode '%03o' "$((0666 & ~file_umask))"
+            chmod "$output_mode" "$tmp_dat"
+        fi
+        [ -f "$yafu_dir/nfs.job" ] || cp -- "$server_job" "$yafu_dir/nfs.job"
+        mv -- "$tmp_dat" "$yafu_dir/nfs.dat"
+        tmp_dat=""
+        bytes=$(stat -c %s "$yafu_dir/nfs.dat")
+        lines=$(wc -l < "$yafu_dir/nfs.dat")
+        echo "wrote $yafu_dir/nfs.dat ($bytes bytes, $lines lines including header)"
+        echo "  first relation: $(sed -n '2{p;q;}' "$yafu_dir/nfs.dat" | cut -c 1-80)"
     fi
 else
-    cp "$server_job" "$yafu_dir/nfs.job"
-    echo "copied $server_job -> $yafu_dir/nfs.job"
+    [ -f "$yafu_dir/nfs.dat" ] || fail "--phase=$phase requires existing nfs.dat from filtering"
+    [ -f "$yafu_dir/nfs.job" ] || fail "--phase=$phase requires existing nfs.job from filtering"
+    IFS= read -r header < "$yafu_dir/nfs.dat" || fail "existing nfs.dat has an empty or incomplete header"
+    [ "${header%$'\r'}" = "N $N" ] || fail "existing nfs.dat has a different N"
+    echo "keeping existing nfs.dat for --phase=$phase"
 fi
-
-# Pull N out of the .job file. Strip CR in case the .job has CRLF endings
-# — a trailing \r in N would silently break yafu invocation and make the
-# printed command look truncated when copied from the terminal.
-N=$(awk '/^n:/ { print $2 }' "$yafu_dir/nfs.job" | tr -d '\r')
-[ -n "$N" ] || { echo "could not parse n: from $yafu_dir/nfs.job" >&2; exit 1; }
-
-shopt -s nullglob
-
-# Which relation files go into nfs.dat.
-#
-# Prefer the database: `SELECT ... WHERE verify_status='passed'` is the only
-# source that knows which submissions actually passed. Globbing the directory
-# assembles failed submissions too (their files are left on disk), and it
-# cannot tell a superseded file from a current one. It also has to know every
-# filename shape the server has ever used -- a block's file is named after its
-# block, not a workunit, precisely so a re-sieved anchor cannot overwrite it.
-#
-# Paths in the DB are absolute and recorded on the SERVER, so a jobdir that was
-# rsynced here (pull-rels.sh) will not match them. Re-root every basename under
-# this jobdir's rels/ instead of trusting the stored directory.
-dat_files=()
-zst_files=()
-selected_from="database"
-db="$jobdir/job.db"
-
-if [ -f "$db" ] && command -v sqlite3 >/dev/null 2>&1; then
-    missing=0
-    while IFS= read -r fp; do
-        [ -n "$fp" ] || continue
-        f="$jobdir/rels/${fp##*/}"
-        if [ ! -f "$f" ]; then
-            missing=$(( missing + 1 ))
-            continue
-        fi
-        case "$f" in
-            *.zst) zst_files+=( "$f" ) ;;
-            *)     dat_files+=( "$f" ) ;;
-        esac
-    done < <(sqlite3 "$db" \
-        "SELECT file_path FROM submissions WHERE verify_status='passed' ORDER BY id;")
-
-    if [ "$missing" -gt 0 ]; then
-        echo "warning: $missing passed submission(s) have no file under $jobdir/rels" >&2
-        echo "         (moved away by move-rels.sh? assembling without them)" >&2
-    fi
-fi
-
-# Fallback: no DB, no sqlite3, or a DB that recorded nothing. Match BOTH
-# shapes -- omitting blk-* here would silently drop every GPU block while
-# still finding CPU files, so `total` would stay non-zero and nothing would
-# look wrong until filtering came up short.
-if [ "$(( ${#dat_files[@]} + ${#zst_files[@]} ))" -eq 0 ]; then
-    selected_from="directory glob (no verify status available)"
-    dat_files=( "$jobdir"/rels/wu-*.dat "$jobdir"/rels/blk-*.dat )
-    zst_files=( "$jobdir"/rels/wu-*.dat.zst "$jobdir"/rels/blk-*.dat.zst )
-fi
-
-total=$(( ${#dat_files[@]} + ${#zst_files[@]} ))
-[ "$total" -gt 0 ] || { echo "no relation files under $jobdir/rels" >&2; exit 1; }
-echo "selecting relation files from: $selected_from"
-
-if [ ${#zst_files[@]} -gt 0 ]; then
-    command -v zstd >/dev/null || { echo "zstd not found in PATH, needed to decompress .dat.zst" >&2; exit 1; }
-fi
-
-# Move aside any prior nfs.dat — yafu's auto-rewrite would clobber relations.
-if [ -f "$yafu_dir/nfs.dat" ]; then
-    mv "$yafu_dir/nfs.dat" "$yafu_dir/nfs.dat.prev.$(date +%s)"
-fi
-
-# Assemble: header + per-workunit relations. xargs avoids ARG_MAX with ~38k files.
-# Serial concatenation — relation order doesn't matter to msieve, but parallel
-# writers to one stdout would interleave bytes and corrupt lines.
-{
-    echo "N $N"
-    if [ ${#dat_files[@]} -gt 0 ]; then
-        printf '%s\0' "${dat_files[@]}" | xargs -0 cat
-    fi
-    if [ ${#zst_files[@]} -gt 0 ]; then
-        printf '%s\0' "${zst_files[@]}" | xargs -0 zstd -dcq
-    fi
-} > "$yafu_dir/nfs.dat"
-
-bytes=$(stat -c %s "$yafu_dir/nfs.dat")
-lines=$(wc -l < "$yafu_dir/nfs.dat")
-echo "wrote $yafu_dir/nfs.dat  ($bytes bytes, $lines lines, $total workunits: ${#dat_files[@]} raw + ${#zst_files[@]} zstd)"
-echo "  N: ${N:0:20}...${N: -8}"
-echo "  first relation: $(sed -n '2p' "$yafu_dir/nfs.dat" | head -c 80)"
 
 cmd=( ./yafu "factor($N)" "-$phase" -R -v -threads "$threads" )
-# Printable form: bash drops the quotes around factor($N) when joining the
-# array with spaces, and the parens break copy-paste without them.
-printable="./yafu \"factor($N)\" -$phase -R -v -threads $threads"
-
-if [ "$do_run" -eq 1 ]; then
-    echo "running: cd $yafu_dir && $printable"
+printf -v printable '%q ' "${cmd[@]}"
+printf -v quoted_dir '%q' "$yafu_dir"
+if [ "$check" -eq 1 ]; then
+    echo "check complete; no output files changed"
+elif [ "$do_run" -eq 1 ]; then
+    echo "running: cd $quoted_dir && $printable"
     cd "$yafu_dir"
     "${cmd[@]}"
 else
-    echo
-    echo "next: cd $yafu_dir && $printable"
+    echo "next: cd $quoted_dir && $printable"
 fi

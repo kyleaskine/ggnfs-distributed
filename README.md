@@ -86,6 +86,57 @@ to YAFU:
 
     ./finalize-nfs.sh --jobdir=/tmp/myjob --yafu-dir=/path/to/yafu --threads=8 --run
 
+For a local `pull-rels.sh` archive, use the same command with its local
+directory, for example `--jobdir=./snfs301`. Finalization reads `archive/`
+and `rels/`, using `job.db` or the newest usable `incoming/<timestamp>/job.db`
+snapshot to select passed submissions. Automatic discovery checks snapshot
+integrity and schema, warning and trying older snapshots if a transfer left
+an incomplete database. It includes both CPU `wu-*` and GPU
+`blk-*` files, raw or zstd-compressed, and excludes files in `incoming/`.
+GPU relations use the same format; YAFU/msieve removes duplicates during
+filtering, so raw GPU relation counts can overstate the usable yield.
+The target YAFU reader supports 64-bit prime factors but requires `b < 2^32`.
+Finalization omits and counts relations with larger `b` coordinates, which
+GPU sieving can produce. The source archives remain intact. Without this
+step, enough such relations can trigger YAFU's 10,000-relation-error abort.
+This is an export constraint for that reader, not a validity requirement:
+sieving and verification retain wide-`b` relations for consumers such as
+CADO and msieve builds that support them.
+
+Use `--check` to check job identity and report eligible file counts without
+reading relation contents or assembling data; `--check --run` still only
+checks. Use `--phase=nc1 --run` to run filtering only. Missing local files
+recorded as passed in the snapshot produce a warning. Query failures in a
+selected database abort; directory globbing is used only when no database
+is available. `--jobdb=PATH` selects a particular snapshot and does not fall
+back to another database on failure.
+
+Pulls retain the original `files/<sha>.job` beside each database snapshot.
+With no new relations, they fetch only the small job file into
+`<local-dir>/files/` if needed, without another full database snapshot or
+`incoming/<timestamp>/` directory. Remote job metadata is checked and copied
+before any relations are moved. For an older archive, run
+another pull or supply `--job-file=PATH` with the original job file. The
+finalizer also looks in `<jobdir>/files/`, `<jobdir>.job`, and the existing
+YAFU `nfs.job`, requiring a match with the database's job hash. The existing
+YAFU `nfs.job` is an automatic source only when a database authenticates it.
+A local
+client caches the original at `<client-workdir>/files/<sha>` (the default
+workdir is `/tmp/ggnfs-client`; the cached filename has no `.job` extension).
+Pass that extensionless cache path with `--job-file=PATH`, or copy it into
+`<jobdir>/files/<sha>.job`; automatic discovery there uses `*.job`.
+
+The `nc2`, `nc3`, and `ncr` phases reuse the existing `nfs.dat` so relation
+indices stay consistent with filtering output and LA checkpoints. Start
+again at filtering if you want to incorporate additional relations.
+
+Some YAFU builds have a 300-byte `LINE_BUF_SIZE` in
+`ms_include/savefile.h`. A long decimal `N` header can then be split into
+multiple reads, with its trailing digits reported as an invalid first
+relation. The full header in `nfs.dat` is correct; the reader buffer needs
+to be enlarged in that YAFU build. Do not change the reader or file during
+an existing filtering/LA/sqrt run, whose relation indices must stay stable.
+
 To stage relation files for download before validating or deleting them
 from the server, move the contents of `<jobdir>/rels` into a separate
 folder:
@@ -96,8 +147,8 @@ Use `--dry-run` first to preview the move, and `--overwrite` only if
 replacing same-named files in the destination is intentional.
 
 `finalize-nfs.sh` aborts if `<yafu-dir>/nfs.job` differs from the `.job`
-the server distributed — mismatched factor-base settings silently
-corrupt filtering, so the script enforces a SHA match.
+the server distributed, and checks that job against the database's SHA
+when available. This prevents mixing jobs or silently changing settings.
 
 ## Adding more work to a running job
 

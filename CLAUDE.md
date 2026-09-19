@@ -26,8 +26,9 @@ There is no linter config and no CI. There is a small hand-run test suite under 
 
 - `tests/block_test.c` — links `db.o` directly (no server, no network) and exercises the GPU block layer: lease/renew/submit/release, contiguity, the attempt ceiling, expiry accounting, id sequencing. **Every geometry case runs in both scan directions**, because `db_block_lease` stores its candidate run in scan order and an index naming one end descending names the other end ascending. Both plausible sign errors were introduced deliberately during development; each produced 71 failures here.
 - `tests/dashboard_test.js` — checks the client rollup arithmetic, reading the functions straight out of `dashboard.html` so it cannot drift from what ships. Needs `node`; skipped with a notice if absent. That column has been wrong twice in opposite directions, so it is worth a check.
+- `tests/finalize_test.py` — offline pull/finalize integration tests, run by `make test` with Python 3, sqlite3, and zstd. Covers job identity, interrupted snapshots, CPU/GPU assembly, YAFU export limits, output preservation, and metadata preflight using local SSH/rsync stand-ins.
 
-Neither covers the HTTP layer or the verifier end to end; those were tested by hand against real archived relations.
+These do not cover the HTTP layer or the verifier end to end; those were tested by hand against real archived relations.
 
 `dashboard_html.h` is generated from `dashboard.html` by `xxd -i` and gets regenerated automatically because `server.o` depends on it.
 

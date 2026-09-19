@@ -3,10 +3,11 @@
 #
 # Workflow per run:
 #   1. flock on a local lockfile so two invocations can't collide.
-#   2. SSH in, pipe move-rels.sh up over stdin, run it with --verified-only
+#   2. Check and stage the original .job before moving any relations.
+#      SSH in, pipe move-rels.sh up over stdin, run it with --verified-only
 #      against a fresh per-run staging dir: <remote-jobdir>-staging/<ts>/
 #   3. Take a consistent snapshot of job.db (sqlite3 .backup) into the same
-#      staging dir.
+#      staging dir, along with the original files/<sha>.job for finalization.
 #   4. rsync the staging dir down to <local-dir>/incoming/<ts>/.
 #   5. Run ggnfs-verify against the downloaded files (parse + q-range +
 #      full GMP norm on every relation), batched through xargs so a large
@@ -18,6 +19,8 @@
 #   6. Only if validation passed: move files from incoming/ to archive/.
 #   7. Only after step 6 succeeds, ssh in and rm -rf the remote staging dir.
 #      Any failure earlier leaves the staging dir on the server untouched.
+#   Empty pulls fetch only a missing .job into <local-dir>/files/, skipping
+#   the full database snapshot and per-run incoming directory.
 #
 # Usage:
 #   ./pull-rels.sh \
@@ -52,7 +55,7 @@ interactive=0
 ssh_extra=()
 
 usage() {
-    sed -n '2,36p' "$0"
+    sed -n '2,/^$/ { /^$/d; p; }' "$0"
 }
 
 for arg in "$@"; do
@@ -187,38 +190,42 @@ ssh_run "set -e
     test -f $(rq "$remote_jobdir/job.db") || { echo 'remote job.db missing' >&2; exit 1; }
     command -v sqlite3 >/dev/null 2>&1 || { echo 'sqlite3 missing on remote' >&2; exit 1; }"
 
+# Check immutable job metadata before relocating any relations. Explicit
+# sqlite options prevent ~/.sqliterc from changing machine-readable output.
+job_sha=$(ssh_run "sqlite3 -init /dev/null -readonly -batch -noheader -list $(rq "$remote_jobdir/job.db") \"SELECT value FROM meta WHERE key='job_sha256';\"")
+[[ "$job_sha" =~ ^[0-9a-f]{64}$ ]] || {
+    echo "invalid job_sha256 in remote database; relations were not moved" >&2; exit 1;
+}
+remote_job_sha=$(ssh_run "sha256sum -- $(rq "$remote_jobdir/files/$job_sha.job")" | awk '{print $1}')
+[ "$remote_job_sha" = "$job_sha" ] || {
+    echo "remote .job does not match database; relations were not moved" >&2; exit 1;
+}
+
 if [ "$dry_run" -eq 1 ]; then
     echo "dry-run: would create $remote_staging and stage verified files"
     echo "dry-run: would rsync to $local_incoming, validate, archive, and rm remote staging"
     exit 0
 fi
 
+# Copy and check the job before moving relations as well: missing files,
+# permissions, or a failed copy must leave rels/ intact.
+staged_job_sha=$(ssh_run "set -e
+    mkdir -p $(rq "$remote_staging/files")
+    cp -- $(rq "$remote_jobdir/files/$job_sha.job") $(rq "$remote_staging/files/$job_sha.job")
+    sha256sum -- $(rq "$remote_staging/files/$job_sha.job")" | awk '{print $1}')
+[ "$staged_job_sha" = "$job_sha" ] || {
+    echo "staged .job does not match database; relations were not moved" >&2; exit 1;
+}
+
 # --- Step 1: pipe move-rels.sh up and run --verified-only ---------------
 echo "[move] running move-rels.sh --verified-only on remote ..."
 ssh_pipe "bash -s -- --jobdir=$(rq "$remote_jobdir") --dest=$(rq "$remote_staging") --verified-only" \
     < "$move_rels_sh"
 
-# --- Step 2: sqlite3 .backup of job.db into the staging dir -------------
-# sqlite3's dot-command needs the destination single-quoted inside the
-# command string, and the whole second arg double-quoted at the shell level.
-echo "[snap] taking job.db snapshot into staging ..."
-ssh_run "sqlite3 $(rq "$remote_jobdir/job.db") \".backup '$remote_staging/job.db'\""
-
 # How many .dat.zst files did we end up with?
 remote_count=$(ssh_run "find $(rq "$remote_staging") -maxdepth 1 -name '*.dat*' -type f | wc -l" | tr -d ' \n')
 remote_count=${remote_count:-0}
 
-if [ "$remote_count" -eq 0 ]; then
-    echo "[skip] no verified relation files in staging; cleaning up empty staging dir"
-    if [ "$keep_staging" -eq 0 ]; then
-        ssh_run "rm -rf -- $(rq "$remote_staging")"
-    fi
-    exit 0
-fi
-
-# --- Step 3: rsync staging dir down -------------------------------------
-echo "[xfer] rsyncing $remote_count file(s) to $local_incoming ..."
-mkdir -p "$local_incoming"
 # --partial + --append-verify make this resumable. -t preserves mtime so
 # repeat runs don't redo work (not that we should ever re-pull, but cheap).
 # Use the same ssh args as the rest of the script via -e.
@@ -226,8 +233,55 @@ rsync_ssh="ssh"
 for a in "${ssh_args[@]}"; do
     rsync_ssh="$rsync_ssh $(printf %q "$a")"
 done
+
+if [ "$remote_count" -eq 0 ]; then
+    # Older archives may still need the small .job file, but an empty pull
+    # does not warrant another full database snapshot or incoming/<ts>/.
+    local_job="$local_dir/files/$job_sha.job"
+    local_job_sha=""
+    if [ -f "$local_job" ]; then
+        local_job_sha=$(sha256sum "$local_job" | awk '{print $1}')
+    fi
+    if [ "$local_job_sha" != "$job_sha" ]; then
+        echo "[meta] no new relations; downloading original .job only"
+        mkdir -p "$local_dir/files"
+        rsync -av --checksum -e "$rsync_ssh" \
+            "$ssh_host:$remote_staging/files/" "$local_dir/files/"
+        local_job_sha=$(sha256sum "$local_job" | awk '{print $1}')
+        [ "$local_job_sha" = "$job_sha" ] || {
+            echo "downloaded .job does not match database; staging preserved" >&2; exit 1;
+        }
+    else
+        echo "[skip] no new relations; original .job already available"
+    fi
+    if [ "$keep_staging" -eq 0 ]; then
+        ssh_run "rm -rf -- $(rq "$remote_staging")"
+    else
+        echo "[keep] remote staging preserved at $remote_staging"
+    fi
+    exit 0
+fi
+
+# --- Step 2: sqlite3 .backup of job.db into the staging dir -------------
+# Read the snapshot after moving so it records verification of all files.
+# Quote for sqlite's dot-command first, then for the remote shell.
+snapshot_path=${remote_staging//\\/\\\\}
+snapshot_path=${snapshot_path//\"/\\\"}
+backup_command=".backup \"$snapshot_path/job.db\""
+echo "[snap] taking job.db snapshot into staging ..."
+ssh_run "sqlite3 -init /dev/null -readonly -batch $(rq "$remote_jobdir/job.db") $(rq "$backup_command")"
+
+# --- Step 3: rsync staging dir down -------------------------------------
+echo "[xfer] rsyncing $remote_count file(s) to $local_incoming ..."
+mkdir -p "$local_incoming"
 rsync -av --partial --append-verify -e "$rsync_ssh" \
     "$ssh_host:$remote_staging/" "$local_incoming/"
+
+local_job_sha=$(sha256sum "$local_incoming/files/$job_sha.job" | awk '{print $1}')
+[ "$local_job_sha" = "$job_sha" ] || {
+    echo "downloaded .job does not match snapshot; remote staging preserved" >&2
+    exit 1
+}
 
 local_count=$(find "$local_incoming" -maxdepth 1 -name '*.dat*' -type f | wc -l)
 if [ "$local_count" -ne "$remote_count" ]; then

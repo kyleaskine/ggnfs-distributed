@@ -96,6 +96,8 @@ vendor/%.o: vendor/%.c
 # geometry case in both scan directions. dashboard_test reads the rollup
 # functions out of dashboard.html so it cannot drift from what ships; it needs
 # node, and is skipped with a notice when node is absent.
+# finalize_test.py exercises pull/finalize with temporary local fixtures;
+# it needs python3, sqlite3, and zstd (no SSH server or YAFU run).
 TEST_BIN := tests/block_test
 
 $(TEST_BIN): tests/block_test.c db.o vendor/sqlite3.o
@@ -104,9 +106,10 @@ $(TEST_BIN): tests/block_test.c db.o vendor/sqlite3.o
 .PHONY: test
 test: $(TEST_BIN)
 	./$(TEST_BIN)
-	@command -v node >/dev/null 2>&1 \
-	  && node tests/dashboard_test.js \
-	  || echo "note: node not found; skipping tests/dashboard_test.js"
+	@if command -v node >/dev/null 2>&1; then \
+	  node tests/dashboard_test.js; \
+	else echo "note: node not found; skipping tests/dashboard_test.js"; fi
+	python3 -B tests/finalize_test.py
 
 clean:
 	rm -f $(ALL_OWN_OBJS) $(ALL_VENDOR_OBJS) $(SERVER_BIN) $(CLIENT_BIN) $(VERIFY_BIN) $(DASHBOARD_HEADER) $(TEST_BIN)

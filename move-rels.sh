@@ -83,14 +83,14 @@ if [ "$verified_only" -eq 1 ]; then
     declare -A verified
     while IFS= read -r id; do
         [ -n "$id" ] && verified["$id"]=1
-    done < <(sqlite3 -readonly -batch "$db" \
+    done < <(sqlite3 -init /dev/null -readonly -batch -noheader -list "$db" \
         "SELECT id FROM workunits WHERE state = 'verified';")
 
     # gpu_blocks only exists on a jobdir served by a build that has blocks;
     # tolerate its absence rather than failing on an older one.
     while IFS= read -r id; do
         [ -n "$id" ] && verified["$id"]=1
-    done < <(sqlite3 -readonly -batch "$db" \
+    done < <(sqlite3 -init /dev/null -readonly -batch -noheader -list "$db" \
         "SELECT id FROM gpu_blocks WHERE state = 'verified';" 2>/dev/null || true)
 
     if [ "${#verified[@]}" -eq 0 ]; then
