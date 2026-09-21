@@ -462,11 +462,15 @@ EOF
 }
 
 # ------------------------------------------------------------- settings -----
+#
+# Three labelled groups, and the identity questions are adjacent. They used to
+# be interleaved with the sizing ones -- base id, then workers, then the CPU
+# name, then device, then prefetch, then the GPU name -- which read exactly
+# like the old single-name flow until you were most of the way through it.
 echo
-echo "==> Coordinator settings"
+echo "==> Coordinator"
 [ -n "$SERVER" ] || prompt_tty SERVER "Server URL (http://host:port)" ""
 [ -n "$TOKEN" ]  || prompt_tty TOKEN  "Auth token" ""
-[ -n "$CLIENT_ID" ] || prompt_tty CLIENT_ID "Client id (base)" "$(hostname -s 2>/dev/null || echo worker)"
 
 if [ -z "$SERVER" ]; then
     echo "error: a server URL is required (--server=http://host:port)." >&2
@@ -477,26 +481,36 @@ if [ -z "$TOKEN" ]; then
     exit 1
 fi
 
-if [ "$MODE" = "cpu" ] || [ "$MODE" = "both" ]; then
-    [ -n "$WORKERS" ] || prompt_tty WORKERS "Workers (CPU sievers)" "$(nproc 2>/dev/null || echo 4)"
-    require_int "$WORKERS" "workers" 1 256
+echo
+echo "==> Dashboard names"
+if [ "$MODE" = "both" ]; then
+    echo "    CPU and GPU sieve independently and get their own names."
+elif [ "$MODE" = "gpu" ]; then
+    echo "    The name this card reports to the coordinator."
+else
+    echo "    The name this box reports to the coordinator."
+fi
+[ -n "$CLIENT_ID" ] || prompt_tty CLIENT_ID "Your name / base" \
+    "$(hostname -s 2>/dev/null || echo worker)"
 
-    # CPU and GPU get INDEPENDENT names, not one name with suffixes: a
-    # dashboard row saying "KyleAskine-9800X3D" tells you which silicon
-    # produced the relations, which "KyleAskine" next to "KyleAskine-gpu0"
-    # does not.
+# The device index is asked here rather than with the other GPU sizing: on a
+# multi-card box it is part of the name below, so it has to be known first.
+if [ "$MODE" = "gpu" ] || [ "$MODE" = "both" ]; then
+    [ -n "$DEVICE" ] || prompt_tty DEVICE "CUDA device index" "0"
+    require_int "$DEVICE" "device" 0 255
+fi
+
+# CPU and GPU get INDEPENDENT names, not one name with suffixes: a dashboard
+# row saying "KyleAskine-9800X3D" tells you which silicon produced the
+# relations, which "KyleAskine" next to "KyleAskine-gpu0" does not.
+if [ "$MODE" = "cpu" ] || [ "$MODE" = "both" ]; then
     if [ -z "$CPU_CLIENT_ID" ]; then
         cpu_tag=$(hw_tag_cpu || true)
         [ -n "$cpu_tag" ] && cpu_def="$CLIENT_ID-$cpu_tag" || cpu_def="$CLIENT_ID"
-        prompt_tty CPU_CLIENT_ID "CPU client id" "$cpu_def"
+        prompt_tty CPU_CLIENT_ID "  CPU name" "$cpu_def"
     fi
 fi
 if [ "$MODE" = "gpu" ] || [ "$MODE" = "both" ]; then
-    [ -n "$DEVICE" ]   || prompt_tty DEVICE   "CUDA device index" "0"
-    [ -n "$PREFETCH" ] || prompt_tty PREFETCH "Lease slots (prefetch)" "2"
-    require_int "$DEVICE" "device" 0 255
-    require_int "$PREFETCH" "prefetch" 1 8
-
     if [ -z "$GPU_CLIENT_ID" ]; then
         gpu_tag=$(hw_tag_gpu "$DEVICE" || true)
         [ -n "$gpu_tag" ] && gpu_def="$CLIENT_ID-$gpu_tag" || gpu_def="$CLIENT_ID-gpu$DEVICE"
@@ -507,8 +521,20 @@ if [ "$MODE" = "gpu" ] || [ "$MODE" = "both" ]; then
         if [ "$(nvidia-smi -L 2>/dev/null | wc -l)" -gt 1 ]; then
             gpu_def="$gpu_def-gpu$DEVICE"
         fi
-        prompt_tty GPU_CLIENT_ID "GPU client id" "$gpu_def"
+        prompt_tty GPU_CLIENT_ID "  GPU name" "$gpu_def"
     fi
+fi
+
+echo
+echo "==> Sizing"
+if [ "$MODE" = "cpu" ] || [ "$MODE" = "both" ]; then
+    [ -n "$WORKERS" ] || prompt_tty WORKERS "Workers (CPU sievers)" \
+        "$(nproc 2>/dev/null || echo 4)"
+    require_int "$WORKERS" "workers" 1 256
+fi
+if [ "$MODE" = "gpu" ] || [ "$MODE" = "both" ]; then
+    [ -n "$PREFETCH" ] || prompt_tty PREFETCH "Lease slots (prefetch)" "2"
+    require_int "$PREFETCH" "prefetch" 1 8
 fi
 
 echo
