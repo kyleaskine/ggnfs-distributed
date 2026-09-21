@@ -89,9 +89,10 @@ to YAFU:
 For a local `pull-rels.sh` archive, use the same command with its local
 directory, for example `--jobdir=./snfs301`. Finalization reads `archive/`
 and `rels/`, using `job.db` or the newest usable `incoming/<timestamp>/job.db`
-snapshot to select passed submissions. Automatic discovery checks snapshot
-integrity and schema, warning and trying older snapshots if a transfer left
-an incomplete database. It includes both CPU `wu-*` and GPU
+snapshot to select passed submissions. Automatic discovery checks database
+integrity and schema, warning and trying snapshots newest first if the
+top-level `job.db` is empty or unusable, or a transfer left an incomplete
+snapshot. It includes both CPU `wu-*` and GPU
 `blk-*` files, raw or zstd-compressed, and excludes files in `incoming/`.
 GPU relations use the same format; YAFU/msieve removes duplicates during
 filtering, so raw GPU relation counts can overstate the usable yield.
@@ -102,6 +103,11 @@ step, enough such relations can trigger YAFU's 10,000-relation-error abort.
 This is an export constraint for that reader, not a validity requirement:
 sieving and verification retain wide-`b` relations for consumers such as
 CADO and msieve builds that support them.
+Pass `--keep-large-b` to preserve these relations, including `b = 2^32`,
+when assembling `nfs.dat` with `nc` or `nc1`, for a reader supporting those
+values. This bypasses the compatibility scan without counting wide values.
+Resume phases report that the flag has no effect and reuse the existing
+data unchanged.
 
 Use `--check` to check job identity and report eligible file counts without
 reading relation contents or assembling data; `--check --run` still only
@@ -128,7 +134,9 @@ Pass that extensionless cache path with `--job-file=PATH`, or copy it into
 
 The `nc2`, `nc3`, and `ncr` phases reuse the existing `nfs.dat` so relation
 indices stay consistent with filtering output and LA checkpoints. Start
-again at filtering if you want to incorporate additional relations.
+again at filtering if you want to incorporate additional relations or change
+`--keep-large-b`. Reassembly warns when existing filtering/LA artifacts are
+present; old checkpoints must not be resumed against the rebuilt data.
 
 Some YAFU builds have a 300-byte `LINE_BUF_SIZE` in
 `ms_include/savefile.h`. A long decimal `N` header can then be split into

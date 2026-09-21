@@ -5,13 +5,14 @@
 # Usage:
 #   finalize-nfs.sh --jobdir=./snfs301 --yafu-dir=/path/to/yafu
 #                   [--job-file=PATH] [--jobdb=PATH] [--threads=8]
-#                   [--run] [--phase=nc|nc1|nc2|nc3|ncr] [--check]
+#                   [--run] [--phase=nc|nc1|nc2|nc3|ncr] [--check] [--keep-large-b]
 #
 # Reads archive/ and rels/, using job.db or the newest usable incoming snapshot.
 # --check validates inputs and reports selected files without writing output.
 # nc/nc1 assemble relations; nc2/nc3/ncr reuse the existing nfs.dat because
 # filtering artifacts and LA checkpoints depend on its exact relation order.
 # Without --run, prints the YAFU command; --phase=nc1 runs only filtering.
+# --keep-large-b preserves relations with b >= 2^32 when assembling nfs.dat.
 
 set -euo pipefail
 export LC_ALL=C
@@ -23,6 +24,7 @@ db=""
 threads=1
 do_run=0
 check=0
+keep_large_b=0
 phase="nc"
 
 for arg in "$@"; do
@@ -35,7 +37,8 @@ for arg in "$@"; do
         --phase=*)    phase="${arg#*=}" ;;
         --run)        do_run=1 ;;
         --check)      check=1 ;;
-        -h|--help)    sed -n '2,14p' "$0"; exit 0 ;;
+        --keep-large-b) keep_large_b=1 ;;
+        -h|--help)    sed -n '2,/^$/ { /^$/d; p; }' "$0"; exit 0 ;;
         *) echo "unknown arg: $arg" >&2; exit 2 ;;
     esac
 done
@@ -54,7 +57,10 @@ db="${db/#\~/$HOME}"
 [ -d "$jobdir" ] || fail "jobdir $jobdir does not exist"
 [ -d "$yafu_dir" ] || fail "yafu dir $yafu_dir does not exist"
 shopt -s nullglob
-sqlite_read() { sqlite3 -init /dev/null -readonly -batch -noheader -list "$@"; }
+sqlite_read() {
+    command -v sqlite3 >/dev/null || { echo "sqlite3 is required to read job databases" >&2; return 1; }
+    sqlite3 -init /dev/null -readonly -batch -noheader -list "$@"
+}
 tmp_dat=""
 passed_list=""
 cleanup() {
@@ -64,41 +70,58 @@ cleanup() {
 }
 trap cleanup EXIT
 
-snapshot_usable() {
+database_usable() {
     local result
     result=$(sqlite_read "$1" "PRAGMA quick_check;
         SELECT value FROM meta WHERE key='job_sha256';
-        SELECT file_path, verify_status FROM submissions LIMIT 0;" 2>/dev/null) || return 1
-    [[ "$result" =~ ^ok$'\n'[0-9a-f]{64}$ ]]
+        SELECT file_path, verify_status FROM submissions LIMIT 0;" 2>&1) || {
+        echo "$result" >&2
+        return 1
+    }
+    if [[ ! "$result" =~ ^ok$'\n'[0-9a-f]{64}$ ]]; then
+        echo "invalid database integrity or job_sha256 in $1: $result" >&2
+        return 1
+    fi
+    job_sha="${result#*$'\n'}"
 }
 
 # Pulls retain cumulative DB snapshots, named with sortable UTC timestamps.
 # Never select relations from incoming/: validation may have failed there.
+job_sha=""
 if [ -z "$db" ]; then
+    database_found=0
     if [ -f "$jobdir/job.db" ]; then
-        db="$jobdir/job.db"
-    else
+        database_found=1
+        if database_usable "$jobdir/job.db"; then
+            db="$jobdir/job.db"
+        else
+            echo "warning: skipping unusable database: $jobdir/job.db" >&2
+        fi
+    fi
+    if [ -z "$db" ]; then
         snapshots=( "$jobdir"/incoming/*/job.db )
         if [ ${#snapshots[@]} -gt 0 ]; then
-            command -v sqlite3 >/dev/null || fail "sqlite3 is required to read snapshots"
+            database_found=1
             for ((i=${#snapshots[@]}-1; i>=0; i--)); do
-                if snapshot_usable "${snapshots[i]}"; then
+                if database_usable "${snapshots[i]}"; then
                     db="${snapshots[i]}"
                     break
                 fi
                 echo "warning: skipping unusable snapshot: ${snapshots[i]}" >&2
             done
-            [ -n "$db" ] || fail "no usable database snapshot found; refusing unverified directory fallback"
         fi
     fi
+    if [ "$database_found" -eq 1 ] && [ -z "$db" ]; then
+        fail "no usable database found; refusing unverified directory fallback"
+    fi
 fi
-job_sha=""
 if [ -n "$db" ]; then
     [ -f "$db" ] || fail "database does not exist: $db"
-    command -v sqlite3 >/dev/null || fail "sqlite3 is required to read $db"
-    # Capture query status directly: process substitution hides sqlite errors.
-    job_sha=$(sqlite_read "$db" \
-        "SELECT value FROM meta WHERE key='job_sha256';") || fail "cannot read job identity from $db"
+    # Discovery already read the identity. Explicit --jobdb still fails directly.
+    if [ -z "$job_sha" ]; then
+        job_sha=$(sqlite_read "$db" \
+            "SELECT value FROM meta WHERE key='job_sha256';") || fail "cannot read job identity from $db"
+    fi
     [[ "$job_sha" =~ ^[0-9a-f]{64}$ ]] || fail "missing or invalid job_sha256 in $db"
     echo "using database: $db"
 fi
@@ -146,6 +169,15 @@ if [ "$do_run" -eq 1 ] && [ "$check" -eq 0 ]; then
 fi
 
 if [[ "$phase" = nc || "$phase" = nc1 ]]; then
+    if [ "$keep_large_b" -eq 1 ]; then
+        echo "--keep-large-b: preserving all b values; requires a reader supporting b >= 2^32"
+    fi
+    artifacts=( "$yafu_dir"/nfs.dat.{p,br,cyc,dep,hc,mat,lp,d,ranges} "$yafu_dir"/nfs.dat.mat.* )
+    for artifact in "${artifacts[@]}"; do
+        [ -e "$artifact" ] || continue
+        echo "warning: existing filtering/LA artifact: $artifact; rebuilding nfs.dat requires restarting from filtering, not resuming old checkpoints" >&2
+        break
+    done
     dat_files=()
     zst_files=()
     declare -A seen=()
@@ -212,7 +244,11 @@ if [[ "$phase" = nc || "$phase" = nc1 ]]; then
             if [ ${#zst_files[@]} -gt 0 ]; then
                 printf '%s\0' "${zst_files[@]}" | xargs -0 zstd -dcq -- || exit 1
             fi
-        } | awk '
+        } | {
+            if [ "$keep_large_b" -eq 1 ]; then
+                cat
+            else
+                awk '
             # The target YAFU reader stores b in uint32_t. Other consumers can
             # use wider b: do not impose this limit in sieving or verification.
             # GPU output can contain larger
@@ -230,7 +266,9 @@ if [[ "$phase" = nc || "$phase" = nc1 ]]; then
                 if (dropped)
                     printf "YAFU compatibility: omitted %.0f relations with b > 4294967295 (originals retained in source files)\n", dropped > "/dev/stderr"
             }
-        ' > "$tmp_dat"
+                '
+            fi
+        } > "$tmp_dat"
         if [ -f "$yafu_dir/nfs.dat" ]; then
             chmod --reference="$yafu_dir/nfs.dat" "$tmp_dat"
             backup=$(mktemp "$yafu_dir/nfs.dat.prev.XXXXXX")
@@ -251,6 +289,9 @@ if [[ "$phase" = nc || "$phase" = nc1 ]]; then
         echo "  first relation: $(sed -n '2{p;q;}' "$yafu_dir/nfs.dat" | cut -c 1-80)"
     fi
 else
+    if [ "$keep_large_b" -eq 1 ]; then
+        echo "--keep-large-b has no effect for --phase=$phase; reusing existing nfs.dat unchanged"
+    fi
     [ -f "$yafu_dir/nfs.dat" ] || fail "--phase=$phase requires existing nfs.dat from filtering"
     [ -f "$yafu_dir/nfs.job" ] || fail "--phase=$phase requires existing nfs.job from filtering"
     IFS= read -r header < "$yafu_dir/nfs.dat" || fail "existing nfs.dat has an empty or incomplete header"

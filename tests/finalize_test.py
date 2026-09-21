@@ -1,5 +1,6 @@
 """Offline integration tests for archive finalization and pull metadata."""
 import hashlib
+from contextlib import closing
 import os
 from pathlib import Path
 import shutil
@@ -17,13 +18,14 @@ GPU = b'-4,3:100000001,2:2,100000003\n'
 
 def database(path, rows=()):
     path.parent.mkdir(parents=True, exist_ok=True)
-    with sqlite3.connect(path) as db:
-        db.executescript('CREATE TABLE meta(key TEXT, value TEXT);'
-                         'CREATE TABLE submissions(id INTEGER PRIMARY KEY, file_path TEXT, verify_status TEXT);'
-                         'CREATE TABLE workunits(id TEXT, state TEXT);'
-                         'CREATE TABLE gpu_blocks(id TEXT, state TEXT);')
-        db.execute('INSERT INTO meta VALUES (?, ?)', ('job_sha256', SHA))
-        db.executemany('INSERT INTO submissions(file_path, verify_status) VALUES (?, ?)', rows)
+    with closing(sqlite3.connect(path)) as db:
+        with db:
+            db.executescript('CREATE TABLE meta(key TEXT, value TEXT);'
+                             'CREATE TABLE submissions(id INTEGER PRIMARY KEY, file_path TEXT, verify_status TEXT);'
+                             'CREATE TABLE workunits(id TEXT, state TEXT);'
+                             'CREATE TABLE gpu_blocks(id TEXT, state TEXT);')
+            db.execute('INSERT INTO meta VALUES (?, ?)', ('job_sha256', SHA))
+            db.executemany('INSERT INTO submissions(file_path, verify_status) VALUES (?, ?)', rows)
 
 
 @unittest.skipUnless(shutil.which('sqlite3') and shutil.which('zstd'), 'requires sqlite3 and zstd')
@@ -72,10 +74,55 @@ class FinalizeTest(unittest.TestCase):
         omit = b'2,4294967296:2:3\n3,18446744073709551615:2:3\n'
         source = self.job / 'archive/wu-cpu.dat'
         source.write_bytes(CPU + keep + omit)
+        compressed = self.job / 'archive/blk-gpu.dat.zst'
+        compressed_bytes = subprocess.run(
+            ['zstd', '-cq'], input=GPU + keep + omit, capture_output=True, check=True).stdout
+        compressed.write_bytes(compressed_bytes)
         result = self.run_finalize()
-        self.assertEqual((self.out / 'nfs.dat').read_bytes(), b'N 123456789\n' + CPU + keep + GPU)
-        self.assertIn('omitted 2 relations', result.stderr)
+        self.assertEqual((self.out / 'nfs.dat').read_bytes(), b'N 123456789\n' + CPU + keep + GPU + keep)
+        self.assertIn('omitted 4 relations', result.stderr)
         self.assertEqual(source.read_bytes(), CPU + keep + omit)
+        self.assertEqual(compressed.read_bytes(), compressed_bytes)
+
+    def test_keep_large_b_preserves_raw_and_compressed_relations(self):
+        wide = b'-1,4294967295:100000001:200000003\n2,4294967296:2:3\n3,18446744073709551615:2:3\n'
+        raw = self.job / 'archive/wu-cpu.dat'
+        compressed = self.job / 'archive/blk-gpu.dat.zst'
+        raw.write_bytes(CPU + wide)
+        compressed_bytes = subprocess.run(
+            ['zstd', '-cq'], input=GPU + wide, capture_output=True, check=True).stdout
+        compressed.write_bytes(compressed_bytes)
+        for phase in ('nc', 'nc1'):
+            with self.subTest(phase=phase):
+                self.out = self.base / f'output-{phase}'
+                self.out.mkdir()
+                result = self.run_finalize('--keep-large-b', f'--phase={phase}')
+                self.assertEqual((self.out / 'nfs.dat').read_bytes(),
+                                 b'N 123456789\n' + CPU + wide + GPU + wide)
+                self.assertEqual(result.stderr, '')
+                self.assertIn('preserving all b values', result.stdout)
+                self.assertEqual(raw.read_bytes(), CPU + wide)
+                self.assertEqual(compressed.read_bytes(), compressed_bytes)
+
+    def test_keep_large_b_corrupt_compression_preserves_output(self):
+        (self.out / 'nfs.dat').write_bytes(b'OLD DATA\n')
+        (self.job / 'archive/blk-gpu.dat.zst').write_bytes(b'corrupt')
+        self.run_finalize('--keep-large-b', ok=False)
+        self.assertEqual((self.out / 'nfs.dat').read_bytes(), b'OLD DATA\n')
+        self.assertEqual(list(self.out.glob('.nfs.dat.*')), [])
+
+    def test_reassembly_warns_about_existing_checkpoint(self):
+        artifact = self.out / 'nfs.dat.mat.chk'
+        artifact.write_bytes(b'CHECKPOINT\n')
+        result = self.run_finalize('--keep-large-b')
+        self.assertIn(str(artifact), result.stderr)
+        self.assertIn('restarting from filtering', result.stderr)
+        self.assertEqual(artifact.read_bytes(), b'CHECKPOINT\n')
+
+    def test_help_includes_large_b_explanation(self):
+        result = self.run_finalize('--help')
+        self.assertIn('--keep-large-b preserves relations', result.stdout)
+        self.assertNotIn('set -euo', result.stdout)
 
     def test_server_layout_and_duplicate_paths(self):
         shutil.move(self.job / 'archive', self.job / 'rels')
@@ -125,7 +172,8 @@ class FinalizeTest(unittest.TestCase):
         old = b'N 123456789\n' + GPU + CPU
         (self.out / 'nfs.dat').write_bytes(old)
         for phase in ('nc2', 'nc3', 'ncr'):
-            self.run_finalize(f'--phase={phase}')
+            result = self.run_finalize(f'--phase={phase}', '--keep-large-b')
+            self.assertIn(f'--keep-large-b has no effect for --phase={phase}', result.stdout)
             self.assertEqual((self.out / 'nfs.dat').read_bytes(), old)
         self.assertEqual(list(self.out.glob('nfs.dat.prev.*')), [])
 
@@ -222,8 +270,109 @@ class FinalizeTest(unittest.TestCase):
     def test_all_snapshots_unusable_never_globs(self):
         self.snapshot.write_bytes(b'truncated')
         result = self.run_finalize(ok=False)
-        self.assertIn('no usable database snapshot', result.stderr)
+        self.assertIn('no usable database found', result.stderr)
+        self.assertIn('not a database', result.stderr)
+        self.assertNotIn('top-level', result.stderr)
         self.assertFalse((self.out / 'nfs.dat').exists())
+
+    def test_unusable_top_level_database_uses_snapshot(self):
+        top = self.job / 'job.db'
+        for content in (b'', b'truncated'):
+            with self.subTest(content=content):
+                self.out = self.base / f'output-{len(content)}'
+                self.out.mkdir()
+                top.write_bytes(content)
+                result = self.run_finalize()
+                self.assertIn(f'skipping unusable database: {top}', result.stderr)
+                self.assertIn(f'using database: {self.snapshot}', result.stdout)
+                self.assertEqual((self.out / 'nfs.dat').read_bytes(), b'N 123456789\n' + CPU + GPU)
+                self.assertEqual(top.read_bytes(), content)
+
+    def test_top_level_database_missing_schema_uses_snapshot(self):
+        top = self.job / 'job.db'
+        database(top)
+        with sqlite3.connect(top) as db:
+            db.execute('DROP TABLE meta')
+        result = self.run_finalize('--check')
+        self.assertIn(f'skipping unusable database: {top}', result.stderr)
+        self.assertIn('no such table: meta', result.stderr)
+        self.assertIn(f'using database: {self.snapshot}', result.stdout)
+        self.assertEqual(list(self.out.iterdir()), [])
+
+    def test_valid_top_level_database_has_priority(self):
+        top = self.job / 'job.db'
+        database(top, [('/server/rels/wu-cpu.dat', 'passed')])
+        (self.job / 'files').mkdir()
+        (self.job / f'files/{SHA}.job').write_bytes(JOB)
+        result = self.run_finalize()
+        self.assertIn(f'using database: {top}', result.stdout)
+        self.assertEqual((self.out / 'nfs.dat').read_bytes(), b'N 123456789\n' + CPU)
+
+    def test_wal_primary_reads_uncheckpointed_submissions(self):
+        top = self.job / 'job.db'
+        database(top, [('/server/rels/wu-cpu.dat', 'passed')])
+        shutil.move(self.snapshot.parent / 'files', self.job / 'files')
+        self.snapshot.unlink()
+        with closing(sqlite3.connect(top)) as db:
+            self.assertEqual(db.execute('PRAGMA journal_mode=WAL').fetchone()[0], 'wal')
+            db.execute('PRAGMA wal_autocheckpoint=0')
+            with db:
+                db.execute("INSERT INTO submissions(file_path, verify_status) VALUES ('/server/rels/blk-gpu.dat.zst', 'passed')")
+            self.assertGreater(Path(f'{top}-wal').stat().st_size, 32)
+            # Keep the writer connection open so the committed row stays in WAL.
+            for readonly in (False, True):
+                with self.subTest(readonly=readonly):
+                    self.out = self.base / f'wal-output-{readonly}'
+                    self.out.mkdir()
+                    paths = [self.job, top, Path(f'{top}-wal'), Path(f'{top}-shm')]
+                    modes = [path.stat().st_mode & 0o777 for path in paths]
+                    try:
+                        if readonly:
+                            for path in paths:
+                                path.chmod(0o555 if path.is_dir() else 0o444)
+                        result = self.run_finalize()
+                        self.assertIn(f'using database: {top}', result.stdout)
+                        self.assertEqual((self.out / 'nfs.dat').read_bytes(),
+                                         b'N 123456789\n' + CPU + GPU)
+                    finally:
+                        for path, mode in zip(paths, modes):
+                            path.chmod(mode)
+
+    @unittest.skipIf(os.geteuid() == 0, 'root bypasses directory permissions')
+    def test_readonly_wal_without_sidecars_reports_sqlite_error(self):
+        top = self.job / 'job.db'
+        database(top)
+        with closing(sqlite3.connect(top)) as db:
+            self.assertEqual(db.execute('PRAGMA journal_mode=WAL').fetchone()[0], 'wal')
+        self.assertFalse(Path(f'{top}-wal').exists())
+        self.assertFalse(Path(f'{top}-shm').exists())
+        mode = self.job.stat().st_mode & 0o777
+        self.job.chmod(0o555)
+        try:
+            result = self.run_finalize('--check')
+            self.assertIn('readonly', result.stderr)
+            self.assertIn(f'skipping unusable database: {top}', result.stderr)
+            self.assertIn(f'using database: {self.snapshot}', result.stdout)
+            result = self.run_finalize(f'--jobdb={top}', '--check', ok=False)
+            self.assertIn('readonly', result.stderr)
+            self.assertIn('cannot read job identity', result.stderr)
+            self.assertEqual(list(self.out.iterdir()), [])
+        finally:
+            self.job.chmod(mode)
+
+    def test_unusable_top_level_without_snapshot_never_globs(self):
+        (self.job / 'job.db').touch()
+        self.snapshot.unlink()
+        result = self.run_finalize(ok=False)
+        self.assertIn('refusing unverified directory fallback', result.stderr)
+        self.assertEqual(list(self.out.iterdir()), [])
+
+    def test_explicit_empty_top_level_database_does_not_fall_back(self):
+        top = self.job / 'job.db'
+        top.touch()
+        result = self.run_finalize(f'--jobdb={top}', ok=False)
+        self.assertIn('cannot read job identity', result.stderr)
+        self.assertEqual(list(self.out.iterdir()), [])
 
     def test_explicit_bad_database_does_not_fall_back(self):
         bad = self.job / 'bad.db'
