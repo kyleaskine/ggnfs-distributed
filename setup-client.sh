@@ -44,6 +44,8 @@ WORKERS=""
 DEVICE=""
 PREFETCH=""
 CLIENT_ID=""
+CPU_CLIENT_ID=""
+GPU_CLIENT_ID=""
 ASSUME_YES=0
 
 usage() {
@@ -58,7 +60,9 @@ setup-client.sh -- set up a ggnfs-distributed worker, CPU or GPU.
                            auto-detect quietly falls back to CPU instead.
   --server=URL             coordinator, e.g. http://host:8080  (or $GGNFS_SERVER)
   --token=TOKEN            bearer token from <jobdir>/token    (or $GGNFS_TOKEN)
-  --client-id=NAME         label for this box on the dashboard
+  --client-id=NAME         base label for this box on the dashboard
+  --cpu-client-id=NAME     label for the CPU workers (default: <base>-<cpu model>)
+  --gpu-client-id=NAME     label for the GPU worker  (default: <base>-<gpu model>)
   --workers=N              CPU sievers to run
   --device=N               CUDA device index (default 0)
   --prefetch=N             GPU lease slots (default 2)
@@ -82,6 +86,8 @@ for arg in "$@"; do
         --device=*)     DEVICE="${arg#*=}" ;;
         --prefetch=*)   PREFETCH="${arg#*=}" ;;
         --client-id=*)  CLIENT_ID="${arg#*=}" ;;
+        --cpu-client-id=*) CPU_CLIENT_ID="${arg#*=}" ;;
+        --gpu-client-id=*) GPU_CLIENT_ID="${arg#*=}" ;;
         -y|--yes)       ASSUME_YES=1 ;;
         -h|--help)      usage 0 ;;
         *) echo "error: unknown option '$arg'" >&2; usage 2 ;;
@@ -103,6 +109,49 @@ prompt_tty() {
     printf '\n' > /dev/tty
     reply=${reply//$'\r'/}
     printf -v "$var" '%s' "${reply:-$default}"
+}
+
+# A short tag naming the hardware, for the dashboard label. "KyleAskine-5070"
+# and "KyleAskine-9800X3D" say which box produced what; "KyleAskine" and
+# "KyleAskine-gpu0" do not, and on a two-card box the CPU fleet ends up as the
+# odd one out with no tag at all.
+#
+# Both are only DEFAULTS -- the prompt shows them and --cpu-client-id /
+# --gpu-client-id override outright -- so an unusual part producing an ugly tag
+# costs nothing. Empty output means "no tag", and the caller falls back to the
+# bare base rather than inventing something.
+hw_tag_cpu() {
+    local model
+    model=$(sed -n 's/^model name[[:space:]]*:[[:space:]]*//p' /proc/cpuinfo \
+            | head -1)
+    [ -n "$model" ] || return 0
+    # Drop vendor and marketing words, then take the first token that still
+    # looks like a model number (has a digit, at least 3 characters).
+    printf '%s\n' "$model" \
+        | sed -E 's/\((R|TM)\)//g' \
+        | tr ' ' '\n' \
+        | grep -vEi '^(intel|amd|ryzen|core|xeon|epyc|cpu|processor|with|graphics|radeon|gold|silver|platinum|bronze|threadripper|[0-9]+-core|@|[0-9.]+ghz)$' \
+        | grep -E '[0-9]' \
+        | grep -E '^.{3,}$' \
+        | head -1 \
+        | tr -cd 'A-Za-z0-9_-' \
+        | cut -c1-16
+}
+
+hw_tag_gpu() {
+    local name
+    name=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null \
+           | sed -n "$((${1:-0} + 1))p")
+    [ -n "$name" ] || return 0
+    # "NVIDIA GeForce RTX 5070" -> 5070;  "Tesla T4" -> T4;
+    # "NVIDIA A100-SXM4-40GB"   -> A100.
+    printf '%s\n' "$name" \
+        | tr ' ' '\n' \
+        | grep -vEi '^(nvidia|geforce|rtx|gtx|tesla|quadro|titan)$' \
+        | head -1 \
+        | cut -d- -f1 \
+        | tr -cd 'A-Za-z0-9_' \
+        | cut -c1-16
 }
 
 require_int() {
@@ -290,7 +339,7 @@ exec ./ggnfs-sieve-client \\
     --server-url="$SERVER" \\
     --token="$TOKEN" \\
     --siever="$ABS_DIR/$SIEVER_DIR" \\
-    --client-id="$CLIENT_ID" \\
+    --client-id="$CPU_CLIENT_ID" \\
     --workers="$WORKERS" \\
     "\$@"
 EOF
@@ -386,7 +435,7 @@ args=(
 $fbgen_arg
   "--device=$DEVICE"
   "--prefetch=$PREFETCH"
-  "--client-id=$CLIENT_ID-gpu$DEVICE"
+  "--client-id=$GPU_CLIENT_ID"
 )
 exec ./ggnfs-sieve-client "\${args[@]}" "\$@"
 EOF
@@ -417,7 +466,7 @@ echo
 echo "==> Coordinator settings"
 [ -n "$SERVER" ] || prompt_tty SERVER "Server URL (http://host:port)" ""
 [ -n "$TOKEN" ]  || prompt_tty TOKEN  "Auth token" ""
-[ -n "$CLIENT_ID" ] || prompt_tty CLIENT_ID "Client id" "$(hostname -s 2>/dev/null || echo worker)"
+[ -n "$CLIENT_ID" ] || prompt_tty CLIENT_ID "Client id (base)" "$(hostname -s 2>/dev/null || echo worker)"
 
 if [ -z "$SERVER" ]; then
     echo "error: a server URL is required (--server=http://host:port)." >&2
@@ -431,12 +480,35 @@ fi
 if [ "$MODE" = "cpu" ] || [ "$MODE" = "both" ]; then
     [ -n "$WORKERS" ] || prompt_tty WORKERS "Workers (CPU sievers)" "$(nproc 2>/dev/null || echo 4)"
     require_int "$WORKERS" "workers" 1 256
+
+    # CPU and GPU get INDEPENDENT names, not one name with suffixes: a
+    # dashboard row saying "KyleAskine-9800X3D" tells you which silicon
+    # produced the relations, which "KyleAskine" next to "KyleAskine-gpu0"
+    # does not.
+    if [ -z "$CPU_CLIENT_ID" ]; then
+        cpu_tag=$(hw_tag_cpu || true)
+        [ -n "$cpu_tag" ] && cpu_def="$CLIENT_ID-$cpu_tag" || cpu_def="$CLIENT_ID"
+        prompt_tty CPU_CLIENT_ID "CPU client id" "$cpu_def"
+    fi
 fi
 if [ "$MODE" = "gpu" ] || [ "$MODE" = "both" ]; then
     [ -n "$DEVICE" ]   || prompt_tty DEVICE   "CUDA device index" "0"
     [ -n "$PREFETCH" ] || prompt_tty PREFETCH "Lease slots (prefetch)" "2"
     require_int "$DEVICE" "device" 0 255
     require_int "$PREFETCH" "prefetch" 1 8
+
+    if [ -z "$GPU_CLIENT_ID" ]; then
+        gpu_tag=$(hw_tag_gpu "$DEVICE" || true)
+        [ -n "$gpu_tag" ] && gpu_def="$CLIENT_ID-$gpu_tag" || gpu_def="$CLIENT_ID-gpu$DEVICE"
+        # Two cards of the same model would otherwise derive the same name,
+        # and the server keeps one live lease per client_id -- so they would
+        # fight over it. Disambiguate only when there is something to
+        # disambiguate.
+        if [ "$(nvidia-smi -L 2>/dev/null | wc -l)" -gt 1 ]; then
+            gpu_def="$gpu_def-gpu$DEVICE"
+        fi
+        prompt_tty GPU_CLIENT_ID "GPU client id" "$gpu_def"
+    fi
 fi
 
 echo
@@ -450,16 +522,17 @@ esac
 echo
 echo "==> Done."
 echo "    server    : $SERVER"
-echo "    client id : $CLIENT_ID"
 if [ "$MODE" = "cpu" ] || [ "$MODE" = "both" ]; then
     echo
     echo "    CPU: $ABS_DIR/run-client.sh      # start sieving ($WORKERS workers)"
+    echo "         dashboard name: $CPU_CLIENT_ID"
     echo "         $ABS_DIR/benchmark.sh       # screen the box first"
     echo "         sievers in $ABS_DIR/$SIEVER_DIR -- the coordinator picks one per job"
 fi
 if [ "$MODE" = "gpu" ] || [ "$MODE" = "both" ]; then
     echo
     echo "    GPU: $ABS_DIR/run-cuda-client.sh # start sieving (device $DEVICE, $PREFETCH slots)"
+    echo "         dashboard name: $GPU_CLIENT_ID"
     echo "         $ABS_DIR/benchmark-gpu.sh   # screen the box first"
 fi
 echo
