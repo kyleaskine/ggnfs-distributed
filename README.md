@@ -46,26 +46,49 @@ polynomial plus factor-base settings):
         --qmin=80000000 --qmax=100000000 --qrange=10000 \
         --jobdir=/tmp/myjob
 
-`init` writes a random bearer token to `/tmp/myjob/token` (chmod 600).
-Hand that file to whoever will run clients.
+`init` writes two credentials to the jobdir (both chmod 600):
+
+- `token` — full access: lease, submit, renew, release, fetch the `.job`.
+- `view-token` — read-only: `GET /stats` and nothing else. This is what you
+  hand to someone who should see progress but not take work.
+
+Both are random by default. Pass `--token=@<file>` / `--view-token=@<file>` to
+adopt keys you already have, which is what makes switching jobs free — see
+**Switching the fleet to a new factorization** below.
 
 Serve:
 
     ./ggnfs-sieve-server serve --jobdir=/tmp/myjob --port=8080
 
-Dashboard: `http://host:8080/?token=<contents of jobdir/token>`. The
-HTML is unauthenticated; its embedded JS reads the token from the URL
-and polls `/stats`.
+Dashboard: `http://host:8080/`. The page asks for a token and keeps it in
+`sessionStorage`; it is never put in the URL, so it stays out of browser
+history, bookmarks and referrer headers. Paste the **view token** for a
+read-only view. (`?token=`/`?view=` still work for links already in
+circulation, but the page strips them from the address bar immediately.)
 
-On each worker box (every machine must already have a matching
-`gnfs-lasieve4*` binary installed):
+On each worker box:
+
+    ./setup-client.sh --server=http://host:8080 --token=<token>
+
+That detects CPU vs GPU (`--cpu` / `--gpu` / `--both` to force it), builds the
+client, installs the sievers, and writes `run-client.sh` and `benchmark.sh`
+(plus `run-cuda-client.sh` / `benchmark-gpu.sh` on a GPU box). Or run the
+client directly:
 
     ./ggnfs-sieve-client \
         --server-url=http://host:8080 \
         --token=<token> \
-        --siever=/path/to/gnfs-lasieve4I14e \
+        --siever=/path/to/sievers \
         --workers=4 \
         --cpu-pin=0,2,4,6        # optional, Linux only
+
+**`--siever` may name a directory instead of one binary.** Which siever a job
+needs is a property of the job, and the coordinator names it in every lease, so
+a directory holding `gnfs-lasieve4I14e/I15e/I16e` lets one worker serve any
+campaign. If the job asks for a binary the directory does not hold, the client
+returns the lease and says so rather than sieving with the wrong one — which
+would still produce valid relations, just far fewer of them, silently.
+`--siever=<one binary>` still works and pins that build.
 
 For large machines, set `--workers` to the number of sievers you want to run
 and leave `--http-concurrency` at its default of 16 unless the coordinator can
@@ -157,6 +180,45 @@ replacing same-named files in the destination is intentional.
 `finalize-nfs.sh` aborts if `<yafu-dir>/nfs.job` differs from the `.job`
 the server distributed, and checks that job against the database's SHA
 when available. This prevents mixing jobs or silently changing settings.
+
+## Switching the fleet to a new factorization
+
+Nothing on any worker has to change. Mint one fleet key, give every job that
+key, and switching jobs is a `serve` restart:
+
+    # Once, ever:
+    openssl rand -hex 32 > /etc/ggnfs/fleet.key
+    openssl rand -hex 32 > /etc/ggnfs/view.key
+
+    # Per factorization:
+    ./ggnfs-sieve-server init --job=next.job --siever=gnfs-lasieve4I16e \
+        --qmin=... --qmax=... --qrange=... \
+        --token=@/etc/ggnfs/fleet.key \
+        --view-token=@/etc/ggnfs/view.key \
+        --jobdir=/srv/next
+
+    # Stop the old serve, then:
+    ./ggnfs-sieve-server serve --jobdir=/srv/next \
+        --token-file=/etc/ggnfs/fleet.key \
+        --view-token-file=/etc/ggnfs/view.key
+
+Running clients pick the new job up on their next lease: same token, so no
+401; the `.job` is content-addressed, so it re-downloads on its own; and under
+`--siever=<dir>` they switch sievers to whatever the new job names. They log
+the change once and carry on.
+
+Two things do not follow automatically:
+
+- A band already being sieved when you restart is abandoned within one lease
+  heartbeat (its `/renew` and `/submit` answer 400 — the workunit belongs to
+  the old job). At most one band per lease slot is lost. A relation file that
+  was finished but not yet accepted is kept on disk, and the client says so.
+- The old jobdir's relations still need `finalize-nfs.sh` run against **that**
+  jobdir. Switching `serve` does not finish the old campaign.
+
+A new factorization means a new `.job`. Two jobdirs built from the *same*
+`.job` share a workunit-ID namespace — the id is `wu-<first 8 hex of the job
+sha>-<seq>` — so the server cannot tell their workunits apart.
 
 ## Adding more work to a running job
 

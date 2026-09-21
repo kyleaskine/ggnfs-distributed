@@ -151,6 +151,116 @@ static int copy_file(const char *src, const char *dst)
     return rc;
 }
 
+static int read_file_string(const char *path, char *out, size_t out_n)
+{
+    FILE *f = fopen(path, "r");
+    if (!f) return -1;
+    size_t n = fread(out, 1, out_n - 1, f);
+    fclose(f);
+    out[n] = '\0';
+    /* trim trailing \n / \r / spaces */
+    while (n > 0 && (out[n-1] == '\n' || out[n-1] == '\r' ||
+                     out[n-1] == ' '  || out[n-1] == '\t')) {
+        out[--n] = '\0';
+    }
+    return 0;
+}
+
+/* A token is exactly what random_token_hex emits: 64 lowercase hex.
+ *
+ * Uppercase is rejected rather than folded. Folding would make the value the
+ * operator typed differ from the one every client has to send, and check_auth
+ * compares the token case-sensitively — so a "helpful" normalisation here
+ * would 401 the whole fleet with no visible cause. */
+static int token_is_wellformed(const char *t)
+{
+    if (!t || strlen(t) != 64) return 0;
+    for (const char *p = t; *p; p++) {
+        if (!((*p >= '0' && *p <= '9') || (*p >= 'a' && *p <= 'f'))) return 0;
+    }
+    return 1;
+}
+
+/* Load a token from a CLI spec: either the literal 64 hex, or "@<path>" /
+ * a bare path to a file holding it. Returns 0 on success.
+ *
+ * This is what lets one key outlive a job: a new factorization is a new
+ * jobdir, and adopting the fleet's existing key here is the difference
+ * between "restart serve" and "re-bootstrap every worker". */
+static int token_load(const char *spec, const char *what, char out[65])
+{
+    if (!spec || !*spec) {
+        fprintf(stderr, "init: %s needs a value\n", what);
+        return -1;
+    }
+    if (spec[0] == '@' || strchr(spec, '/') != NULL) {
+        const char *path = (spec[0] == '@') ? spec + 1 : spec;
+        char buf[128];
+        if (!*path) {
+            /* Separate branch: no syscall ran, so errno holds whatever an
+             * unrelated call last left and "…: Success" would be the likely
+             * message. */
+            fprintf(stderr, "init: %s=@ needs a path after the @\n", what);
+            return -1;
+        }
+        if (read_file_string(path, buf, sizeof(buf)) != 0) {
+            fprintf(stderr, "init: cannot read %s from %s: %s\n",
+                    what, path, strerror(errno));
+            return -1;
+        }
+        if (!token_is_wellformed(buf)) {
+            fprintf(stderr,
+                "init: %s in %s is not 64 lowercase hex characters.\n"
+                "      Mint one with:  openssl rand -hex 32 > %s\n",
+                what, path, path);
+            return -1;
+        }
+        memcpy(out, buf, 64); out[64] = '\0';   /* length proven above */
+        return 0;
+    }
+    if (!token_is_wellformed(spec)) {
+        fprintf(stderr,
+            "init: %s must be 64 lowercase hex characters, or @<path> to a "
+            "file holding one.\n"
+            "      Mint one with:  openssl rand -hex 32\n", what);
+        return -1;
+    }
+    fprintf(stderr,
+        "init: note — passing %s literally puts it in your shell history; "
+        "prefer %s=@<path>.\n", what, what);
+    memcpy(out, spec, 64); out[64] = '\0';      /* length proven above */
+    return 0;
+}
+
+/* Write a credential to <jobdir>/<name> at 0600. Returns 0 on success.
+ *
+ * `who` is the subcommand, because this is called from `serve` too (minting a
+ * view token for a jobdir that predates them) and reporting "init:" for a
+ * command the operator did not run sends them looking in the wrong place. */
+static int token_write_file(const char *who, const char *jobdir,
+                            const char *name, const char *token,
+                            char **out_path)
+{
+    char *path = path_join(jobdir, name);
+    if (!path) return -1;
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0) {
+        fprintf(stderr, "%s: cannot write %s: %s\n", who, path, strerror(errno));
+        free(path);
+        return -1;
+    }
+    ssize_t w1 = write(fd, token, 64);
+    ssize_t w2 = write(fd, "\n", 1);
+    close(fd);
+    if (w1 != 64 || w2 != 1) {
+        fprintf(stderr, "%s: short write to %s\n", who, path);
+        free(path);
+        return -1;
+    }
+    if (out_path) *out_path = path; else free(path);
+    return 0;
+}
+
 /* 32 random bytes from /dev/urandom -> 64-char hex token + NUL. */
 static int random_token_hex(char out[65])
 {
@@ -243,6 +353,12 @@ static void usage_init(void)
         "                            first (useful when another sieve is working upward\n"
         "                            from a higher q and you want to close the gap from\n"
         "                            the top)\n"
+        "    [--token=<64hex|@file>] adopt an existing bearer token instead of\n"
+        "                            minting one. This is how a new factorization\n"
+        "                            reuses the fleet's key, so no worker has to be\n"
+        "                            reconfigured to follow it\n"
+        "    [--view-token=<64hex|@file>] same, for the READ-ONLY token that unlocks\n"
+        "                            GET /stats and nothing else (the status page)\n"
         "    [--jobdir=<dir>]        default current dir\n");
 }
 
@@ -297,6 +413,14 @@ static int cmd_init(int argc, char **argv)
     const char *class_s     = flag(argc, argv, "--class");
     const char *siever_args = flag(argc, argv, "--siever-args");
     const char *gpu_args    = flag(argc, argv, "--gpu-args");
+    const char *token_spec  = flag(argc, argv, "--token");
+    const char *view_spec   = flag(argc, argv, "--view-token");
+    if (flag_is_bare(argc, argv, "--token") ||
+        flag_is_bare(argc, argv, "--view-token")) {
+        fprintf(stderr, "init: --token / --view-token need a value, e.g. "
+                        "--token=@/etc/ggnfs/fleet.key\n");
+        return 2;
+    }
     if (flag_is_bare(argc, argv, "--gpu-args")) {
         fprintf(stderr, "init: --gpu-args needs a value, e.g. "
                         "--gpu-args=\"--logI 17 --J 16384\"\n"
@@ -455,39 +579,48 @@ static int cmd_init(int argc, char **argv)
         seq++;
     }
 
-    /* Token. Stash in meta for self-checking + write to <jobdir>/token. */
-    char token[65];
-    if (random_token_hex(token) != 0) {
+    /* Two credentials, both stashed in meta for self-checking and written to
+     * the jobdir:
+     *
+     *   token       full access: lease, submit, renew, release, fetch the .job
+     *   view-token  read-only: GET /stats and nothing else
+     *
+     * Either may be ADOPTED from an existing key rather than minted. That is
+     * the whole point: a new factorization is a new jobdir, and a fleet that
+     * shares one key does not have to be reconfigured to follow it. The view
+     * token gets the same treatment so the status page URL survives a job
+     * change too. */
+    char token[65], view_token[65];
+    if (token_spec ? token_load(token_spec, "--token", token) != 0
+                   : random_token_hex(token) != 0) {
         db_close(db);
         free(files_dir); free(rels_dir); free(dst_path); free(db_path);
         return 1;
     }
-    char *token_path = path_join(jobdir, "token");
-    if (!token_path) {
+    if (view_spec ? token_load(view_spec, "--view-token", view_token) != 0
+                  : random_token_hex(view_token) != 0) {
         db_close(db);
         free(files_dir); free(rels_dir); free(dst_path); free(db_path);
         return 1;
     }
-    {
-        int fd = open(token_path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
-        if (fd < 0) {
-            fprintf(stderr, "init: cannot write %s: %s\n", token_path, strerror(errno));
-            db_close(db);
-            free(files_dir); free(rels_dir); free(dst_path); free(db_path); free(token_path);
-            return 1;
-        }
-        ssize_t w1 = write(fd, token, 64);
-        ssize_t w2 = write(fd, "\n",  1);
-        close(fd);
-        if (w1 != 64 || w2 != 1) {
-            fprintf(stderr, "init: short write to %s\n", token_path);
-            db_close(db);
-            free(files_dir); free(rels_dir); free(dst_path); free(db_path); free(token_path);
-            return 1;
-        }
+    if (strcmp(token, view_token) == 0) {
+        fprintf(stderr, "init: --token and --view-token must differ; a view "
+                        "token equal to the real one grants full access.\n");
+        db_close(db);
+        free(files_dir); free(rels_dir); free(dst_path); free(db_path);
+        return 1;
+    }
+    char *token_path = NULL, *view_path = NULL;
+    if (token_write_file("init", jobdir, "token", token, &token_path) != 0 ||
+        token_write_file("init", jobdir, "view-token", view_token, &view_path) != 0) {
+        db_close(db);
+        free(files_dir); free(rels_dir); free(dst_path); free(db_path);
+        free(token_path); free(view_path);
+        return 1;
     }
 
-    db_meta_set(db, "token",     token);
+    db_meta_set(db, "token",      token);
+    db_meta_set(db, "view_token", view_token);
     db_meta_set(db, "job_id",    job_id);
     db_meta_set(db, "siever",    siever);
     {
@@ -507,10 +640,16 @@ static int cmd_init(int argc, char **argv)
     printf("  job file : %s  (sha=%s, %lld bytes)\n", dst_path, job_sha, (long long)dst_bytes);
     printf("  workunits: %lld   (q_range=%lld, class=%s, side=%c, siever=%s, lease_order=%s)\n",
            (long long)seq, (long long)qrange, class_norm, side, siever, lease_order_norm);
-    printf("  token    : written to %s (chmod 600)\n", token_path);
+    printf("  token    : written to %s (chmod 600)%s\n", token_path,
+           token_spec ? "  [adopted]" : "  [minted]");
+    printf("  view     : written to %s (chmod 600)%s\n", view_path,
+           view_spec ? "  [adopted]" : "  [minted]");
+    printf("             read-only: GET /stats only. Safe to hand to anyone "
+           "who should see progress.\n");
     printf("\nNext: ggnfs-sieve-server serve --jobdir=%s\n", jobdir);
 
-    free(files_dir); free(rels_dir); free(dst_path); free(db_path); free(token_path);
+    free(files_dir); free(rels_dir); free(dst_path); free(db_path);
+    free(token_path); free(view_path);
     return 0;
 }
 
@@ -696,7 +835,11 @@ static int cmd_extend(int argc, char **argv)
 
 typedef struct {
     ggnfs_db_t  *db;
-    char        token[65];          /* expected bearer token */
+    char        token[65];          /* expected bearer token (full access) */
+    /* Read-only credential: accepted by /stats alone, so the dashboard and any
+     * status page can be shared without handing out the ability to lease work
+     * or submit relations. "" disables it. */
+    char        view_token[65];
     char        job_id[16];
     char        siever[64];         /* required siever binary name */
     char        siever_args[128];   /* extra flags shipped to clients (may be "") */
@@ -783,10 +926,16 @@ static void send_json_take_close(struct mg_connection *c, int code, char *json_o
     c->is_draining = 1;
 }
 
-/* Returns 1 if the request carries a valid Bearer token; 0 otherwise.
- * On 0, writes a 401 response. */
-static int check_auth(struct mg_connection *c, struct mg_http_message *hm,
-                      const char *expected_token)
+/* Returns 1 if the request carries a Bearer token matching `tok_a`, or
+ * `tok_b` when that is non-NULL. 0 otherwise, having written a 401.
+ *
+ * Two accepted tokens exist so the dashboard can be given a READ-ONLY
+ * credential. Only /stats passes a second token; every endpoint that can take
+ * work, submit relations or fetch the .job passes tok_b = NULL, which is what
+ * makes the view token safe to put in a status-page URL or hand to someone who
+ * should see progress and nothing more. */
+static int check_auth2(struct mg_connection *c, struct mg_http_message *hm,
+                       const char *tok_a, const char *tok_b)
 {
     struct mg_str *h = mg_http_get_header(hm, "Authorization");
     if (!h) goto deny;
@@ -794,15 +943,28 @@ static int check_auth(struct mg_connection *c, struct mg_http_message *hm,
     size_t plen = strlen(prefix);
     if (h->len <= plen) goto deny;
     if (mg_strcasecmp(mg_str_n(h->buf, plen), mg_str(prefix)) != 0) goto deny;
-    /* Constant-time-ish compare against expected_token. mg_strcmp is fine —
-     * we're not defending against timing attacks in the MVP per design. */
+    /* Constant-time-ish compare against the expected tokens. mg_strcmp is
+     * fine — we're not defending against timing attacks in the MVP per
+     * design. */
     struct mg_str presented = mg_str_n(h->buf + plen, h->len - plen);
-    struct mg_str expected  = mg_str(expected_token);
-    if (mg_strcmp(presented, expected) != 0) goto deny;
-    return 1;
+    if (tok_a && *tok_a &&
+        mg_strcmp(presented, mg_str(tok_a)) == 0) return 1;
+    /* The length guard matters: an unset view token is "", and without it an
+     * empty or malformed Bearer value would compare equal to it and authorise
+     * the request. */
+    if (tok_b && strlen(tok_b) == 64 &&
+        mg_strcmp(presented, mg_str(tok_b)) == 0) return 1;
 deny:
     mg_http_reply(c, 401, "Content-Type: text/plain\r\n", "unauthorized\n");
     return 0;
+}
+
+/* Returns 1 if the request carries a valid Bearer token; 0 otherwise.
+ * On 0, writes a 401 response. */
+static int check_auth(struct mg_connection *c, struct mg_http_message *hm,
+                      const char *expected_token)
+{
+    return check_auth2(c, hm, expected_token, NULL);
 }
 
 /* The job's base band width, re-read at most once per TTL. Returns 0 if the
@@ -1419,7 +1581,8 @@ static char *format_stats_json(server_ctx_t *ctx, const db_stats_t *s,
 static void handle_stats(struct mg_connection *c, struct mg_http_message *hm,
                          server_ctx_t *ctx)
 {
-    if (!check_auth(c, hm, ctx->token)) return;
+    /* The one endpoint that also accepts the read-only view token. */
+    if (!check_auth2(c, hm, ctx->token, ctx->view_token)) return;
 
     db_stats_t s;
     if (db_stats_snapshot(ctx->db, now_unix(), &s) != 0) {
@@ -1432,13 +1595,15 @@ static void handle_stats(struct mg_connection *c, struct mg_http_message *hm,
     send_json_take_close(c, 200, json);
 }
 
-/* ---- / dashboard (HTML, no auth — JS fetches /stats with bearer token) ---- */
+/* ---- / dashboard (HTML, no auth — the page asks for a token itself) ---- */
 
 static void handle_dashboard(struct mg_connection *c)
 {
-    /* The HTML itself is harmless static content; the dashboard's JS reads
-     * ?token=<x> from the URL and uses it for the (authenticated) /stats
-     * polling. So no token check here. */
+    /* The HTML itself is harmless static content and carries no credential:
+     * the page prompts for one and keeps it in sessionStorage, then uses it
+     * for the (authenticated) /stats polling. ?token=/?view= are still
+     * honoured for links already in circulation, but the page strips them
+     * from the address bar. So no token check here. */
     mg_printf(c,
         "HTTP/1.1 200 OK\r\n"
         "Content-Type: text/html; charset=utf-8\r\n"
@@ -1527,21 +1692,6 @@ static void ev_handler(struct mg_connection *c, int ev, void *ev_data)
 
 /* ---- serve mode entry ---- */
 
-static int read_file_string(const char *path, char *out, size_t out_n)
-{
-    FILE *f = fopen(path, "r");
-    if (!f) return -1;
-    size_t n = fread(out, 1, out_n - 1, f);
-    fclose(f);
-    out[n] = '\0';
-    /* trim trailing \n / \r / spaces */
-    while (n > 0 && (out[n-1] == '\n' || out[n-1] == '\r' ||
-                     out[n-1] == ' '  || out[n-1] == '\t')) {
-        out[--n] = '\0';
-    }
-    return 0;
-}
-
 /* mongoose timer fires this on the event-loop thread, so it shares the DB
  * connection with the request handlers — no locking needed. */
 static void on_sweep_timer(void *arg)
@@ -1587,6 +1737,12 @@ static void usage_serve(void)
     fprintf(stderr,
         "usage: ggnfs-sieve-server serve [options]\n"
         "    [--jobdir=<dir>]        default .\n"
+        "    [--token-file=<path>]   read the bearer token from this file instead\n"
+        "                            of <jobdir>/token. Point every job at one\n"
+        "                            fleet key and switching jobs needs no client\n"
+        "                            changes. Unreadable = refuse to start, never\n"
+        "                            a silent fallback\n"
+        "    [--view-token-file=<path>] same, for the read-only /stats token\n"
         "    [--bind=<addr>]         default 127.0.0.1; use 0.0.0.0 to expose\n"
         "                            the coordinator to other machines\n"
         "    [--port=<int>]          default 8080\n"
@@ -1767,6 +1923,15 @@ static int cmd_serve(int argc, char **argv)
             VERIFY_SPOTCHECK_MAX_SCALE, (long long)block_width_multiple);
     }
 
+    const char *tokfile      = flag(argc, argv, "--token-file");
+    const char *viewtokfile  = flag(argc, argv, "--view-token-file");
+    if (flag_is_bare(argc, argv, "--token-file") ||
+        flag_is_bare(argc, argv, "--view-token-file")) {
+        fprintf(stderr, "serve: --token-file / --view-token-file need a "
+                        "value\n");
+        return 2;
+    }
+
     char *db_path = path_join(jobdir, "job.db");
     if (!db_path) return 1;
 
@@ -1793,17 +1958,106 @@ static int cmd_serve(int argc, char **argv)
         return 1;
     }
 
-    /* Prefer the token file on disk if it exists. */
+    /* Token precedence: --token-file > <jobdir>/token > meta.token.
+     *
+     * An EXPLICIT --token-file that cannot be read is fatal, never a silent
+     * fallback. The operator named a specific fleet key; coming up on a
+     * different one would 401 every worker while the server looked perfectly
+     * healthy, which is the exact failure this flag exists to prevent. The
+     * implicit <jobdir>/token may legitimately be absent, so that one falls
+     * back to meta as it always has. */
+    const char *token_src = NULL;
     {
-        char *tok_path = path_join(jobdir, "token");
         char file_tok[80];
-        if (tok_path && read_file_string(tok_path, file_tok, sizeof(file_tok)) == 0
-                && strlen(file_tok) == 64) {
+        if (tokfile && *tokfile) {
+            if (read_file_string(tokfile, file_tok, sizeof(file_tok)) != 0 ||
+                strlen(file_tok) != 64) {
+                fprintf(stderr,
+                    "serve: --token-file=%s is unreadable or does not hold 64 "
+                    "hex characters.\n"
+                    "       Refusing to fall back to this jobdir's own token: "
+                    "the fleet would 401 against a server that looks fine.\n",
+                    tokfile);
+                free(m_token); free(m_jobid); free(m_siever);
+                free(m_side); free(m_jobsha);
+                db_close(ctx.db); free(db_path);
+                return 1;
+            }
             snprintf(ctx.token, sizeof(ctx.token), "%s", file_tok);
+            token_src = tokfile;
         } else {
-            snprintf(ctx.token, sizeof(ctx.token), "%s", m_token);
+            char *tok_path = path_join(jobdir, "token");
+            if (tok_path &&
+                read_file_string(tok_path, file_tok, sizeof(file_tok)) == 0 &&
+                strlen(file_tok) == 64) {
+                snprintf(ctx.token, sizeof(ctx.token), "%s", file_tok);
+                token_src = "<jobdir>/token";
+            } else {
+                snprintf(ctx.token, sizeof(ctx.token), "%s", m_token);
+                token_src = "meta.token";
+            }
+            free(tok_path);
         }
-        free(tok_path);
+    }
+
+    /* The read-only view token, same precedence. A jobdir created before view
+     * tokens existed has none, so one is minted and persisted here rather than
+     * requiring a migration — the alternative is every pre-existing campaign
+     * losing the feature until it is re-initialized, which it cannot be. */
+    const char *view_src = NULL;
+    {
+        char file_tok[80];
+        char *m_view = db_meta_get(ctx.db, "view_token");
+        if (viewtokfile && *viewtokfile) {
+            if (read_file_string(viewtokfile, file_tok, sizeof(file_tok)) != 0 ||
+                strlen(file_tok) != 64) {
+                fprintf(stderr,
+                    "serve: --view-token-file=%s is unreadable or does not "
+                    "hold 64 hex characters.\n", viewtokfile);
+                free(m_view);
+                free(m_token); free(m_jobid); free(m_siever);
+                free(m_side); free(m_jobsha);
+                db_close(ctx.db); free(db_path);
+                return 1;
+            }
+            snprintf(ctx.view_token, sizeof(ctx.view_token), "%s", file_tok);
+            view_src = viewtokfile;
+        } else {
+            char *vp = path_join(jobdir, "view-token");
+            if (vp && read_file_string(vp, file_tok, sizeof(file_tok)) == 0 &&
+                strlen(file_tok) == 64) {
+                snprintf(ctx.view_token, sizeof(ctx.view_token), "%s", file_tok);
+                view_src = "<jobdir>/view-token";
+            } else if (m_view && strlen(m_view) == 64) {
+                snprintf(ctx.view_token, sizeof(ctx.view_token), "%s", m_view);
+                view_src = "meta.view_token";
+            } else if (random_token_hex(ctx.view_token) == 0) {
+                db_meta_set(ctx.db, "view_token", ctx.view_token);
+                /* meta is the source of truth, so a jobdir we cannot write to
+                 * still gets a working view token -- but say that the file is
+                 * missing, or the operator follows the README to a path that
+                 * is not there. */
+                if (token_write_file("serve", jobdir, "view-token",
+                                     ctx.view_token, NULL) == 0) {
+                    view_src = "minted now (this jobdir predates view tokens)";
+                } else {
+                    view_src = "minted now, meta only — could not write "
+                               "<jobdir>/view-token";
+                }
+            }
+            free(vp);
+        }
+        free(m_view);
+
+        /* A view token equal to the real one would silently turn the status
+         * page credential into a full-access one. */
+        if (ctx.view_token[0] && strcmp(ctx.view_token, ctx.token) == 0) {
+            fprintf(stderr, "serve: the view token equals the full token; "
+                            "disabling it rather than granting full access "
+                            "through /stats.\n");
+            ctx.view_token[0] = '\0';
+            view_src = "disabled (identical to the full token)";
+        }
     }
     snprintf(ctx.job_id,     sizeof(ctx.job_id),     "%s", m_jobid);
     snprintf(ctx.siever,     sizeof(ctx.siever),     "%s", m_siever);
@@ -1908,8 +2162,12 @@ static int cmd_serve(int argc, char **argv)
         " <=%lld members, ceiling %lld\n"
         "  sweep        : every %llds   max_attempts=%lld\n"
         "  job .job sha : %s\n"
-        "  token        : %.8s... (read from <jobdir>/token)\n"
-        "  dashboard    : %s/?token=%s\n",
+        "  token        : %.8s... (from %s)\n"
+        "  view token   : %s (from %s)\n"
+        "  dashboard    : %s\n"
+        "                 no credential in the URL — the page asks for one and\n"
+        "                 keeps it in sessionStorage. Paste the view token for\n"
+        "                 a read-only view; it cannot lease or submit.\n",
         ctx.job_id, listen_url, ctx.jobdir, ctx.siever, ctx.side,
         (long long)ctx.lease_seconds,
         ctx.siever_args[0] ? ctx.siever_args : "(none)",
@@ -1921,8 +2179,11 @@ static int cmd_serve(int argc, char **argv)
         (long long)ctx.block_max_members,
         (long long)ctx.block_attempt_ceiling,
         (long long)sweep_seconds, (long long)ctx.max_attempts,
-        ctx.job_sha256, ctx.token,
-        listen_url, ctx.token);
+        ctx.job_sha256,
+        ctx.token, token_src ? token_src : "meta.token",
+        ctx.view_token[0] ? ctx.view_token : "(disabled)",
+        view_src ? view_src : "unavailable",
+        listen_url);
 
     for (;;) mg_mgr_poll(&mgr, SERVER_POLL_MS);
 

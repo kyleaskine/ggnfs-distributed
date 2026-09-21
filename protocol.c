@@ -136,6 +136,52 @@ static int64_t copy_int_field(cJSON *root, const char *name, int64_t fallback)
     return fallback;
 }
 
+/* ---- fields the client turns into filesystem paths ----------------------
+ *
+ * The client builds real paths out of some of these: file_sha256_hex names a
+ * file in its cache and workunit_id names the siever's output file. Nothing
+ * validated them, so a coordinator could send "../../foo" and reach any path
+ * the worker can write. That is not theoretical -- ensure_file_cached unlinks
+ * the cache path BEFORE it downloads anything, so a hostile lease deleted an
+ * arbitrary file on every lease, without needing the download to succeed.
+ *
+ * Validating here rather than at each use site is deliberate: this is the one
+ * choke point every lease field passes through, the caller already treats -1
+ * as "malformed response, back off", and a new use site added later inherits
+ * the guarantee instead of having to remember it.
+ */
+static int is_hex64(const char *s)
+{
+    if (!s) return 0;
+    size_t n = 0;
+    for (; s[n]; n++) {
+        if (n >= 64) return 0;
+        if (!((s[n] >= '0' && s[n] <= '9') || (s[n] >= 'a' && s[n] <= 'f')))
+            return 0;
+    }
+    return n == 64;
+}
+
+/* A single path component: no separator, no "..", nothing a shell or a path
+ * resolver treats specially. Deliberately a charset whitelist rather than a
+ * blacklist of bad sequences -- the id format has already changed once (blocks
+ * added a blk- prefix) and a whitelist stays correct when it changes again. */
+static int is_safe_component(const char *s, size_t max_len)
+{
+    if (!s || !*s) return 0;
+    if (s[0] == '-' || s[0] == '.') return 0;   /* flag-like / dotfile / ".." */
+    size_t n = 0;
+    for (; s[n]; n++) {
+        if (n >= max_len) return 0;
+        char c = s[n];
+        int ok = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                 (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-';
+        if (!ok) return 0;
+        if (c == '.' && s[n + 1] == '.') return 0;
+    }
+    return 1;
+}
+
 int proto_decode_lease_response(const char *body, size_t body_len,
                                 proto_lease_response_t *out)
 {
@@ -194,6 +240,20 @@ int proto_decode_lease_response(const char *body, size_t body_len,
         out->output_name[0] == '\0') {
         return -1;
     }
+
+    /* Shape checks on everything that becomes a path component. A real
+     * coordinator always satisfies these; anything that does not is either
+     * broken or hostile, and either way the client should back off rather
+     * than act on it. */
+    if (!is_hex64(out->file_sha256_hex))                   return -1;
+    if (!is_safe_component(out->workunit_id, sizeof(out->workunit_id) - 1))
+        return -1;
+    if (!is_safe_component(out->output_name, sizeof(out->output_name) - 1))
+        return -1;
+    if (!is_safe_component(out->file_name, sizeof(out->file_name) - 1) &&
+        out->file_name[0] != '\0')
+        return -1;
+
     return 0;
 }
 

@@ -20,9 +20,92 @@
 #ifndef GGNFS_SIEVE_EXECUTOR_H
 #define GGNFS_SIEVE_EXECUTOR_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 typedef int (*sieve_cancel_fn)(void *ctx);
+
+/* ---- which binary do we invoke? ----------------------------------------
+ *
+ * The siever is a property of the JOB, not of the client: the coordinator
+ * names it in every /lease response. A client whose --siever points at a
+ * DIRECTORY resolves <dir>/<server_name> per lease, so pointing `serve` at a
+ * new jobdir switches the whole fleet's siever with nothing to reconfigure.
+ *
+ *   configured  -- the --siever value: "" (cuda, no lasieve4 at all),
+ *                  a file (used verbatim, today's behaviour), or a directory
+ *   server_name -- lease.siever / stats.siever. Arrives OVER THE WIRE.
+ *
+ * server_name is validated, never trusted: sieve_run_local formats the
+ * resolved path into a command string that run_child_cancelable hands to
+ * /bin/sh -c, so a name carrying a shell metacharacter would run as a command.
+ * Only a plain gnfs-lasieve4-shaped basename is accepted.
+ *
+ * Be clear about what this does and does not buy. It is NOT the case that
+ * nothing from the wire reached that command string before: `siever_args` and
+ * `gpu_args` come from the same /lease response and are still interpolated
+ * verbatim (see sieve_run_local / sieve_run_cuda below), so a coordinator that
+ * can set meta.siever_args already has this reach. Validating the name closes
+ * one of three wire-supplied inputs and keeps a path traversal out of the
+ * resolution step, which is worth doing on its own; it is not a general fix.
+ * The general fix is to stop composing a shell string at all and execvp an
+ * argv array -- see FUTURE.md.
+ *
+ * On success returns SIEVE_RESOLVE_OK and fills `out`. The failure codes are
+ * distinct because the operator fix differs for each: a bad name means the
+ * coordinator's meta is wrong, a missing binary means this box's siever
+ * directory is incomplete.
+ */
+#define SIEVE_RESOLVE_OK          0   /* `out` holds the binary to run      */
+#define SIEVE_RESOLVE_NONE        1   /* nothing configured; `out` is ""    */
+#define SIEVE_RESOLVE_BAD_NAME   -1   /* server_name failed validation      */
+#define SIEVE_RESOLVE_NOT_FOUND  -2   /* no such entry in the directory     */
+#define SIEVE_RESOLVE_NOT_EXEC   -3   /* present but not an executable file */
+#define SIEVE_RESOLVE_TOO_LONG   -4   /* <dir>/<name> would not fit in out  */
+
+int sieve_resolve_siever(const char *configured, const char *server_name,
+                         char *out, size_t out_n);
+
+/* Human-readable form of the codes above, for error messages. */
+const char *sieve_resolve_strerror(int rc);
+
+/* ---- server-supplied tuning flags --------------------------------------
+ *
+ * `siever_args` and `gpu_args` arrive in the /lease response and end up in a
+ * command line. Passing them through verbatim means the coordinator decides
+ * what the worker executes -- not just the shell metacharacter case, but the
+ * quieter one where every token is shell-safe and the flags themselves are
+ * hostile (`-o /home/you/.ssh/authorized_keys` needs no metacharacters at all,
+ * and an argv array would not help).
+ *
+ * So the client does not forward these. It PARSES them into typed, bounded
+ * values and rebuilds the string itself from the parsed integers. What the
+ * coordinator sends is data to be interpreted, never a fragment to be run, and
+ * the only flags that can ever reach a siever are the ones in the table in
+ * sieve_executor.c.
+ *
+ * An unrecognised flag fails rather than being dropped: dropping one silently
+ * changes the sieve area, which is the same class of quiet wrongness as
+ * running the wrong siever. The operator's own --siever-args / --gpu-args are
+ * NOT put through this -- those are local intent and the escape hatch when a
+ * campaign needs a flag this table does not know.
+ *
+ * `bad` receives the offending token for the error message; pass NULL to skip.
+ */
+#define SIEVE_ARGS_LASIEVE4  0
+#define SIEVE_ARGS_CUDA      1
+
+#define SIEVE_ARGS_OK        0
+#define SIEVE_ARGS_UNKNOWN  -1   /* token is not in the table            */
+#define SIEVE_ARGS_RANGE    -2   /* known flag, value outside its bounds */
+#define SIEVE_ARGS_NOVALUE  -3   /* flag present with no value after it  */
+#define SIEVE_ARGS_TOO_LONG -4   /* rebuilt string does not fit in `out` */
+
+int sieve_sanitize_args(int vocab, const char *in,
+                        char *out, size_t out_n,
+                        char *bad, size_t bad_n);
+
+const char *sieve_args_strerror(int rc);
 
 /* Run an arbitrary command through /bin/sh with the same isolation the two
  * sievers get: its own process group (so a terminal Ctrl-C does not reach it)

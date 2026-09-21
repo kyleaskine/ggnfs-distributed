@@ -9,6 +9,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -211,6 +212,263 @@ int sieve_run_command(const char *syscmd,
                       void *cancel_ctx)
 {
     return run_child_cancelable(syscmd, should_cancel, cancel_ctx);
+}
+
+/* ---- siever resolution -------------------------------------------------
+ *
+ * See the header for why server_name is validated rather than trusted.
+ */
+
+/* gnfs-lasieve4I14e, gnfs-lasieve4I16e, ... The fleet's binaries all take this
+ * shape, and restricting to it means no byte that /bin/sh treats specially can
+ * reach the command line. Deliberately narrower than "a safe basename": a name
+ * that is not a lasieve4 siever is a misconfigured coordinator, and failing
+ * loudly there beats resolving something plausible and sieving with it. */
+static int siever_name_is_sane(const char *name)
+{
+    if (!name || !*name) return 0;
+    if (strlen(name) >= 64) return 0;
+
+    static const char prefix[] = "gnfs-lasieve4I";
+    size_t plen = sizeof(prefix) - 1;
+    if (strncmp(name, prefix, plen) != 0) return 0;
+
+    /* One or two digits, then a single trailing letter (the 'e' variant). */
+    const char *p = name + plen;
+    int digits = 0;
+    while (*p >= '0' && *p <= '9') { p++; digits++; }
+    if (digits < 1 || digits > 2) return 0;
+    if (!(*p >= 'a' && *p <= 'z')) return 0;
+    return p[1] == '\0';
+}
+
+const char *sieve_resolve_strerror(int rc)
+{
+    switch (rc) {
+        case SIEVE_RESOLVE_OK:        return "ok";
+        case SIEVE_RESOLVE_NONE:      return "nothing configured";
+        case SIEVE_RESOLVE_BAD_NAME:  return "the coordinator named a siever "
+                                             "that is not a gnfs-lasieve4I<N>e "
+                                             "binary";
+        case SIEVE_RESOLVE_NOT_FOUND: return "no such binary in the siever "
+                                             "directory";
+        case SIEVE_RESOLVE_NOT_EXEC:  return "present but not an executable "
+                                             "file";
+        case SIEVE_RESOLVE_TOO_LONG:  return "resolved path is too long";
+        default:                      return "unknown error";
+    }
+}
+
+int sieve_resolve_siever(const char *configured, const char *server_name,
+                         char *out, size_t out_n)
+{
+    if (!out || out_n == 0) return SIEVE_RESOLVE_TOO_LONG;
+    out[0] = '\0';
+
+    /* --engine=cuda drives no lasieve4 binary at all. */
+    if (!configured || !*configured) return SIEVE_RESOLVE_NONE;
+
+    struct stat st;
+    if (stat(configured, &st) != 0 || !S_ISDIR(st.st_mode)) {
+        /* A file, or a path that does not exist. Both are passed through
+         * verbatim: that is exactly today's behaviour, including letting a
+         * nonexistent path reach the siever and exit 127, so existing
+         * deployments are untouched by this change. */
+        if (snprintf(out, out_n, "%s", configured) >= (int)out_n) {
+            out[0] = '\0';
+            return SIEVE_RESOLVE_TOO_LONG;
+        }
+        return SIEVE_RESOLVE_OK;
+    }
+
+    if (!siever_name_is_sane(server_name)) return SIEVE_RESOLVE_BAD_NAME;
+
+    /* Trim trailing slashes so the joined path has exactly one separator;
+     * "<dir>//<name>" works but reads like a bug in every log line. */
+    size_t dlen = strlen(configured);
+    while (dlen > 1 && configured[dlen - 1] == '/') dlen--;
+    /* "/" trims to itself, and "%.*s/%s" would then emit "//name" -- which
+     * POSIX gives an implementation-defined meaning and which shows up in
+     * every log line. Drop the prefix entirely for the root. */
+    if (dlen == 1 && configured[0] == '/') dlen = 0;
+
+    if (snprintf(out, out_n, "%.*s/%s", (int)dlen, configured, server_name)
+            >= (int)out_n) {
+        out[0] = '\0';
+        return SIEVE_RESOLVE_TOO_LONG;
+    }
+
+    if (stat(out, &st) != 0) { out[0] = '\0'; return SIEVE_RESOLVE_NOT_FOUND; }
+    /* S_ISREG before X_OK: access(X_OK) succeeds on a searchable directory,
+     * so the mode test is what keeps a subdirectory from resolving. */
+    if (!S_ISREG(st.st_mode) || access(out, X_OK) != 0) {
+        out[0] = '\0';
+        return SIEVE_RESOLVE_NOT_EXEC;
+    }
+    return SIEVE_RESOLVE_OK;
+}
+
+/* ---- server-supplied tuning flags --------------------------------------
+ *
+ * See the header. Every flag a coordinator is allowed to influence lives in
+ * this table and nowhere else; adding one is a deliberate act.
+ *
+ * Bounds are the ranges the client already works in: derive_gpu_args reads a
+ * -J of 7..23 out of siever_args and emits --logI jbits+1, and gpu_args_logI
+ * accepts 8..24 (client.c). They are a sanity net, not the security property
+ * -- that comes from the value being parsed as an integer and re-emitted by
+ * us, so no byte of the coordinator's string survives into the command line.
+ */
+typedef struct {
+    int         vocab;
+    const char *flag;
+    long        min;
+    long        max;
+} sieve_arg_spec_t;
+
+static const sieve_arg_spec_t SIEVE_ARG_TABLE[] = {
+    /* gnfs-lasieve4: J_bits, the I-sieve area. The only tunable a campaign
+     * has ever shipped (meta.siever_args is "-J 16" on prod, empty elsewhere). */
+    { SIEVE_ARGS_LASIEVE4, "-J",     1, 24 },
+    /* cuda-sieve geometry. Not translations of -J; see CLAUDE.md. */
+    { SIEVE_ARGS_CUDA,     "--logI", 1, 24 },
+    { SIEVE_ARGS_CUDA,     "--J",    1, 16777216 },
+};
+
+const char *sieve_args_strerror(int rc)
+{
+    switch (rc) {
+        case SIEVE_ARGS_OK:       return "ok";
+        case SIEVE_ARGS_UNKNOWN:  return "not a flag this client will pass to "
+                                         "a siever";
+        case SIEVE_ARGS_RANGE:    return "value is outside the range this flag "
+                                         "allows";
+        case SIEVE_ARGS_NOVALUE:  return "flag has no value after it";
+        case SIEVE_ARGS_TOO_LONG: return "rebuilt argument string is too long";
+        default:                  return "unknown error";
+    }
+}
+
+/* Copy the next whitespace-delimited token.
+ *
+ * Returns 1 on a token, 0 at end of input, -1 if the token is too long for the
+ * scratch buffer. Those last two MUST be distinguishable: conflating them (an
+ * over-long token reported as end-of-input) makes "-J 16 <400 junk chars>"
+ * return success having silently dropped the junk, which is the quiet
+ * geometry change this whole table exists to prevent. */
+static int next_token(const char **pp, char *tok, size_t tok_n)
+{
+    const char *p = *pp;
+    while (*p == ' ' || *p == '\t') p++;
+    if (!*p) { *pp = p; return 0; }
+    size_t n = 0;
+    while (*p && *p != ' ' && *p != '\t') {
+        if (n + 1 >= tok_n) return -1;
+        tok[n++] = *p++;
+    }
+    tok[n] = '\0';
+    *pp = p;
+    return 1;
+}
+
+static const sieve_arg_spec_t *spec_for(int vocab, const char *flag)
+{
+    size_t n = sizeof(SIEVE_ARG_TABLE) / sizeof(SIEVE_ARG_TABLE[0]);
+    for (size_t i = 0; i < n; i++) {
+        if (SIEVE_ARG_TABLE[i].vocab == vocab &&
+            strcmp(SIEVE_ARG_TABLE[i].flag, flag) == 0)
+            return &SIEVE_ARG_TABLE[i];
+    }
+    return NULL;
+}
+
+static int parse_long_strict(const char *s, long *out)
+{
+    if (!s || !*s) return -1;
+    char *end = NULL;
+    errno = 0;
+    long v = strtol(s, &end, 10);
+    if (errno != 0 || end == s || *end != '\0') return -1;
+    *out = v;
+    return 0;
+}
+
+int sieve_sanitize_args(int vocab, const char *in,
+                        char *out, size_t out_n,
+                        char *bad, size_t bad_n)
+{
+    if (bad && bad_n) bad[0] = '\0';
+    if (!out || out_n == 0) return SIEVE_ARGS_TOO_LONG;
+    out[0] = '\0';
+    if (!in || !*in) return SIEVE_ARGS_OK;      /* nothing to say is fine */
+
+    char tok[128], valtok[128];
+    size_t used = 0;
+    const char *p = in;
+    int rc = SIEVE_ARGS_OK;
+    int t;
+
+    while ((t = next_token(&p, tok, sizeof(tok))) != 0) {
+        if (t < 0) {                             /* token too long */
+            if (bad && bad_n) snprintf(bad, bad_n, "(over-long token)");
+            rc = SIEVE_ARGS_UNKNOWN;
+            goto fail;
+        }
+
+        char *eq = strchr(tok, '=');
+        const char *valstr = NULL;
+
+        if (eq) {                                /* --flag=value */
+            *eq = '\0';
+            valstr = eq + 1;
+        }
+
+        const sieve_arg_spec_t *spec = spec_for(vocab, tok);
+        if (!spec) {
+            if (bad && bad_n) snprintf(bad, bad_n, "%s", tok);
+            rc = SIEVE_ARGS_UNKNOWN;
+            goto fail;
+        }
+
+        if (!valstr) {                           /* --flag value */
+            int vt = next_token(&p, valtok, sizeof(valtok));
+            if (vt <= 0) {
+                if (bad && bad_n) snprintf(bad, bad_n, "%s", tok);
+                rc = vt == 0 ? SIEVE_ARGS_NOVALUE : SIEVE_ARGS_UNKNOWN;
+                goto fail;
+            }
+            valstr = valtok;
+        }
+
+        long v;
+        if (parse_long_strict(valstr, &v) != 0) {
+            if (bad && bad_n) snprintf(bad, bad_n, "%s %s", tok, valstr);
+            rc = SIEVE_ARGS_RANGE;
+            goto fail;
+        }
+        if (v < spec->min || v > spec->max) {
+            if (bad && bad_n) snprintf(bad, bad_n, "%s %ld", tok, v);
+            rc = SIEVE_ARGS_RANGE;
+            goto fail;
+        }
+
+        /* Rebuilt from the parsed integer. Nothing from `in` is copied. */
+        int w = snprintf(out + used, out_n - used, "%s%s %ld",
+                         used ? " " : "", spec->flag, v);
+        if (w < 0 || (size_t)w >= out_n - used) {
+            rc = SIEVE_ARGS_TOO_LONG;
+            goto fail;
+        }
+        used += (size_t)w;
+    }
+    return SIEVE_ARGS_OK;
+
+fail:
+    /* Never leave a partial rebuild behind. "-J 16 && id" would otherwise
+     * return failure with a perfectly plausible "-J 16" sitting in `out`,
+     * which the next caller to ignore a return code would happily run. */
+    out[0] = '\0';
+    return rc;
 }
 
 int sieve_run_local(const char *siever_path,

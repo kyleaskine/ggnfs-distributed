@@ -43,8 +43,24 @@
 <h1>ggnfs-sieve <span id="job-id"></span></h1>
 <div class="sub" id="server-line"></div>
 
-<div id="auth-warn" class="err" style="display:none">
-  No token. Append <code>?token=&lt;your-token&gt;</code> to the URL.
+<div id="auth-warn" class="err" style="display:none"></div>
+
+<div id="unlock" style="display:none">
+  <p class="sub">
+    This page needs a token. Paste the <b>view token</b>
+    (<code>&lt;jobdir&gt;/view-token</code>) for a read-only view &mdash; it can
+    read progress but cannot lease work or submit relations. The full token
+    from <code>&lt;jobdir&gt;/token</code> also works.
+  </p>
+  <form id="unlock-form" autocomplete="off">
+    <input id="unlock-input" type="password" size="48" spellcheck="false"
+           placeholder="64 hex characters" aria-label="token">
+    <button type="submit">Show</button>
+  </form>
+  <p class="sub">
+    Kept in this tab only (sessionStorage) and never put in the URL, so it
+    stays out of your history, bookmarks and referrers.
+  </p>
 </div>
 
 <div id="content" style="display:none">
@@ -81,10 +97,52 @@
 
 <script>
 (function () {
+  /* The credential never lives in the URL.
+   *
+   * It used to: the page read ?token= and that token could lease work and
+   * submit relations, while sitting in browser history, bookmarks, referrer
+   * headers and anyone's view of the address bar. Now ?token= / ?view= are
+   * still ACCEPTED, for links already in circulation, but are moved into
+   * sessionStorage and stripped from the address bar immediately.
+   *
+   * sessionStorage, not localStorage: the credential dies with the tab.
+   * Wrapped in try/catch because it throws outright in some privacy modes,
+   * where the page must still work for the length of one visit. */
+  var KEY = 'ggnfs-token';
+  function store(k, v) { try { sessionStorage.setItem(k, v); } catch (e) {} }
+  function load(k) { try { return sessionStorage.getItem(k); } catch (e) { return null; } }
+  function drop(k) { try { sessionStorage.removeItem(k); } catch (e) {} }
+
   var params = new URLSearchParams(location.search);
-  var token  = params.get('token');
+  var fromUrl = params.get('token') || params.get('view');
+  var token = fromUrl || load(KEY);
+
+  if (fromUrl) {
+    store(KEY, fromUrl);
+    /* Strip it before anything can read it back off the URL. replaceState so
+     * the credential-bearing URL does not stay in the back stack either. */
+    params.delete('token');
+    params.delete('view');
+    var q = params.toString();
+    try {
+      history.replaceState(null, '',
+        location.pathname + (q ? '?' + q : '') + location.hash);
+    } catch (e) {}
+  }
+
+  var unlock = document.getElementById('unlock');
+  var warn   = document.getElementById('auth-warn');
+
+  document.getElementById('unlock-form').addEventListener('submit', function (ev) {
+    ev.preventDefault();
+    var v = document.getElementById('unlock-input').value.trim();
+    if (!v) return;
+    store(KEY, v);
+    location.reload();
+  });
+
   if (!token) {
-    document.getElementById('auth-warn').style.display = 'block';
+    unlock.style.display = 'block';
     return;
   }
   document.getElementById('content').style.display = 'block';
@@ -449,6 +507,7 @@
 
   var statsFetch = null;
   var statsTimeout = null;
+  var pollTimer = null;
 
   function finishPoll() {
     if (statsTimeout) clearTimeout(statsTimeout);
@@ -458,6 +517,11 @@
 
   function poll() {
     if (statsFetch) return;
+    /* Belt and braces with the clearInterval in the 401 branch: poll() is
+     * called once before pollTimer is assigned, so a handler that only
+     * cancelled the timer would depend on the fetch resolving after that
+     * assignment. It does, but this does not rely on it. */
+    if (!token) return;
 
     statsFetch = new AbortController();
     statsTimeout = setTimeout(function () {
@@ -471,9 +535,18 @@
     })
       .then(function (r) {
         if (r.status === 401) {
-          document.getElementById('auth-warn').textContent = '401 — token rejected.';
-          document.getElementById('auth-warn').style.display = 'block';
-          document.getElementById('content').style.display   = 'none';
+          /* Stop, rather than retrying with it forever: the usual cause is a
+           * token from a previous job. Clearing sessionStorage is not enough
+           * on its own -- `token` was captured once when this closure ran and
+           * the interval would keep firing with the same rejected value until
+           * the tab closed -- so the timer has to be cancelled too. */
+          drop(KEY);
+          if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+          token = null;
+          warn.textContent = '401 — that token was rejected.';
+          warn.style.display = 'block';
+          unlock.style.display = 'block';
+          document.getElementById('content').style.display = 'none';
           throw new Error('unauthorized');
         }
         if (!r.ok) throw new Error('HTTP ' + r.status);
@@ -490,7 +563,7 @@
     if (statsFetch) statsFetch.abort();
   });
   poll();
-  setInterval(poll, 5000);
+  pollTimer = setInterval(poll, 5000);
 })();
 </script>
 </body>

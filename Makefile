@@ -98,21 +98,37 @@ vendor/%.o: vendor/%.c
 # node, and is skipped with a notice when node is absent.
 # finalize_test.py exercises pull/finalize with temporary local fixtures;
 # it needs python3, sqlite3, and zstd (no SSH server or YAFU run).
-TEST_BIN := tests/block_test
+# siever_resolve_test links sieve_executor.o alone. It guards the one string
+# that arrives over the wire and then helps compose a /bin/sh -c command line,
+# so its hostile-name cases are the point of the file, not an afterthought.
+TEST_BINS := tests/block_test tests/siever_resolve_test
 
-$(TEST_BIN): tests/block_test.c db.o vendor/sqlite3.o
+tests/block_test: tests/block_test.c db.o vendor/sqlite3.o
 	$(CC) $(CFLAGS) -I. -Ivendor -o $@ $^ -lpthread -lm -ldl
 
+# filter-out the header: make concatenates prerequisites across rules, and the
+# dependency edge declared below would otherwise put sieve_executor.h into $^
+# and hand it to the compiler as an input (which some toolchains precompile
+# into a stray .gch).
+tests/siever_resolve_test: tests/siever_resolve_test.c sieve_executor.o
+	$(CC) $(CFLAGS) -I. -o $@ $(filter-out %.h,$^) -lpthread
+
 .PHONY: test
-test: $(TEST_BIN)
-	./$(TEST_BIN)
+test: $(TEST_BINS)
+	./tests/block_test
+	./tests/siever_resolve_test
 	@if command -v node >/dev/null 2>&1; then \
 	  node tests/dashboard_test.js; \
 	else echo "note: node not found; skipping tests/dashboard_test.js"; fi
 	python3 -B tests/finalize_test.py
 
+# No general header dependency tracking here (see CLAUDE.md). These are the
+# edges where a stale object would link against a changed declaration.
+client.o sieve_executor.o: sieve_executor.h
+tests/siever_resolve_test: sieve_executor.h
+
 clean:
-	rm -f $(ALL_OWN_OBJS) $(ALL_VENDOR_OBJS) $(SERVER_BIN) $(CLIENT_BIN) $(VERIFY_BIN) $(DASHBOARD_HEADER) $(TEST_BIN)
+	rm -f $(ALL_OWN_OBJS) $(ALL_VENDOR_OBJS) $(SERVER_BIN) $(CLIENT_BIN) $(VERIFY_BIN) $(DASHBOARD_HEADER) $(TEST_BINS)
 
 # ---------- vendor refresh helpers (manually invoked) ----------
 

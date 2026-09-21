@@ -71,6 +71,12 @@ static const char *engine_name(int e)
 }
 #define SUBMIT_ZSTD_LEVEL 1
 
+/* A siever the coordinator names but this box does not have is a permanent
+ * configuration error: it recurs on every lease until someone fixes it. Back
+ * off much harder than the ordinary idle backoff so the logs stay readable and
+ * the coordinator is not asked once a second for work this client cannot do. */
+#define MISCONFIG_BACKOFF_SECONDS 60
+
 #define CLIENT_VERSION "0.2.0"
 
 enum {
@@ -179,6 +185,18 @@ static int should_cancel_siever(void *ctx)
          * hours. The caller checks lease_lost to skip the submit. */
         fprintf(stderr, "client: %s was reclaimed by the server (lease "
                         "expired); abandoning it\n", sc->workunit_id);
+        sc->lease_lost = 1;
+        sc->next_renew_ms = 0;
+        return 1;
+    }
+    if (r == 3) {
+        /* The coordinator is serving a different job than this workunit
+         * belongs to — `serve` was repointed at another jobdir mid-band.
+         * Identical consequence to a reclaim: /submit can only answer 400,
+         * so every further second of sieving is waste. */
+        fprintf(stderr, "client: the coordinator moved to a different job "
+                        "while %s was sieving; abandoning it\n",
+                sc->workunit_id);
         sc->lease_lost = 1;
         sc->next_renew_ms = 0;
         return 1;
@@ -570,6 +588,12 @@ typedef struct client_cfg_s {
     char        token[80];
     char        client_id[64];
     char        siever_path[256];
+    /* --siever may name a DIRECTORY of gnfs-lasieve4* binaries instead of one
+     * binary. When it does, this holds it and siever_path is resolved per
+     * lease from the name the coordinator sends. That is what lets `serve` be
+     * repointed at a new jobdir — with a different siever — without touching
+     * a single worker. Empty means --siever named a file, the old behaviour. */
+    char        siever_dir[256];
     char        workdir[256];
     char        file_cache_dir[256];
     int64_t     idle_backoff_seconds;
@@ -589,6 +613,10 @@ typedef struct client_cfg_s {
     char        fb1_path[256];          /* explicit --fb1 cache; "" = none */
     char        fbgen_gpu[256];         /* fbgen_gpu binary to build one with */
     char        gpu_args_override[192]; /* --gpu-args: beats the server's */
+    /* --siever-args: beats the server's, and is NOT put through the whitelist.
+     * The escape hatch for a campaign needing a lasieve4 flag the client does
+     * not know, so a refusal is never a dead end. Local = operator intent. */
+    char        siever_args_override[128];
     int         cuda_device;            /* -1 = let bench choose */
     /* Lease slots per worker. >1 runs the pipelined worker, which keeps the
      * card sieving across lease round trips and uploads. */
@@ -614,8 +642,11 @@ static void usage(void)
         "usage: ggnfs-sieve-client \\\n"
         "    --server-url=http://host:port  (required)\n"
         "    --token=<bearer token>         (required)\n"
-        "    --siever=<path>                gnfs-lasieve4* binary (required unless\n"
-        "                                   --engine=cuda)\n"
+        "    --siever=<path>                gnfs-lasieve4* binary, OR a directory\n"
+        "                                   holding several: the coordinator names\n"
+        "                                   which one each job needs, so a directory\n"
+        "                                   follows a job change with no reconfig.\n"
+        "                                   (required unless --engine=cuda)\n"
         "    [--client-id=<name>]           label this worker on the dashboard; defaults to hostname\n"
         "    [--workdir=/tmp/ggnfs-client]\n"
         "    [--idle-backoff=30]\n"
@@ -629,6 +660,10 @@ static void usage(void)
         "                                   cache once per job. Without either, bench\n"
         "                                   rebuilds the factor base every workunit\n"
         "    [--device=N]                   CUDA device index (default: bench chooses)\n"
+        "    [--siever-args=<flags>]        override the coordinator's lasieve4 flags\n"
+        "                                   for this client, e.g. \"-J 16\". Without it\n"
+        "                                   the server's are used, after being parsed\n"
+        "                                   and rebuilt against a known-flag table\n"
         "    [--gpu-args=<flags>]           override the geometry for this client, e.g.\n"
         "                                   \"--logI 16 --J 32768\". Without it the server's\n"
         "                                   gpu_args is used, and failing that the\n"
@@ -739,6 +774,16 @@ static int parse_config(int argc, char **argv, client_cfg_t *cfg)
     if (fb1 && *fb1)
         snprintf(cfg->fb1_path, sizeof(cfg->fb1_path), "%s", fb1);
 
+    const char *sargs = flag(argc, argv, "--siever-args");
+    if (sargs && !*sargs) {
+        fprintf(stderr, "client: --siever-args needs a value, e.g. "
+                        "--siever-args=\"-J 16\"\n");
+        return -1;
+    }
+    if (sargs)
+        snprintf(cfg->siever_args_override, sizeof(cfg->siever_args_override),
+                 "%s", sargs);
+
     const char *gargs = flag(argc, argv, "--gpu-args");
     if (gargs && !*gargs) {
         /* flag() reports a bare `--gpu-args` (or the space-separated form the
@@ -804,6 +849,27 @@ static int parse_config(int argc, char **argv, client_cfg_t *cfg)
     snprintf(cfg->server_url,  sizeof(cfg->server_url),  "%s", url);
     snprintf(cfg->token,       sizeof(cfg->token),       "%s", token);
     snprintf(cfg->siever_path, sizeof(cfg->siever_path), "%s", siever ? siever : "");
+
+    /* A directory means "resolve per lease"; anything else is one pinned
+     * binary and keeps working exactly as before. Classified once here rather
+     * than per lease so a box whose siever dir is deleted mid-run does not
+     * silently fall back to treating the path as a file. */
+    if (siever && *siever) {
+        struct stat st;
+        if (stat(siever, &st) == 0 && S_ISDIR(st.st_mode)) {
+            /* Truncating here would leave a valid-LOOKING directory string
+             * that resolves nothing, so every lease would be taken and handed
+             * straight back citing a path the operator never typed, while the
+             * box looked healthy. Same check the file_cache_dir join makes. */
+            if (snprintf(cfg->siever_dir, sizeof(cfg->siever_dir), "%s", siever)
+                    >= (int)sizeof(cfg->siever_dir)) {
+                fprintf(stderr, "client: --siever path is too long (max %zu)\n",
+                        sizeof(cfg->siever_dir) - 1);
+                return -1;
+            }
+            cfg->siever_path[0] = '\0';   /* filled in per lease */
+        }
+    }
 
     if (cid && *cid) {
         snprintf(cfg->client_id, sizeof(cfg->client_id), "%s", cid);
@@ -1096,10 +1162,24 @@ static int siever_supports_afb_audit(const char *siever_path)
  * is named by its content hash, a new job can never pick up a stale cache.
  * Failure is non-fatal: without the cache the siever rebuilds the factor
  * base per workunit, exactly as before. */
+/* Everything remembered about a factor-base cache is KEYED on the path it was
+ * derived from, never latched as a bare flag. The siever and the job can both
+ * change under a running client now (the operator repoints `serve` at a new
+ * jobdir), and a boolean "generation failed" would carry a verdict about job A
+ * silently into job B for the rest of the process's life. g_afb_validated_path
+ * always worked this way; the other two were booleans and are now keyed to
+ * match. */
 static pthread_mutex_t g_afb_mu = PTHREAD_MUTEX_INITIALIZER;
-static int g_afb_gen_failed = 0;
-static int g_afb_siever_ok = -1;   /* -1 unknown, 0 old siever, 1 supported */
-static char g_afb_validated_path[300]; /* cache that passed the content probe */
+static char g_afb_failed_for[300];     /* .afb.0 whose generation failed */
+static char g_afb_siever_probed[256];  /* siever the flag below describes */
+static int g_afb_siever_ok = -1;       /* -1 unknown, 0 old siever, 1 supported */
+/* The cache that passed the `-c 0` audit, AND the siever that audited it. The
+ * siever is half the key: under --siever=<dir> the binary changes whenever the
+ * campaign's does, while afb stays sha-named and identical, so keying on the
+ * path alone would skip the audit for a binary that has never seen this
+ * cache. */
+static char g_afb_validated_path[300];
+static char g_afb_validated_by[256];
 
 static void ensure_afb_cached(const client_cfg_t *cfg,
                               const proto_lease_response_t *lease,
@@ -1118,8 +1198,15 @@ static void ensure_afb_cached(const client_cfg_t *cfg,
 
     pthread_mutex_lock(&g_afb_mu);
 
-    if (g_afb_siever_ok == -1) {
+    /* Keyed on the path, not probed once per process: under --siever=<dir> the
+     * binary changes whenever the campaign's siever does, and the answer is a
+     * property of that binary. Also keeps the warning to once per siever
+     * rather than once per lease — the portable dist/ tier genuinely lacks the
+     * marker, so on those boxes it would otherwise print forever. */
+    if (strcmp(g_afb_siever_probed, cfg->siever_path) != 0) {
         g_afb_siever_ok = siever_supports_afb_audit(cfg->siever_path);
+        snprintf(g_afb_siever_probed, sizeof(g_afb_siever_probed), "%s",
+                 cfg->siever_path);
         if (!g_afb_siever_ok)
             fprintf(stderr,
                     "client: %s predates factor-base cache support; "
@@ -1139,12 +1226,13 @@ static void ensure_afb_cached(const client_cfg_t *cfg,
         return;
     }
 
-    if (g_afb_gen_failed) {
+    if (strcmp(g_afb_failed_for, afb) == 0) {
         pthread_mutex_unlock(&g_afb_mu);
         return;
     }
     if (file_exists(afb)) {
-        if (strcmp(g_afb_validated_path, afb) == 0) {
+        if (strcmp(g_afb_validated_path, afb) == 0 &&
+            strcmp(g_afb_validated_by, cfg->siever_path) == 0) {
             pthread_mutex_unlock(&g_afb_mu);
             return;
         }
@@ -1163,6 +1251,8 @@ static void ensure_afb_cached(const client_cfg_t *cfg,
             if (prc == 0) {
                 snprintf(g_afb_validated_path, sizeof(g_afb_validated_path),
                          "%s", afb);
+                snprintf(g_afb_validated_by, sizeof(g_afb_validated_by),
+                         "%s", cfg->siever_path);
                 printf("client: validated existing factor base cache %s\n", afb);
                 pthread_mutex_unlock(&g_afb_mu);
                 return;
@@ -1188,7 +1278,7 @@ static void ensure_afb_cached(const client_cfg_t *cfg,
     if (!staged) {
         fprintf(stderr, "client: cannot stage %s; factor base cache disabled\n",
                 genjob);
-        g_afb_gen_failed = 1;
+        snprintf(g_afb_failed_for, sizeof(g_afb_failed_for), "%s", afb);
         pthread_mutex_unlock(&g_afb_mu);
         return;
     }
@@ -1201,12 +1291,14 @@ static void ensure_afb_cached(const client_cfg_t *cfg,
                              should_cancel_siever, NULL);
     if (rc == 0 && afb_size_ok(genafb) && rename(genafb, afb) == 0) {
         snprintf(g_afb_validated_path, sizeof(g_afb_validated_path), "%s", afb);
+        snprintf(g_afb_validated_by, sizeof(g_afb_validated_by), "%s",
+                 cfg->siever_path);
         printf("client: factor base cache ready: %s\n", afb);
     } else {
         fprintf(stderr,
                 "client: factor base cache generation failed (rc=%d); "
                 "sievers will rebuild the factor base per workunit\n", rc);
-        g_afb_gen_failed = 1;
+        snprintf(g_afb_failed_for, sizeof(g_afb_failed_for), "%s", afb);
         unlink(genafb);
     }
     unlink(genjob);
@@ -1283,6 +1375,27 @@ static int derive_gpu_args(const char *siever, const char *siever_args,
  * an explicit client-side --gpu-args, then the server's meta.gpu_args, then
  * the rectangle derived from the campaign's own siever settings. Returns ""
  * only when the siever name is unrecognised and nothing was configured. */
+/* Replace a lease's server-supplied gpu_args with a locally rebuilt
+ * equivalent, in place, so nothing downstream can accidentally use the raw
+ * wire string. Returns 0, or the sieve_sanitize_args code on refusal.
+ *
+ * Skipped when --gpu-args is set, because the server's value is then unused
+ * and failing a lease over a field nobody reads would be gratuitous. */
+static int scrub_lease_gpu_args(const client_cfg_t *cfg,
+                                proto_lease_response_t *lease,
+                                char *bad, size_t bad_n)
+{
+    if (cfg->gpu_args_override[0]) return 0;
+    if (lease->gpu_args[0] == '\0') return 0;
+
+    char clean[sizeof(lease->gpu_args)];
+    int rc = sieve_sanitize_args(SIEVE_ARGS_CUDA, lease->gpu_args,
+                                 clean, sizeof(clean), bad, bad_n);
+    if (rc != SIEVE_ARGS_OK) return rc;
+    snprintf(lease->gpu_args, sizeof(lease->gpu_args), "%s", clean);
+    return 0;
+}
+
 static const char *effective_gpu_args(const client_cfg_t *cfg,
                                       const proto_lease_response_t *lease,
                                       char *buf, size_t buf_n,
@@ -1311,9 +1424,31 @@ static const char *effective_gpu_args(const client_cfg_t *cfg,
         if (derive_gpu_args(lease->siever, lease->siever_args,
                             want, sizeof(want)) == 0 &&
             strcmp(want, val) != 0) {
-            static int warned = 0;
-            if (!warned) {
-                warned = 1;
+            /* Keyed, not latched. This warning exists to catch a card
+             * sieving a different area than the CPU fleet for a whole
+             * campaign — so it has to fire again when the campaign CHANGES.
+             * A bare bool would go quiet for the rest of the process after
+             * the first job, which is precisely when it stops being useful.
+             * Guarded by the same g_job_mu-style reasoning as elsewhere:
+             * a duplicate print under a race is harmless, a missed one is
+             * not, so the compare-and-set is deliberately not locked. */
+            static pthread_mutex_t warn_mu = PTHREAD_MUTEX_INITIALIZER;
+            static char warned_for[448];
+            char key[448];
+            snprintf(key, sizeof(key), "%s|%s|%s",
+                     lease->siever, lease->siever_args, val);
+            /* Every worker and prefetch slot runs this. The old bare `int`
+             * was a word-sized racy read-modify-write -- benign in practice;
+             * a char array is not, because a reader can see a splice of two
+             * strings mid-snprintf. Locked rather than left to chance: this
+             * is the signal that a card is sieving a different area than the
+             * CPU fleet, which is the last one to lose to a torn read. */
+            int say;
+            pthread_mutex_lock(&warn_mu);
+            say = (strcmp(warned_for, key) != 0);
+            if (say) snprintf(warned_for, sizeof(warned_for), "%s", key);
+            pthread_mutex_unlock(&warn_mu);
+            if (say) {
                 fprintf(stderr,
                         "client: WARNING — geometry \"%s\" (%s) is not the "
                         "rectangle siever '%s %s' covers, which is \"%s\". "
@@ -1447,7 +1582,7 @@ done:
 #define GPU_FB_LOGI_DEFAULT 15   /* cuda-sieve bench_main.cu: cfg.logI = 15 */
 
 static pthread_mutex_t g_fb1_mu = PTHREAD_MUTEX_INITIALIZER;
-static int  g_fb1_failed = 0;
+static char g_fb1_failed_for[320]; /* cache path whose generation failed */
 static char g_fb1_ready[320];    /* "" until this process has a usable cache */
 
 /* Pull "--logI N" out of the server-supplied cuda-sieve arg string. --maxbits
@@ -1486,18 +1621,27 @@ static int64_t job_alim(const char *job_path)
     return alim > 0 ? alim : 0;
 }
 
-/* Returns the path to pass as --fb1, or NULL to let bench build the base
- * in-process. Never fails the workunit: a cache we cannot build just means
- * slower sieving, not wrong sieving. */
-static const char *ensure_gpu_fb_cached(const client_cfg_t *cfg,
-                                        const proto_lease_response_t *lease,
-                                        const char *job_local,
-                                        const char *gpu_args,
-                                        struct mg_mgr *mgr)
+/* Fills `out` with the path to pass as --fb1, or "" to let bench build the
+ * base in-process. Never fails the workunit: a cache we cannot build just
+ * means slower sieving, not wrong sieving.
+ *
+ * `out` is a caller buffer rather than a pointer to g_fb1_ready on purpose.
+ * The caller stashes this for the whole band and dereferences it on the sieve
+ * thread minutes later, while another prefetch slot may be in here re-pointing
+ * the global at a different cache — a different (sha, logI), now that the job
+ * can change under a running client. Copying under the lock is what keeps a
+ * band from being sieved against another job's factor base. */
+static void ensure_gpu_fb_cached(const client_cfg_t *cfg,
+                                 const proto_lease_response_t *lease,
+                                 const char *job_local,
+                                 const char *gpu_args,
+                                 struct mg_mgr *mgr,
+                                 char *out, size_t out_n)
 {
+    out[0] = '\0';
     /* An explicit --fb1 is the operator's call and is used as given. */
-    if (cfg->fb1_path[0]) return cfg->fb1_path;
-    if (cfg->fbgen_gpu[0] == '\0') return NULL;
+    if (cfg->fb1_path[0]) { snprintf(out, out_n, "%s", cfg->fb1_path); return; }
+    if (cfg->fbgen_gpu[0] == '\0') return;
 
     /* Build the key BEFORE any early return. The whole point of keying on
      * (job sha, logI) is that a cache built for a different width is not
@@ -1513,26 +1657,31 @@ static const char *ensure_gpu_fb_cached(const client_cfg_t *cfg,
              cfg->file_cache_dir, lease->file_sha256_hex, logI);
 
     pthread_mutex_lock(&g_fb1_mu);
-    if (g_fb1_failed) { pthread_mutex_unlock(&g_fb1_mu); return NULL; }
-    if (strcmp(g_fb1_ready, cache) == 0) {
+    if (strcmp(g_fb1_failed_for, cache) == 0) {
         pthread_mutex_unlock(&g_fb1_mu);
-        return g_fb1_ready;
+        return;
+    }
+    if (strcmp(g_fb1_ready, cache) == 0) {
+        snprintf(out, out_n, "%s", g_fb1_ready);
+        pthread_mutex_unlock(&g_fb1_mu);
+        return;
     }
 
     if (file_exists(cache)) {
         snprintf(g_fb1_ready, sizeof(g_fb1_ready), "%s", cache);
+        snprintf(out, out_n, "%s", cache);
         printf("client: using factor base cache %s\n", cache);
         pthread_mutex_unlock(&g_fb1_mu);
-        return g_fb1_ready;
+        return;
     }
 
     int64_t alim = job_alim(job_local);
     if (alim == 0) {
         fprintf(stderr, "client: no alim: in the .job; cannot pre-build the "
                         "factor base (bench will build it per workunit)\n");
-        g_fb1_failed = 1;
+        snprintf(g_fb1_failed_for, sizeof(g_fb1_failed_for), "%s", cache);
         pthread_mutex_unlock(&g_fb1_mu);
-        return NULL;
+        return;
     }
 
     char staged[352];
@@ -1571,10 +1720,11 @@ static const char *ensure_gpu_fb_cached(const client_cfg_t *cfg,
     if (rc == 0 && regular_file_size(staged, &sz) == 0 && sz > 0 &&
         rename(staged, cache) == 0) {
         snprintf(g_fb1_ready, sizeof(g_fb1_ready), "%s", cache);
+        snprintf(out, out_n, "%s", cache);
         printf("client: factor base cache ready: %s (%lld bytes)\n",
                cache, (long long)sz);
         pthread_mutex_unlock(&g_fb1_mu);
-        return g_fb1_ready;
+        return;
     }
 
     unlink(staged);
@@ -1582,13 +1732,13 @@ static const char *ensure_gpu_fb_cached(const client_cfg_t *cfg,
         /* Killed by shutdown, not by a real failure — don't poison the next
          * run's attempt. */
         pthread_mutex_unlock(&g_fb1_mu);
-        return NULL;
+        return;
     }
     fprintf(stderr, "client: factor base cache generation failed (rc=%d); "
                     "bench will rebuild it per workunit\n", rc);
-    g_fb1_failed = 1;
+    snprintf(g_fb1_failed_for, sizeof(g_fb1_failed_for), "%s", cache);
     pthread_mutex_unlock(&g_fb1_mu);
-    return NULL;
+    return;
 }
 
 static int do_lease(struct mg_mgr *mgr, const client_cfg_t *cfg,
@@ -1728,6 +1878,22 @@ static int do_submit(struct mg_mgr *mgr, const client_cfg_t *cfg,
     } else if (io.status >= 500 || io.status == 0) {
         fprintf(stderr, "client: /submit returned HTTP %d\n", io.status);
         result = -1;
+    } else if (io.status == 400) {
+        /* Not a bug and not corrupt data: the coordinator is serving a
+         * different job than this workunit belongs to, so its id fails the
+         * job-prefix check. Retrying can only loop, but the relations are
+         * perfectly valid for the job they were sieved for, and an operator
+         * who is told that can still recover them. */
+        fprintf(stderr,
+            "client: /submit rejected %s with HTTP 400 (not retrying).\n"
+            "client: the coordinator is serving a different job than this "
+            "workunit belongs to — `serve` was most likely repointed at "
+            "another jobdir.\n"
+            "client: these relations are VALID for the original job: keep %s "
+            "and submit it against a `serve` running that jobdir, or assemble "
+            "it by hand.\n",
+            lease->workunit_id, outfile_path);
+        result = -2;
     } else {
         fprintf(stderr, "client: /submit returned HTTP %d (not retrying)\n", io.status);
         result = -2;
@@ -1809,6 +1975,12 @@ static int do_renew(struct mg_mgr *mgr, const client_cfg_t *cfg,
     if (status == 200) return 0;
     if (status == 409) return 1;
     if (status == 404) return 2;
+    /* 400 means the id is not shaped for the job this coordinator serves —
+     * `serve` was repointed at a different jobdir while we held this lease.
+     * That is permanent, not transient: treating it as retryable would let the
+     * siever grind out a whole band (a quarter hour on a GPU block) that can
+     * only ever be answered with a 400 at /submit. */
+    if (status == 400) return 3;
     return -1;
 }
 
@@ -1890,6 +2062,11 @@ static void release_active_leases(const client_cfg_t *base_cfg)
  *   0  - no work right now (caller should backoff)
  *  -1  - job is done (caller should exit cleanly)
  *  -2  - transient failure (caller should backoff)
+ *  -3  - this box cannot run the job's siever. PERMANENT: it recurs on every
+ *        lease until an operator fixes the siever directory. The lease has
+ *        already been released. Every dispatch site must back off much longer
+ *        than for -2 (MISCONFIG_BACKOFF_SECONDS) and must not treat it as
+ *        transient -- mishandling it is what poisons a contiguous q-range.
  */
 /* ---- pipeline stages ---------------------------------------------------
  *
@@ -1912,7 +2089,10 @@ typedef struct {
     char                    job_poly[300];   /* what bench gets; == job_local
                                               * unless sanitising was needed */
     char                    gpu_args[192];   /* resolved geometry for this band */
-    const char             *fb1;         /* cuda only; owned by the FB cache */
+    /* lasieve4 flags, rebuilt locally from the coordinator's (or taken from
+     * --siever-args). Never lease.siever_args itself. */
+    char                    siever_args[192];
+    char                    fb1[320];    /* cuda only; "" = bench builds its own */
     char                   *outfile;     /* malloc'd */
     double                  sieve_seconds;
     int                     active_idx;
@@ -1923,15 +2103,58 @@ static void slot_reset(pipe_slot_t *slot)
 {
     free(slot->outfile);
     slot->outfile = NULL;
-    slot->fb1 = NULL;
+    slot->fb1[0] = '\0';
     slot->sieve_seconds = 0.0;
     slot->lease_lost = 0;
     memset(&slot->lease, 0, sizeof(slot->lease));
 }
 
+/* ---- following a job change --------------------------------------------
+ *
+ * An operator switches factorizations by stopping `serve` and starting it on a
+ * different jobdir. With a fleet-wide token the clients never notice at the
+ * auth layer, so they carry straight on — leasing from the new job, fetching
+ * its .job by sha, and (under --siever=<dir>) switching sievers on their own.
+ *
+ * All this does is SAY so, once for the process rather than once per worker.
+ * Nothing needs invalidating: every cache that depends on the job is keyed on
+ * the sha or the path it came from, which is exactly why they are keyed rather
+ * than latched.
+ *
+ * The lease carries the job's sha as the input file's sha (files[0].sha256);
+ * there is no separate job_sha256 field on /lease, only on /stats. */
+static pthread_mutex_t g_job_mu = PTHREAD_MUTEX_INITIALIZER;
+static char g_job_sha[65];      /* "" until the first lease of the process */
+
+static void note_job_identity(const proto_lease_response_t *lease)
+{
+    char prev[65];
+
+    pthread_mutex_lock(&g_job_mu);
+    snprintf(prev, sizeof(prev), "%s", g_job_sha);
+    if (strcmp(g_job_sha, lease->file_sha256_hex) != 0)
+        snprintf(g_job_sha, sizeof(g_job_sha), "%s", lease->file_sha256_hex);
+    else
+        prev[0] = '\0';        /* unchanged: nothing to report */
+    pthread_mutex_unlock(&g_job_mu);
+
+    /* Only a CHANGE is worth a line; the first lease of a run is just the job
+     * this client started on, and the banner already said that. */
+    if (prev[0] == '\0') return;
+
+    printf("client: the coordinator is now serving a different job\n"
+           "client:   job   %.12s... -> %.12s...\n"
+           "client:   siever %s   side %c   args %s\n",
+           prev, lease->file_sha256_hex, lease->siever, lease->side,
+           lease->siever_args[0] ? lease->siever_args : "(none)");
+    fflush(stdout);
+}
+
 /* Stage 1: lease a workunit and fetch everything needed to sieve it.
  *   1  acquired    0  no work right now    -1  job complete / draining
- *  -2  transient failure */
+ *  -2  transient failure
+ *  -3  this box cannot run the job's siever; the lease has been RELEASED and
+ *      the condition is permanent (see run_one_iteration's contract) */
 static int stage_acquire(struct mg_mgr *mgr, pipe_slot_t *slot)
 {
     const client_cfg_t *cfg = &slot->cfg;
@@ -1960,16 +2183,101 @@ static int stage_acquire(struct mg_mgr *mgr, pipe_slot_t *slot)
     } else if (cfg->want_blocks) {
         printf("client: no block available; took a single workunit\n");
     }
-    printf("client: leased %s  q=[%lld,%lld)  width=%lld  side=%c  engine=%s  args=%s\n",
+
+    active_lease_set(slot->active_idx, slot->lease.workunit_id, cfg->client_id);
+
+    /* Announce a job change BEFORE the lease line, so a log reads in the
+     * order things happened rather than "leased a workunit from nowhere,
+     * then by the way the job changed". */
+    note_job_identity(&slot->lease);
+
+    /* Resolve which siever binary this job wants, BEFORE anything touches it.
+     * ensure_afb_cached below reads the binary to decide whether it can use a
+     * factor-base cache, and would unlink a perfectly good .afb.0 if handed a
+     * directory.
+     *
+     * Written through slot->cfg, not the const alias above: slot->cfg is this
+     * slot's private copy. Only the lease thread writes siever_path and only
+     * the sieve loop reads it, with the slot-state handoff between them.
+     *
+     * A failure here is a permanent configuration error, not a transient one —
+     * it will recur on every lease — so the lease goes back UNCONDITIONALLY.
+     * Merely returning -2 would abandon it to the expiry sweep, which charges
+     * attempt_count every time round; at one lease per backoff that poisons a
+     * contiguous stretch of the q-range in an hour, fifty workunits at a time
+     * under --engine=cuda. */
+    if (cfg->engine != ENGINE_CUDA && cfg->siever_dir[0]) {
+        char resolved[sizeof(slot->cfg.siever_path)];
+        int rrc = sieve_resolve_siever(cfg->siever_dir, slot->lease.siever,
+                                       resolved, sizeof(resolved));
+        if (rrc != SIEVE_RESOLVE_OK) {
+            fprintf(stderr,
+                "client: cannot run this job: the coordinator asks for '%s' "
+                "and %s (%s).\n"
+                "client: returning %s. Put that binary in %s — the dist/ tree "
+                "ships I14e/I15e/I16e for each CPU tier — or point --siever at "
+                "a single binary to pin one.\n",
+                slot->lease.siever, sieve_resolve_strerror(rrc),
+                cfg->siever_dir, slot->lease.workunit_id, cfg->siever_dir);
+            release_active_lease(mgr, &slot->cfg, slot->active_idx);
+            return -3;
+        }
+        snprintf(slot->cfg.siever_path, sizeof(slot->cfg.siever_path),
+                 "%s", resolved);
+    }
+
+    /* Rebuild the lasieve4 flags from the coordinator's rather than forwarding
+     * them. An operator's own --siever-args is local intent and goes through
+     * as given; a refusal here is the same shape as an unrunnable siever,
+     * because a band sieved with flags we do not understand is a band whose
+     * geometry nobody can account for. */
+    if (cfg->engine != ENGINE_CUDA) {
+        if (cfg->siever_args_override[0]) {
+            snprintf(slot->siever_args, sizeof(slot->siever_args), "%s",
+                     cfg->siever_args_override);
+        } else {
+            char badtok[160];
+            int arc = sieve_sanitize_args(SIEVE_ARGS_LASIEVE4,
+                                          slot->lease.siever_args,
+                                          slot->siever_args,
+                                          sizeof(slot->siever_args),
+                                          badtok, sizeof(badtok));
+            if (arc != SIEVE_ARGS_OK) {
+                fprintf(stderr,
+                    "client: refusing this job's siever flags: \"%s\" — '%s' "
+                    "%s.\n"
+                    "client: returning %s. The coordinator's siever_args are "
+                    "parsed and rebuilt here, never passed through, so only "
+                    "flags this client knows can reach a siever. Pass "
+                    "--siever-args=\"...\" to override locally, or update the "
+                    "client if the campaign genuinely needs that flag.\n",
+                    slot->lease.siever_args, badtok,
+                    sieve_args_strerror(arc), slot->lease.workunit_id);
+                release_active_lease(mgr, &slot->cfg, slot->active_idx);
+                return -3;
+            }
+        }
+    }
+
+    /* One line per lease, naming the binary that will actually run it. Which
+     * siever a band was sieved with is the thing you want in the log when a
+     * campaign's yield looks wrong, and under --siever=<dir> it is no longer
+     * implied by the command line. Flushed because stdout is fully buffered
+     * when redirected to a file, and a band can take a quarter of an hour —
+     * an operator tailing the log should not wait for the buffer. */
+    printf("client: leased %s  q=[%lld,%lld)  width=%lld  side=%c  engine=%s  "
+           "siever=%s  args=%s\n",
            slot->lease.workunit_id,
            (long long)slot->lease.q_start,
            (long long)(slot->lease.q_start + slot->lease.q_range),
            (long long)slot->lease.q_range,
            slot->lease.side, engine_name(cfg->engine),
+           (cfg->engine == ENGINE_CUDA) ? cfg->cuda_bench
+                                        : slot->cfg.siever_path,
            (cfg->engine == ENGINE_CUDA)
                ? "(cuda; geometry resolved below)"
-               : (slot->lease.siever_args[0] ? slot->lease.siever_args : "(none)"));
-    active_lease_set(slot->active_idx, slot->lease.workunit_id, cfg->client_id);
+               : (slot->siever_args[0] ? slot->siever_args : "(none)"));
+    fflush(stdout);
 
     /* Fetch input file (the .job) into the local cache. */
     if (ensure_file_cached(mgr, cfg, &slot->lease,
@@ -1986,6 +2294,19 @@ static int stage_acquire(struct mg_mgr *mgr, pipe_slot_t *slot)
     if (cfg->engine == ENGINE_CUDA) {
         char derived[192];
         const char *gsrc = NULL;
+        char badtok[160];
+        int arc = scrub_lease_gpu_args(cfg, &slot->lease,
+                                       badtok, sizeof(badtok));
+        if (arc != 0) {
+            fprintf(stderr,
+                "client: refusing this job's gpu_args: '%s' %s.\n"
+                "client: returning %s. Pass --gpu-args=\"...\" to override "
+                "locally, or update the client if the campaign genuinely "
+                "needs that flag.\n",
+                badtok, sieve_args_strerror(arc), slot->lease.workunit_id);
+            release_active_lease(mgr, &slot->cfg, slot->active_idx);
+            return -3;
+        }
         snprintf(slot->job_poly, sizeof(slot->job_poly), "%s",
                  cuda_job_file(slot->job_local));
         snprintf(slot->gpu_args, sizeof(slot->gpu_args), "%s",
@@ -2002,8 +2323,9 @@ static int stage_acquire(struct mg_mgr *mgr, pipe_slot_t *slot)
          * saying which. */
         printf("client:   geometry %s  [%s]\n",
                slot->gpu_args[0] ? slot->gpu_args : "(bench default)", gsrc);
-        slot->fb1 = ensure_gpu_fb_cached(cfg, &slot->lease, slot->job_poly,
-                                         slot->gpu_args, mgr);
+        ensure_gpu_fb_cached(cfg, &slot->lease, slot->job_poly,
+                             slot->gpu_args, mgr,
+                             slot->fb1, sizeof(slot->fb1));
     } else {
         snprintf(slot->job_poly, sizeof(slot->job_poly), "%s", slot->job_local);
         ensure_afb_cached(cfg, &slot->lease, slot->job_local);
@@ -2021,13 +2343,13 @@ static int stage_acquire(struct mg_mgr *mgr, pipe_slot_t *slot)
         return -2;
     }
 
-    /* The server tells us which siever name to use; we trust the operator
-     * to have given --siever pointing at the right binary on disk. We can
-     * surface the mismatch as a warning. Meaningless under --engine=cuda:
-     * the server names a gnfs-lasieve4 binary because that is what the CPU
-     * fleet runs, and the geometry the card should use comes from gpu_args
-     * instead. */
-    if (cfg->engine != ENGINE_CUDA) {
+    /* With --siever=<dir> the binary was resolved from this very name above, so
+     * a mismatch is impossible. This is the --siever=<file> case: the operator
+     * pinned one binary, which is legitimate (draining a tail, testing a
+     * build), so it stays a warning rather than a refusal. Meaningless under
+     * --engine=cuda: the server names a gnfs-lasieve4 binary because that is
+     * what the CPU fleet runs, and the card's geometry comes from gpu_args. */
+    if (cfg->engine != ENGINE_CUDA && cfg->siever_dir[0] == '\0') {
         const char *siever_basename = strrchr(cfg->siever_path, '/');
         siever_basename = siever_basename ? siever_basename + 1 : cfg->siever_path;
         if (strcmp(siever_basename, slot->lease.siever) != 0) {
@@ -2082,7 +2404,10 @@ static int stage_sieve(struct mg_mgr *mgr, pipe_slot_t *slot)
                                    (uint32_t)slot->lease.q_start,
                                    (uint32_t)slot->lease.q_range,
                                    slot->lease.side,
-                                   slot->lease.siever_args,
+                                   /* rebuilt locally in stage_acquire; the
+                                    * raw lease.siever_args must never get
+                                    * here */
+                                   slot->siever_args,
                                    should_cancel_siever,
                                    &sc);
     }
@@ -2136,7 +2461,8 @@ static int stage_submit(struct mg_mgr *mgr, pipe_slot_t *slot)
      * heartbeat. Renew once here so the upload starts with a full lease window
      * ahead of it, instead of racing whatever was left over from the sieve. */
     if (slot->lease.lease_seconds > 0) {
-        if (do_renew(mgr, cfg, slot->lease.workunit_id) == 1) {
+        int rr = do_renew(mgr, cfg, slot->lease.workunit_id);
+        if (rr == 1 || rr == 3) {
             /* A completed band. The server reissued the workunit while we were
              * sieving, so /submit would 409 — but these relations are valid and
              * are precisely what the reissued workunit will re-derive, so they
@@ -2184,7 +2510,7 @@ static int run_one_iteration(struct mg_mgr *mgr, const client_cfg_t *cfg, int wo
     slot.active_idx = worker_idx;
 
     int r = stage_acquire(mgr, &slot);
-    if (r != 1) { slot_reset(&slot); return r; }
+    if (r != 1) { slot_reset(&slot); return r; }   /* -3 reaches worker_main */
 
     r = stage_sieve(mgr, &slot);
     if (r != 1) { slot_reset(&slot); return -2; }
@@ -2262,9 +2588,13 @@ static int pipe_return_ready_slot(pipeline_t *p, int i, struct mg_mgr *mgr)
     lost = p->slots[i].lease_lost;
     pthread_mutex_unlock(&p->mu);
 
-    /* cfg and active_idx are written once at setup and never mutated, so
-     * reading them outside the lock is safe. active_lease_claim_release is
-     * what actually serialises this against any other releaser. */
+    /* active_idx and the cfg members read here (server_url, token, client_id)
+     * are written once at setup and never mutated, so reading them outside the
+     * lock is safe. cfg.siever_path is NOT in that set any more — the lease
+     * thread rewrites it per lease under --siever=<dir> — but it is a distinct
+     * member, so there is no race with the fields used here.
+     * active_lease_claim_release is what actually serialises this against any
+     * other releaser. */
     if (lost) {
         /* The server already took it back; /release would 409. */
         active_lease_clear(p->slots[i].active_idx);
@@ -2311,7 +2641,8 @@ static void *pipe_lease_thread(void *arg)
             slot_reset(&p->slots[idx]);
             p->state[idx] = SLOT_EMPTY;
             /* -1 means the job is complete or we are draining: stop asking.
-             * 0 (no work now) and -2 (transient) both just back off. */
+             * 0 (no work now), -2 (transient) and -3 (this box cannot run the
+             * job's siever) all back off; -3 waits a good deal longer. */
             if (r == -1) p->no_more_work = 1;
         }
         pthread_cond_broadcast(&p->cv);
@@ -2319,13 +2650,16 @@ static void *pipe_lease_thread(void *arg)
         pthread_mutex_unlock(&p->mu);
         if (done) break;
 
-        if (r == 0 || r == -2) {
+        if (r == 0 || r == -2 || r == -3) {
             /* Back off, but stay responsive: the sieve loop may finish (or
              * --once may fire) while we are waiting for work that no longer
              * matters, and shutdown should not have to sit out a full
              * idle-backoff before this thread notices. */
+            int64_t ib = p->slots[idx].cfg.idle_backoff_seconds;
+            if (r == -3 && ib < MISCONFIG_BACKOFF_SECONDS)
+                ib = MISCONFIG_BACKOFF_SECONDS;
             for (int64_t i = 0;
-                 i < p->slots[idx].cfg.idle_backoff_seconds &&
+                 i < ib &&
                  shutdown_phase() == SHUTDOWN_RUNNING;
                  i++) {
                 pthread_mutex_lock(&p->mu);
@@ -2421,15 +2755,25 @@ static void *pipe_heartbeat_thread(void *arg)
         pthread_mutex_unlock(&p->mu);
 
         for (int k = 0; k < n_todo; k++) {
-            /* cfg is written once at setup and never mutated, so reading it
-             * outside the lock is safe. */
+            /* The cfg members do_renew reads (server_url, token, client_id)
+             * are written once at setup and never mutated, so reading them
+             * outside the lock is safe. cfg.siever_path is rewritten per lease
+             * by the lease thread under --siever=<dir>, but it is a distinct
+             * member and only the sieve loop reads it, with the slot-state
+             * handoff in between. */
             int r = do_renew(&mgr, &p->slots[todo[k].idx].cfg, todo[k].wu);
-            if (r != 1) continue;
+            /* 1 = reclaimed and reissued; 3 = the coordinator now serves a
+             * different job. Both mean this queued lease is dead. Dropping it
+             * here is what stops the sieve loop promoting it later and
+             * spending a whole band on a workunit that can only 400. */
+            if (r != 1 && r != 3) continue;
             pthread_mutex_lock(&p->mu);
             /* Only mark it if the slot still holds the same workunit. */
             if (strcmp(p->slots[todo[k].idx].lease.workunit_id, todo[k].wu) == 0) {
-                fprintf(stderr, "client: queued workunit %s was reclaimed by "
-                                "the server; dropping it\n", todo[k].wu);
+                fprintf(stderr, "client: queued workunit %s is dead (%s); "
+                                "dropping it\n", todo[k].wu,
+                        r == 3 ? "the coordinator moved to a different job"
+                               : "reclaimed by the server");
                 p->slots[todo[k].idx].lease_lost = 1;
                 pthread_cond_broadcast(&p->cv);
             }
@@ -2709,6 +3053,15 @@ static void *worker_main(void *arg)
             if (cfg.once) break;
             continue;
         }
+        /* -3 is permanent by definition: this box cannot run the job's siever,
+         * and the next lease will say the same. Under --once (cron and CI
+         * wrappers that expect exactly one workunit and an exit status) the
+         * backoff below would spin on it for ever, so fail out instead. */
+        if (r == -3 && cfg.once) {
+            fprintf(stderr, "[w%d] --once: cannot run this job's siever; "
+                            "giving up\n", idx);
+            break;
+        }
         if (r == -1) {
             if (shutdown_phase() >= SHUTDOWN_DRAINING)
                 printf("[w%d] drain requested — exiting\n", idx);
@@ -2717,9 +3070,14 @@ static void *worker_main(void *arg)
             break;
         }
         if (shutdown_phase() >= SHUTDOWN_DRAINING) break;
-        /* r == 0 (no work) or r == -2 (transient failure) — backoff. */
+        /* r == 0 (no work) or r == -2 (transient failure) — backoff. r == -3
+         * is a permanent misconfiguration (the job's siever is not on this
+         * box) which recurs on every lease, so it waits a good deal longer. */
+        int64_t backoff = cfg.idle_backoff_seconds;
+        if (r == -3 && backoff < MISCONFIG_BACKOFF_SECONDS)
+            backoff = MISCONFIG_BACKOFF_SECONDS;
         for (int64_t i = 0;
-             i < cfg.idle_backoff_seconds && shutdown_phase() == SHUTDOWN_RUNNING;
+             i < backoff && shutdown_phase() == SHUTDOWN_RUNNING;
              i++) {
             sleep(1);
         }
@@ -3070,7 +3428,10 @@ static int run_benchmark_cuda(client_cfg_t *cfg, struct mg_mgr *mgr,
     fflush(stdout);
     struct timeval f0, f1;
     gettimeofday(&f0, NULL);
-    const char *fb1 = ensure_gpu_fb_cached(cfg, lease, job_local, gargs, mgr);
+    char fb1buf[320];
+    ensure_gpu_fb_cached(cfg, lease, job_local, gargs, mgr,
+                         fb1buf, sizeof(fb1buf));
+    const char *fb1 = fb1buf[0] ? fb1buf : NULL;
     gettimeofday(&f1, NULL);
     printf("factor base: %.1fs (%s)\n", elapsed_seconds(f0, f1),
            fb1 ? "cache ready" : "none — bench will build it in-process");
@@ -3213,7 +3574,13 @@ static int run_benchmark(int argc, char **argv, client_cfg_t *cfg)
         printf("threads    : %ld online / %ld configured\n",
                online_cpus(), configured_cpus());
         printf("workers    : %d\n", cfg->workers);
-        printf("siever     : %s\n", cfg->siever_path);
+        /* Under --siever=<dir> the binary is not known until /stats names it,
+         * a few lines below; printing siever_path here would print "". */
+        if (cfg->siever_dir[0])
+            printf("siever dir : %s (the coordinator names which one)\n",
+                   cfg->siever_dir);
+        else
+            printf("siever     : %s\n", cfg->siever_path);
     }
     printf("q-range    : %lld wide (fixed work, same as a workunit's q_range)\n",
            (long long)qrange);
@@ -3236,9 +3603,40 @@ static int run_benchmark(int argc, char **argv, client_cfg_t *cfg)
         return 1;
     }
 
+    /* Same rule as the sieving path: what the coordinator sends is parsed and
+     * rebuilt here, never forwarded. A benchmark run with flags we do not
+     * understand measures a geometry nobody can account for. */
+    {
+        char badtok[160];
+        int arc = scrub_lease_gpu_args(cfg, &lease, badtok, sizeof(badtok));
+        if (arc != 0) {
+            fprintf(stderr, "benchmark: refusing the job's gpu_args: '%s' %s. "
+                    "Pass --gpu-args=\"...\" to override.\n",
+                    badtok, sieve_args_strerror(arc));
+            mg_mgr_free(&mgr);
+            return 1;
+        }
+    }
+
     char side = lease.side;
     char siever_args[128];
-    snprintf(siever_args, sizeof(siever_args), "%s", lease.siever_args);
+    if (cfg->siever_args_override[0]) {
+        snprintf(siever_args, sizeof(siever_args), "%s",
+                 cfg->siever_args_override);
+    } else {
+        char badtok[160];
+        int arc = sieve_sanitize_args(SIEVE_ARGS_LASIEVE4, lease.siever_args,
+                                      siever_args, sizeof(siever_args),
+                                      badtok, sizeof(badtok));
+        if (arc != SIEVE_ARGS_OK) {
+            fprintf(stderr, "benchmark: refusing the job's siever_args "
+                    "\"%s\": '%s' %s. Pass --siever-args=\"...\" to "
+                    "override.\n",
+                    lease.siever_args, badtok, sieve_args_strerror(arc));
+            mg_mgr_free(&mgr);
+            return 1;
+        }
+    }
 
     /* Fixed anchor: --q if given, else the campaign's q_min. */
     int64_t anchor = q_override ? q_override : qmin;
@@ -3256,10 +3654,29 @@ static int run_benchmark(int argc, char **argv, client_cfg_t *cfg)
      * scaling a clean signal (no per-q-region cost differences to confound it).
      * Each worker is an independent process with its own private sieve arrays. */
 
-    /* lasieve4-only: under --engine=cuda there is no --siever to compare, and
-     * the server names a gnfs-lasieve4 binary because that is what the CPU
-     * fleet runs. Without this guard the warning fired on every GPU run. */
-    if (cfg->engine != ENGINE_CUDA) {
+    /* Resolve the siever the same way the sieving path does, and for the same
+     * reason: a benchmark run against the wrong binary reports a number for
+     * hardware that will never do that work. This has to happen before any
+     * worker thread starts, since they all read cfg->siever_path. run_benchmark
+     * takes a non-const cfg precisely so this can be written here. */
+    if (cfg->engine != ENGINE_CUDA && cfg->siever_dir[0]) {
+        char resolved[sizeof(cfg->siever_path)];
+        int rrc = sieve_resolve_siever(cfg->siever_dir, lease.siever,
+                                       resolved, sizeof(resolved));
+        if (rrc != SIEVE_RESOLVE_OK) {
+            fprintf(stderr,
+                "benchmark: the coordinator asks for '%s' and %s (%s).\n"
+                "benchmark: put that binary there, or pass --siever=<path to "
+                "one binary> to benchmark a specific build.\n",
+                lease.siever, sieve_resolve_strerror(rrc), cfg->siever_dir);
+            mg_mgr_free(&mgr);
+            return 1;
+        }
+        snprintf(cfg->siever_path, sizeof(cfg->siever_path), "%s", resolved);
+        printf("siever     : %s (named by the coordinator)\n", cfg->siever_path);
+    } else if (cfg->engine != ENGINE_CUDA) {
+        /* --siever=<file>: the operator pinned a binary. Warn on a mismatch
+         * but honour it — pinning is how you benchmark a specific build. */
         const char *siever_basename = strrchr(cfg->siever_path, '/');
         siever_basename = siever_basename ? siever_basename + 1 : cfg->siever_path;
         if (lease.siever[0] && strcmp(siever_basename, lease.siever) != 0) {
@@ -3461,6 +3878,94 @@ static int run_benchmark(int argc, char **argv, client_cfg_t *cfg)
 
 /* ===================== main ============================================= */
 
+/* Ask /stats which siever this job wants and resolve it, once, before any
+ * worker starts.
+ *
+ * The sieving loop has never needed /stats and still does not — per-lease
+ * resolution in stage_acquire is what is authoritative, and it has to be,
+ * because the job can change under a running client. This exists purely so the
+ * common operator error (a siever directory that does not hold the binary this
+ * campaign needs) is a clear message at launch rather than a lease taken and
+ * handed back every minute.
+ *
+ * Nothing here is fatal, including a coordinator that names a siever this box
+ * does not have. That was an exit(1) and it was wrong: stage_acquire treats
+ * the identical condition as recoverable -- it releases the lease and retries
+ * every MISCONFIG_BACKOFF_SECONDS, so copying the missing binary in fixes a
+ * RUNNING client with no restart. A client that exits instead is either gone
+ * until someone notices, or, under `Restart=always` (which is how
+ * run-client.sh gets supervised), a crash loop hammering /stats from every
+ * affected box at once. The two paths have to agree, and parking is the
+ * answer that self-heals.
+ *
+ * So this is purely a head start: the operator sees the actionable message at
+ * launch instead of a minute later, and the banner can name the binary.
+ *
+ * Runs on a short budget (unlike the benchmark's 30s) so a wedged coordinator
+ * delays startup by seconds, not half a minute. Must be called AFTER
+ * http_limiter_init, which resets the in-flight counter. */
+static void preflight_resolve_siever(client_cfg_t *cfg)
+{
+    if (cfg->engine == ENGINE_CUDA || cfg->siever_dir[0] == '\0') return;
+
+    char url[512];
+    if (join_url(url, sizeof(url), cfg->server_url, "/stats") != 0) return;
+
+    char headers[256];
+    build_auth_headers(headers, sizeof(headers), cfg->token,
+                       "application/json", NULL);
+    http_io_t io = {
+        .url = url, .method = "GET",
+        .extra_headers = headers,
+        .body = NULL, .body_len = 0,
+    };
+
+    struct mg_mgr mgr;
+    mg_mgr_init(&mgr);
+    int rc = http_request(&mgr, &io, 8000, 1);
+    int status = io.status;
+
+    char siever[64] = {0};
+    if (rc == 0 && status == 200) {
+        cJSON *root = cJSON_ParseWithLength((const char *)io.resp_body,
+                                            io.resp_body_len);
+        if (root) {
+            cJSON *sv = cJSON_GetObjectItemCaseSensitive(root, "siever");
+            if (cJSON_IsString(sv) && sv->valuestring)
+                snprintf(siever, sizeof(siever), "%s", sv->valuestring);
+            cJSON_Delete(root);
+        }
+    }
+    http_io_free(&io);
+    mg_mgr_free(&mgr);
+
+    if (rc != 0 || status != 200 || siever[0] == '\0') {
+        fprintf(stderr,
+            "client: could not ask the coordinator which siever this job "
+            "wants (%s); starting anyway and resolving per lease.\n",
+            rc != 0 ? "connection failed"
+                    : status == 401 ? "401 unauthorized — token wrong?"
+                                    : "unexpected reply");
+        return;
+    }
+
+    char resolved[sizeof(cfg->siever_path)];
+    int rrc = sieve_resolve_siever(cfg->siever_dir, siever,
+                                   resolved, sizeof(resolved));
+    if (rrc != SIEVE_RESOLVE_OK) {
+        fprintf(stderr,
+            "client: this job needs '%s' and %s (%s).\n"
+            "client: the dist/ tree ships I14e/I15e/I16e for each CPU tier — "
+            "copy the one this campaign uses into that directory, or pass "
+            "--siever=<path to one binary> to pin a build.\n"
+            "client: starting anyway; no work will be taken until that binary "
+            "is there, and none is lost in the meantime.\n",
+            siever, sieve_resolve_strerror(rrc), cfg->siever_dir);
+        return;
+    }
+    snprintf(cfg->siever_path, sizeof(cfg->siever_path), "%s", resolved);
+}
+
 int main(int argc, char **argv)
 {
     int is_bench = (argc > 1 && strcmp(argv[1], "benchmark") == 0);
@@ -3510,6 +4015,19 @@ int main(int argc, char **argv)
 
     if (mkdir_p(cfg.workdir) != 0) return 1;
 
+    /* Before the banner, so the banner can name the binary this job actually
+     * wants rather than just the directory it will be looked up in. */
+    http_limiter_init(cfg.http_concurrency, cfg.http_interval_ms);
+    preflight_resolve_siever(&cfg);
+
+    char siever_line[600];
+    if (cfg.siever_dir[0])
+        snprintf(siever_line, sizeof(siever_line), "%s  [from %s]",
+                 cfg.siever_path[0] ? cfg.siever_path : "(resolved per lease)",
+                 cfg.siever_dir);
+    else
+        snprintf(siever_line, sizeof(siever_line), "%s", cfg.siever_path);
+
     fprintf(stderr,
         "ggnfs-sieve-client: %s\n"
         "  server   : %s\n"
@@ -3520,12 +4038,10 @@ int main(int argc, char **argv)
         "  http max : %d\n"
         "  http gap : %lldms\n"
         "  backoff  : %llds   once=%d\n",
-        CLIENT_VERSION, cfg.server_url, cfg.client_id, cfg.siever_path,
+        CLIENT_VERSION, cfg.server_url, cfg.client_id, siever_line,
         cfg.workdir, cfg.workers, cfg.http_concurrency,
         (long long)cfg.http_interval_ms,
         (long long)cfg.idle_backoff_seconds, cfg.once);
-
-    http_limiter_init(cfg.http_concurrency, cfg.http_interval_ms);
 
     pthread_t     *tids = calloc((size_t)cfg.workers, sizeof(pthread_t));
     worker_args_t *args = calloc((size_t)cfg.workers, sizeof(worker_args_t));

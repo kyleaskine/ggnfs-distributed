@@ -4,6 +4,7 @@ ggnfs-sieve-server
 ggnfs-sieve-client
 ggnfs-verify
 dashboard_html.h
+tests/siever_resolve_test
 
 # Operator state from running `init` / `serve` / a client out of this directory.
 # (Real deployments use a separate jobdir; these patterns just cover ad-hoc
@@ -17,6 +18,10 @@ rels/
 /.codex
 /.agents
 *.job
+# Deployment wrappers: these bake in the live server address and token as
+# defaults, so they are copied to the webserver rather than cloned.
+# setup-client.sh itself is TRACKED -- it holds no secrets, taking them from
+# --server=/--token= instead.
 C191-ggnfs-client.sh
 cuda-client.sh
 ggnfs-client.sh
@@ -25,5 +30,7 @@ run-cuda-client.sh
 benchmark-gpu.sh
 archive/
 .locks/
+# Siever binaries setup-client.sh copies out of dist/ for this box's CPU tier.
+sievers/
 benchmark.sh
 *.log
