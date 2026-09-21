@@ -537,9 +537,25 @@ static void sync_http_handler(struct mg_connection *c, int ev, void *ev_data)
     }
 }
 
-/* Block until the request completes (or times out). Returns 0 on success
- * (HTTP status now filled in) or -1 on connection-level failure. */
-static int http_request(struct mg_mgr *mgr, http_io_t *io, int timeout_ms,
+/* Block until the request completes (or stalls). Returns 0 on success (HTTP
+ * status now filled in) or -1 on connection-level failure.
+ *
+ * `idle_timeout_ms` is a NO-PROGRESS budget, not a total one: it restarts
+ * every time bytes move in either direction. A /submit carrying a 50-member
+ * GPU block is ~32 MiB, so any fixed total budget is really a bet on the
+ * worker's uplink. The old flat 60s lost that bet and reported "/submit
+ * connection failure" for a submission the coordinator had already accepted,
+ * stored and verified -- the client then re-uploaded the same 32 MiB twice
+ * more before a retry finally got through and was told 409.
+ *
+ * Elapsed time is measured with the clock, not counted in poll iterations.
+ * mg_mgr_poll() returns as soon as the socket is ready, so it can return in
+ * microseconds; the old `waited_ms += 200` per iteration therefore charged
+ * 200 ms for polls that took almost none. Measured against a local server,
+ * that ran the budget down up to 24x faster than wall clock, which made every
+ * timeout here -- including /renew's nominal 5s -- fire at an unpredictable
+ * fraction of its stated value. */
+static int http_request(struct mg_mgr *mgr, http_io_t *io, int idle_timeout_ms,
                         int abort_on_cancel)
 {
     io->sent = io->done = io->err = io->closed = 0;
@@ -555,17 +571,37 @@ static int http_request(struct mg_mgr *mgr, http_io_t *io, int timeout_ms,
         return -1;
     }
 
-    int waited_ms = 0;
-    while (!io->done && waited_ms < timeout_ms) {
+    int64_t last_progress_ms = monotonic_ms();
+    size_t  last_unsent  = 0;   /* bytes still queued for the server */
+    size_t  last_recv    = 0;   /* bytes of response received so far */
+    int     watching_send = 0;
+
+    while (!io->done &&
+           monotonic_ms() - last_progress_ms < (int64_t)idle_timeout_ms) {
         if (abort_on_cancel && shutdown_phase() >= SHUTDOWN_CANCELLING) break;
         mg_mgr_poll(mgr, 200);
-        waited_ms += 200;
+        /* Only touch `c` while it is still live. Every close path runs
+         * MG_EV_CLOSE, which sets io->done, and mg_mgr_poll() frees the
+         * connection in the same call -- so io->done is the liveness test. */
+        if (io->done) break;
+        if (io->sent && !watching_send) {
+            /* First poll after the body was queued: take the baseline. */
+            watching_send = 1;
+            last_unsent = c->send.len;
+            last_progress_ms = monotonic_ms();
+        } else if (watching_send && c->send.len < last_unsent) {
+            last_unsent = c->send.len;
+            last_progress_ms = monotonic_ms();
+        }
+        if (c->recv.len > last_recv) {
+            last_recv = c->recv.len;
+            last_progress_ms = monotonic_ms();
+        }
     }
     if (!io->done) {
         c->is_closing = 1;
-        for (int close_waited_ms = 0;
-             !io->done && close_waited_ms < 1000;
-             close_waited_ms += 50) {
+        int64_t close_deadline = monotonic_ms() + 1000;
+        while (!io->done && monotonic_ms() < close_deadline) {
             mg_mgr_poll(mgr, 50);
         }
     }
@@ -1912,6 +1948,17 @@ static int submit_with_retries(struct mg_mgr *mgr, const client_cfg_t *cfg,
 
     for (;;) {
         int sr = do_submit(mgr, cfg, lease, outfile_path, sieve_seconds);
+        if (sr == 1 && attempt > 0) {
+            /* A 409 on a RETRY usually does not mean the workunit was
+             * reissued to someone else -- it means an earlier attempt of ours
+             * did land and the server has already moved the workunit on. The
+             * relations are safe; only the response was lost. Say so, because
+             * "re-issued?" reads like the band has to be sieved again. */
+            fprintf(stderr,
+                "client: ...which means retry %d found the workunit already "
+                "submitted — an earlier attempt did reach the server. These "
+                "relations are recorded; nothing was lost.\n", attempt);
+        }
         if (sr == 0 || sr == 1 || sr == -2) return sr;
 
         attempt++;

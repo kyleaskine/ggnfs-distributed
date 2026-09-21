@@ -892,6 +892,30 @@ typedef struct {
 #define OUTPUT_MAX_BYTES     (524288000LL)  /* 500 MiB per design */
 #define SERVER_POLL_MS       50
 
+/* Receive-buffer growth for large /submit bodies.
+ *
+ * mongoose grows c->recv by a flat MG_IO_SIZE (16 KiB) per read, and
+ * mg_iobuf_resize() deliberately does NOT realloc: it callocs the new size,
+ * memmoves the old contents in, then bzeroes the old buffer before freeing
+ * it. That is three passes over everything received so far for every 16 KiB
+ * that arrives -- quadratic in body size, and it lands on the single
+ * event-loop thread that also answers /lease, /renew and the dashboard.
+ *
+ * Measured against this server over loopback, absorbing one POST body:
+ *     2 MiB 0.13s | 8 MiB 1.1s | 16 MiB 3.7s | 24 MiB 8.7s | 32 MiB 16.6s
+ *
+ * A 50-member GPU block is ~32 MiB compressed, so the fleet stalled for
+ * sixteen seconds per block submission and the submitting client hit its own
+ * timeout and re-sent -- while the submission had in fact been accepted.
+ *
+ * `align` is the one growth knob mongoose exposes without editing vendor/:
+ * mg_iobuf_resize() rounds every requested size up to it. It is raised only
+ * once a body is ALREADY large, so ordinary requests keep the 16 KiB step and
+ * nothing is preallocated on the strength of a Content-Length that a client
+ * merely claimed -- the bytes have to actually arrive first. */
+#define BIG_BODY_THRESHOLD   (1u << 20)   /* 1 MiB of body seen...          */
+#define BIG_BODY_RECV_ALIGN  (4u << 20)   /* ...then grow 4 MiB at a time   */
+
 static void send_text(struct mg_connection *c, int code, const char *body)
 {
     /* mg_http_reply takes a printf-style body with %s/%d etc. — we want raw. */
@@ -1660,6 +1684,14 @@ static void ev_handler(struct mg_connection *c, int ev, void *ev_data)
         if (b < 'A' || b > 'Z') {
             c->is_closing = 1;
             return;
+        }
+        /* Past this size the 16 KiB default growth step is quadratic; see
+         * BIG_BODY_RECV_ALIGN. Setting `align` only affects the NEXT
+         * ioalloc(), so it neither moves nor invalidates the buffer that
+         * mongoose is parsing right now. */
+        if (c->recv.len >= BIG_BODY_THRESHOLD &&
+            c->recv.align < BIG_BODY_RECV_ALIGN) {
+            c->recv.align = BIG_BODY_RECV_ALIGN;
         }
     }
 
