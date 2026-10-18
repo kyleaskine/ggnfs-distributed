@@ -103,10 +103,14 @@ vendor/%.o: vendor/%.c
 # so its hostile-name cases are the point of the file, not an afterthought.
 # pause_test.py starts a temporary server on loopback and checks that pausing
 # blocks CPU/GPU assignments while existing leases renew, submit, and verify.
-TEST_BINS := tests/block_test tests/siever_resolve_test
+TEST_BINS := tests/block_test tests/siever_resolve_test tests/submit_publish_test
 
 tests/block_test: tests/block_test.c db.o vendor/sqlite3.o
-	$(CC) $(CFLAGS) -I. -Ivendor -o $@ $^ -lpthread -lm -ldl
+	$(CC) $(CFLAGS) -I. -Ivendor -o $@ $(filter-out %.h,$^) -lpthread -lm -ldl
+
+# Wrap publication to inspect the verifier's connection at the race boundary.
+tests/submit_publish_test: tests/submit_publish_test.c db.o vendor/sqlite3.o
+	$(CC) $(CFLAGS) -I. -Ivendor -o $@ $(filter-out %.h,$^) -Wl,--wrap=rename -lpthread -lm -ldl
 
 # filter-out the header: make concatenates prerequisites across rules, and the
 # dependency edge declared below would otherwise put sieve_executor.h into $^
@@ -118,6 +122,7 @@ tests/siever_resolve_test: tests/siever_resolve_test.c sieve_executor.o
 .PHONY: test
 test: $(TEST_BINS) $(SERVER_BIN)
 	./tests/block_test
+	./tests/submit_publish_test
 	./tests/siever_resolve_test
 	@if command -v node >/dev/null 2>&1; then \
 	  node tests/dashboard_test.js; \
@@ -129,6 +134,8 @@ test: $(TEST_BINS) $(SERVER_BIN)
 # edges where a stale object would link against a changed declaration.
 client.o sieve_executor.o: sieve_executor.h
 tests/siever_resolve_test: sieve_executor.h
+server.o db.o verify.o verify_cli.o: db.h
+tests/block_test tests/submit_publish_test: db.h
 
 clean:
 	rm -f $(ALL_OWN_OBJS) $(ALL_VENDOR_OBJS) $(SERVER_BIN) $(CLIENT_BIN) $(VERIFY_BIN) $(DASHBOARD_HEADER) $(TEST_BINS)

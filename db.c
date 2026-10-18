@@ -3,6 +3,7 @@
 #include "db.h"
 #include "vendor/sqlite3.h"
 
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -769,7 +770,8 @@ int db_lease(ggnfs_db_t *db, const char *client_id,
 
 int db_submit(ggnfs_db_t *db,
               const char *workunit_id, const char *client_id,
-              const char *rel_file_path, const char *body_sha256_hex,
+              const char *staged_path, const char *rel_file_path,
+              const char *body_sha256_hex,
               int64_t num_relations, double sieve_seconds,
               int64_t now_unix)
 {
@@ -819,8 +821,19 @@ int db_submit(ggnfs_db_t *db,
 done:
     if (up)  sqlite3_finalize(up);
     if (ins) sqlite3_finalize(ins);
+    /* Publish only after ownership and all SQL writes succeed, but before
+     * COMMIT makes the pending row visible to the verifier's connection. */
+    if (result == 0 && staged_path && rename(staged_path, rel_file_path) != 0) {
+        fprintf(stderr, "db_submit: rename %s -> %s: %s\n",
+                staged_path, rel_file_path, strerror(errno));
+        sqlite3_exec(db->conn, "ROLLBACK;", NULL, NULL, NULL);
+        return -1;
+    }
     if (result == 0) {
-        sqlite3_exec(db->conn, "COMMIT;",   NULL, NULL, NULL);
+        if (sqlite3_exec(db->conn, "COMMIT;", NULL, NULL, NULL) != SQLITE_OK) {
+            sqlite3_exec(db->conn, "ROLLBACK;", NULL, NULL, NULL);
+            return -1;
+        }
     } else {
         if (result == -1)
             fprintf(stderr, "db_submit: %s\n", sqlite3_errmsg(db->conn));
@@ -1413,7 +1426,8 @@ done:
 }
 
 int db_block_submit(ggnfs_db_t *db, const char *anchor_wu_id,
-                    const char *client_id, const char *rel_file_path,
+                    const char *client_id, const char *staged_path,
+                    const char *rel_file_path,
                     const char *body_sha256_hex, int64_t num_relations,
                     double sieve_seconds, int64_t now_unix)
 {
@@ -1484,6 +1498,14 @@ int db_block_submit(ggnfs_db_t *db, const char *anchor_wu_id,
 
 done:
     if (st) sqlite3_finalize(st);
+    /* As with a single workunit, the verifier must never see the row before
+     * the file exists. A failed publish rolls back every member and the block. */
+    if (result == 0 && staged_path && rename(staged_path, rel_file_path) != 0) {
+        fprintf(stderr, "db_block_submit: rename %s -> %s: %s\n",
+                staged_path, rel_file_path, strerror(errno));
+        sqlite3_exec(db->conn, "ROLLBACK;", NULL, NULL, NULL);
+        return -1;
+    }
     if (result == 0) {
         if (sqlite3_exec(db->conn, "COMMIT;", NULL, NULL, NULL) != SQLITE_OK) {
             sqlite3_exec(db->conn, "ROLLBACK;", NULL, NULL, NULL);

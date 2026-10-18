@@ -1336,8 +1336,9 @@ static void handle_submit(struct mg_connection *c, struct mg_http_message *hm,
     char *rel_path = path_join(ctx->rels_dir, rel_name);
     if (!rel_path) { send_text(c, 500, "oom\n"); return; }
 
-    /* Stage to a per-request temp file and rename only once the DB has
-     * ACCEPTED the submission.
+    /* Stage to a per-request temp file. The DB submission transaction checks
+     * ownership, renames the file, then commits the pending row. Committing
+     * before rename lets the verifier race ahead and fail with ENOENT.
      *
      * Writing straight to rel_path lets a client whose lease already lapsed
      * clobber the file of whoever the sweep reissued the workunit to — and
@@ -1364,7 +1365,12 @@ static void handle_submit(struct mg_connection *c, struct mg_http_message *hm,
             send_text(c, 500, "short write\n");
             return;
         }
-        fclose(f);
+        if (fclose(f) != 0) {
+            unlink(tmp_path);
+            free(tmp_path); free(rel_path);
+            send_text(c, 500, "cannot flush submission\n");
+            return;
+        }
     }
 
     db_clients_seen(ctx->db, client_id, now_unix(), NULL);
@@ -1375,10 +1381,10 @@ static void handle_submit(struct mg_connection *c, struct mg_http_message *hm,
      * anchor submitted underneath the block that owns it. */
     int rc;
     if (found == 0) {
-        rc = db_block_submit(ctx->db, workunit_id, client_id, rel_path,
+        rc = db_block_submit(ctx->db, workunit_id, client_id, tmp_path, rel_path,
                              body_sha, num_relations, sieve_seconds, now_unix());
     } else if (found == 1) {
-        rc = db_submit(ctx->db, workunit_id, client_id, rel_path, body_sha,
+        rc = db_submit(ctx->db, workunit_id, client_id, tmp_path, rel_path, body_sha,
                        num_relations, sieve_seconds, now_unix());
     } else {
         rc = -1;
@@ -1398,15 +1404,7 @@ static void handle_submit(struct mg_connection *c, struct mg_http_message *hm,
         send_text(c, 500, "internal error\n");
         return;
     }
-    /* Accepted: publish the staged file under the name the submission row
-     * records. A failure here leaves the row pointing at a file that does not
-     * exist, which the verifier reports as an open error rather than silently
-     * passing, so it is loud either way. */
-    if (rename(tmp_path, rel_path) != 0) {
-        fprintf(stderr, "submit: rename %s -> %s: %s\n",
-                tmp_path, rel_path, strerror(errno));
-        unlink(tmp_path);
-    }
+    /* Accepted and already published before the pending row became visible. */
     free(tmp_path);
     free(rel_path);
 

@@ -5,6 +5,7 @@ ggnfs-sieve-client
 ggnfs-verify
 dashboard_html.h
 tests/siever_resolve_test
+tests/submit_publish_test
 
 # Operator state from running `init` / `serve` / a client out of this directory.
 # (Real deployments use a separate jobdir; these patterns just cover ad-hoc

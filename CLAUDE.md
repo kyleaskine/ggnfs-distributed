@@ -28,7 +28,10 @@ There is no linter config and no CI. There is a small hand-run test suite under 
 - `tests/dashboard_test.js` — checks the client rollup arithmetic, reading the functions straight out of `dashboard.html` so it cannot drift from what ships. Needs `node`; skipped with a notice if absent. That column has been wrong twice in opposite directions, so it is worth a check.
 - `tests/finalize_test.py` — offline pull/finalize integration tests, run by `make test` with Python 3, sqlite3, and zstd. Covers job identity, interrupted snapshots, CPU/GPU assembly, YAFU export limits, output preservation, and metadata preflight using local SSH/rsync stand-ins.
 
-These do not cover the HTTP layer or the verifier end to end; those were tested by hand against real archived relations.
+- `tests/submit_publish_test.c` — checks CPU/GPU submission publication using a separate verifier DB connection at the rename boundary; also covers rollback on rename failure and protection against stale or duplicate uploads.
+- `tests/pause_test.py` — HTTP integration tests using a temporary loopback server, covering pause/resume and verification of synthetic submissions. Requires permission to create local sockets.
+
+Real archived relations were also tested by hand against the HTTP layer and verifier.
 
 `dashboard_html.h` is generated from `dashboard.html` by `xxd -i` and gets regenerated automatically because `server.o` depends on it.
 
@@ -94,6 +97,8 @@ The measurement is **fixed work, not fixed time**: it sieves a fixed q-interval 
 Happy path: `available → leased → submitted → verified`. Failure loops back: the verifier (or the lease-expiry sweep) sends the workunit to `available` with `attempt_count++`, or to `poisoned` once `attempt_count` hits `--max-attempts`. The atomic `available → leased` transition is one `UPDATE … WHERE id = (SELECT … LIMIT 1) RETURNING …` in `db_lease`. `leased → submitted` (with the submission insert at `verify_status='pending'`) is `BEGIN IMMEDIATE` in `db_submit` and returns `1` if the workunit isn't currently leased (handler responds 409). The verifier's resolve path (`db_verify_pass` / `db_verify_fail`) and the lease-expiry sweep both wrap their transitions in `BEGIN IMMEDIATE` too; the sweep uses a single `UPDATE … RETURNING state` with a `CASE` on the post-increment count to pick `available` vs `poisoned`.
 
 ### Verifier (`verify.[ch]`)
+Submission publication is ordered inside `db_submit` / `db_block_submit`: check ownership and write SQL, rename the closed staging file to its final name, then commit. The verifier must never see a pending row before that file exists. Rename failure rolls back the transaction and leaves the lease retryable; stale submissions never rename. Do not move publication back after commit, even if `verify_thread_wake` is called afterward: the verifier may already be draining other submissions or wake on its timer.
+
 Background pthread. Started by `cmd_serve` after `db_open`, signaled by `verify_thread_wake` on every successful `/submit`, stopped via `verify_thread_stop` (currently unreachable — see `FUTURE.md`). Owns its own `ggnfs_db_t`. Each iteration drains every pending submission, then waits on a condvar with a 5s timed-wait as a safety net.
 
 Per submission: one streaming pass over the relation file does (1) parse check on every line (`a` signed-decimal, `b` unsigned-decimal nonzero, two comma-separated hex prime lists; `b=0` is rejected since it's msieve's free-relation shape, not raw lasieve4 output), (2) q-range check (at least one prime on the sieved side falls in `[q_start, q_start+q_range)`), and (3) Algorithm-R reservoir-sampling of K accepted relations. The norm spot-check then runs on the reservoir via GMP: `|N_R| = |a*Y1 + b*Y0|`, `|N_A| = |Σ c_k a^k b^(d-k)|`, abs, divide out listed primes (all multiplicities), trial-divide by primes ≤ 1000, residue must be 1 or probable-prime. Convention matches `msieve/gnfs/relation.c:nfs_read_relation`.

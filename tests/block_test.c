@@ -152,7 +152,7 @@ static void t_basic(void)
     CK(rc == 1, "renew by wrong owner rc=%d", rc);
 
     /* submit */
-    rc = db_block_submit(db, b.anchor_wu_id, "gpu-a", "/tmp/x.dat", "deadbeef",
+    rc = db_block_submit(db, b.anchor_wu_id, "gpu-a", NULL, "/tmp/x.dat", "deadbeef",
                          95600, 378.0, 7000);
     CK(rc == 0, "submit rc=%d", rc);
     CK(scalar(c, "SELECT COUNT(*) FROM workunits WHERE state='submitted'") == 20,
@@ -164,7 +164,7 @@ static void t_basic(void)
     CK(scalar(c, "SELECT COUNT(*) FROM gpu_blocks WHERE state='submitted'") == 1,
        "block submitted");
     /* double submit is refused */
-    rc = db_block_submit(db, b.anchor_wu_id, "gpu-a", "/tmp/x.dat", "deadbeef",
+    rc = db_block_submit(db, b.anchor_wu_id, "gpu-a", NULL, "/tmp/x.dat", "deadbeef",
                          1, 1.0, 7001);
     CK(rc == 1, "double submit rc=%d", rc);
 
@@ -449,7 +449,7 @@ static void t_no_double_lease(void)
     CK(strcmp(r2.id, r.id) == 0, "same workunit returned");
 
     /* Once it is submitted the client is free again. */
-    CK(db_submit(db, r.id, "gpu-a", "/tmp/x", "sha", 1, 1.0, 5003) == 0, "submit");
+    CK(db_submit(db, r.id, "gpu-a", NULL, "/tmp/x", "sha", 1, 1.0, 5003) == 0, "submit");
     rc = db_block_lease(db, JOB, "gpu-a", 20000, 5000, 64, CEIL, g_desc, 3600, 5004, &b);
     CK(rc == 0, "block granted once the plain lease is resolved (rc=%d)", rc);
     sqlite3_close(c); db_close(db);
@@ -463,13 +463,13 @@ static void t_submit_ownership(void)
     db_lease_result_t r;
     CK(db_lease(db, "owner", 3600, 5000, 0, "cpu", &r) == 0, "lease");
     /* A stale client whose lease was reissued must not submit against it. */
-    CK(db_submit(db, r.id, "impostor", "/tmp/bad", "sha", 9, 1.0, 5001) == 1,
+    CK(db_submit(db, r.id, "impostor", NULL, "/tmp/bad", "sha", 9, 1.0, 5001) == 1,
        "submit by non-owner must be refused");
     sqlite3 *c = raw(P);
     CK(scalar(c, "SELECT COUNT(*) FROM submissions") == 0, "no submission row");
     CK(scalar(c, "SELECT COUNT(*) FROM workunits WHERE state='leased'") == 1,
        "workunit still leased to the owner");
-    CK(db_submit(db, r.id, "owner", "/tmp/good", "sha", 9, 1.0, 5002) == 0,
+    CK(db_submit(db, r.id, "owner", NULL, "/tmp/good", "sha", 9, 1.0, 5002) == 0,
        "owner submit succeeds");
     sqlite3_close(c); db_close(db);
 }

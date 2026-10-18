@@ -178,10 +178,12 @@ int db_block_release(ggnfs_db_t *db, const char *anchor_wu_id,
 /* Record a block submission: every member -> 'submitted', block -> 'submitted',
  * one submissions row carrying block_id / member_count / q_width so neither
  * the verifier nor /stats has to join gpu_blocks.
+ * staged_path has the same publication/rollback semantics as db_submit below.
  * Returns 0 on success, 1 if there is no live block anchored here (caller
  * responds 409), -1 on error. */
 int db_block_submit(ggnfs_db_t *db, const char *anchor_wu_id,
-                    const char *client_id, const char *rel_file_path,
+                    const char *client_id, const char *staged_path,
+                    const char *rel_file_path,
                     const char *body_sha256_hex, int64_t num_relations,
                     double sieve_seconds, int64_t now_unix);
 
@@ -243,12 +245,21 @@ int db_lease(ggnfs_db_t *db, const char *client_id,
 int db_workunit_get(ggnfs_db_t *db, const char *id, db_lease_result_t *out);
 
 /* Record a relation file submission and mark the workunit submitted.
+ * If staged_path is non-NULL, rename it to rel_file_path inside the write
+ * transaction, after checking ownership and before publishing the pending row.
+ * Rename failure rolls back the submission, leaving the lease retryable.
+ * NULL records an already published file (caller is responsible for its safety).
+ * A rejected lease never touches either file. On error, callers may remove the
+ * staging file but must not unlink the final path: a successful rename followed
+ * by a failed commit or process exit can leave an unrecorded final file, which
+ * a retry can replace. This orders publication, not power-loss durability.
  * New submissions land with verify_status='pending' for the verifier to pick
  * up. Returns 0 on success, 1 if the workunit is not currently leased
  * (caller should respond 409), -1 on internal error. */
 int db_submit(ggnfs_db_t *db,
               const char *workunit_id, const char *client_id,
-              const char *rel_file_path, const char *body_sha256_hex,
+              const char *staged_path, const char *rel_file_path,
+              const char *body_sha256_hex,
               int64_t num_relations, double sieve_seconds,
               int64_t now_unix);
 
