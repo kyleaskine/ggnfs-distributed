@@ -1043,6 +1043,28 @@ static void handle_lease(struct mg_connection *c, struct mg_http_message *hm,
 
     db_clients_seen(ctx->db, client_id, now_unix(), class_want);
 
+    /* Drain this job without disturbing active leases or the verifier. Check
+     * on every request so touching/removing the marker needs no restart.
+     * This must precede both the GPU block and ordinary workunit paths. */
+    char *paused_path = path_join(ctx->jobdir, "paused");
+    if (!paused_path) {
+        send_text(c, 500, "internal error\n");
+        return;
+    }
+    struct stat paused_st;
+    int paused_rc = lstat(paused_path, &paused_st);
+    int paused_errno = errno;
+    free(paused_path);
+    if (paused_rc == 0) {
+        mg_http_reply(c, 204, "", "");
+        return;
+    }
+    if (paused_errno != ENOENT) {
+        /* An unreadable marker path must not silently resume assignments. */
+        send_text(c, 500, "cannot check job pause state\n");
+        return;
+    }
+
     db_lease_result_t r;
     int64_t block_members = 0;
     int     rc            = 1;

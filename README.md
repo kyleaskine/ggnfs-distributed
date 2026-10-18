@@ -181,6 +181,31 @@ replacing same-named files in the destination is intentional.
 the server distributed, and checks that job against the database's SHA
 when available. This prevents mixing jobs or silently changing settings.
 
+## Pausing new assignments and draining a job
+
+On the server, create a file named `paused` in the directory passed to
+`serve --jobdir`:
+
+    touch /srv/current-job/paused
+
+The server checks this marker on every lease request and returns HTTP 204
+(no work available) for both CPU workunits and GPU blocks. Clients wait and
+retry. Existing leases can still renew, submit, and release, and submitted
+relations continue through verification. Already assigned work, including
+prefetched GPU bands, can finish. Normal lease expiry still applies.
+
+Remove the marker to resume assignments:
+
+    rm /srv/current-job/paused
+
+No restart is needed to pause or resume with a server built from this version;
+the marker also survives server restarts. When upgrading an older running
+server, rebuild and restart `serve` against the same jobdir first. You can
+create the marker before that restart to start paused.
+
+Before switching jobs, wait for `/stats` to show zero `workunits.leased` and
+zero `workunits.submitted`, so in-flight work and verification have drained.
+
 ## Switching the fleet to a new factorization
 
 Nothing on any worker has to change. Mint one fleet key, give every job that

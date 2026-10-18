@@ -101,6 +101,8 @@ vendor/%.o: vendor/%.c
 # siever_resolve_test links sieve_executor.o alone. It guards the one string
 # that arrives over the wire and then helps compose a /bin/sh -c command line,
 # so its hostile-name cases are the point of the file, not an afterthought.
+# pause_test.py starts a temporary server on loopback and checks that pausing
+# blocks CPU/GPU assignments while existing leases renew, submit, and verify.
 TEST_BINS := tests/block_test tests/siever_resolve_test
 
 tests/block_test: tests/block_test.c db.o vendor/sqlite3.o
@@ -114,13 +116,14 @@ tests/siever_resolve_test: tests/siever_resolve_test.c sieve_executor.o
 	$(CC) $(CFLAGS) -I. -o $@ $(filter-out %.h,$^) -lpthread
 
 .PHONY: test
-test: $(TEST_BINS)
+test: $(TEST_BINS) $(SERVER_BIN)
 	./tests/block_test
 	./tests/siever_resolve_test
 	@if command -v node >/dev/null 2>&1; then \
 	  node tests/dashboard_test.js; \
 	else echo "note: node not found; skipping tests/dashboard_test.js"; fi
 	python3 -B tests/finalize_test.py
+	python3 -B tests/pause_test.py
 
 # No general header dependency tracking here (see CLAUDE.md). These are the
 # edges where a stale object would link against a changed declaration.
